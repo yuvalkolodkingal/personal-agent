@@ -1,0 +1,519 @@
+{
+  "schema_version": 1,
+  "updated_on": "2026-08-26",
+  "products": [
+    {
+      "id": "COMP-001",
+      "product": "OpenCode",
+      "category": "agent-runtime",
+      "primary_source": "https://opencode.ai/docs/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "provider-neutral runtime",
+        "client/server API",
+        "agents",
+        "MCP",
+        "skills"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-002",
+      "product": "OpenClaw",
+      "category": "agent-runtime",
+      "primary_source": "https://docs.openclaw.ai/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "isolated agents",
+        "channel routing",
+        "skills",
+        "local workspaces"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-003",
+      "product": "GLaDOS",
+      "category": "voice-assistant",
+      "primary_source": "https://github.com/dnhkng/GlaDOS",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "local voice pipeline",
+        "reactive persona"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-004",
+      "product": "Leon",
+      "category": "voice-assistant",
+      "primary_source": "https://github.com/leon-ai/leon",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "local providers",
+        "layered memory",
+        "native and agent skills",
+        "bounded proactivity"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-005",
+      "product": "Home Assistant Assist",
+      "category": "smart-home",
+      "primary_source": "https://developers.home-assistant.io/docs/voice/overview/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "local voice",
+        "satellites",
+        "home control"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-006",
+      "product": "OpenVoiceOS",
+      "category": "voice-assistant",
+      "primary_source": "https://openvoiceos.github.io/ovos-technical-manual/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "wake words",
+        "skills",
+        "offline voice"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-007",
+      "product": "ChatGPT Agent/Tasks",
+      "category": "assistant",
+      "primary_source": "https://openai.com/index/introducing-chatgpt-agent/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "browser agent",
+        "scheduled tasks",
+        "connectors",
+        "artifacts"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-008",
+      "product": "Claude/Cowork",
+      "category": "assistant",
+      "primary_source": "https://www.anthropic.com/engineering/how-we-contain-claude",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "computer use",
+        "artifacts",
+        "project context",
+        "local VM containment"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-009",
+      "product": "Gemini",
+      "category": "assistant",
+      "primary_source": "https://gemini.google.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "multimodal live",
+        "research",
+        "workspace integrations"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-010",
+      "product": "Alexa+",
+      "category": "assistant",
+      "primary_source": "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "ambient assistance",
+        "smart home",
+        "proactivity"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-011",
+      "product": "Microsoft Copilot",
+      "category": "assistant",
+      "primary_source": "https://support.microsoft.com/en-us/microsoft-copilot/using-copilot-tasks",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "goal-based tasks",
+        "scheduled work",
+        "browser takeover",
+        "sensitive-action approval"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-012",
+      "product": "Perplexity Computer",
+      "category": "assistant",
+      "primary_source": "https://www.perplexity.ai/help-center/en/articles/11521526-perplexity-tasks",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "cited research",
+        "scheduled tasks",
+        "connectors",
+        "isolated background agents"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-013",
+      "product": "Codex",
+      "category": "coding-agent",
+      "primary_source": "https://developers.openai.com/codex/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "parallel agents",
+        "worktrees",
+        "automations",
+        "review"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-014",
+      "product": "Claude Code",
+      "category": "coding-agent",
+      "primary_source": "https://docs.anthropic.com/en/docs/claude-code/overview",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "hooks",
+        "skills",
+        "MCP",
+        "subagents"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-015",
+      "product": "Gemini CLI",
+      "category": "coding-agent",
+      "primary_source": "https://github.com/google-gemini/gemini-cli",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "terminal agent",
+        "MCP",
+        "extensions"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-016",
+      "product": "Goose",
+      "category": "coding-agent",
+      "primary_source": "https://block.github.io/goose/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "extensions",
+        "recipes",
+        "provider choice"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-017",
+      "product": "Cline",
+      "category": "coding-agent",
+      "primary_source": "https://docs.cline.bot/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "approval-driven tools",
+        "MCP",
+        "browser"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-018",
+      "product": "OpenHands",
+      "category": "coding-agent",
+      "primary_source": "https://docs.all-hands.dev/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "sandboxed execution",
+        "web UI",
+        "evaluation"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-019",
+      "product": "Aider",
+      "category": "coding-agent",
+      "primary_source": "https://aider.chat/docs/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "git-native edits",
+        "repository maps"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-020",
+      "product": "Cursor",
+      "category": "coding-agent",
+      "primary_source": "https://docs.cursor.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "IDE agents",
+        "background work",
+        "rules"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-021",
+      "product": "Windsurf",
+      "category": "coding-agent",
+      "primary_source": "https://docs.windsurf.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "IDE agent",
+        "workflows",
+        "context"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-022",
+      "product": "Playwright MCP",
+      "category": "browser",
+      "primary_source": "https://github.com/microsoft/playwright-mcp",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "structured browser control",
+        "accessibility snapshots"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-023",
+      "product": "Chrome DevTools MCP",
+      "category": "browser",
+      "primary_source": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "CDP inspection",
+        "performance diagnostics"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-024",
+      "product": "browser-use",
+      "category": "browser",
+      "primary_source": "https://docs.browser-use.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "agent browser abstraction",
+        "session profiles"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-025",
+      "product": "agent-browser",
+      "category": "browser",
+      "primary_source": "https://github.com/vercel-labs/agent-browser",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "native automation CLI",
+        "structured snapshots",
+        "stable element references",
+        "session profiles"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-026",
+      "product": "Stagehand",
+      "category": "browser",
+      "primary_source": "https://docs.stagehand.dev/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "structured actions",
+        "observations",
+        "extraction"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-027",
+      "product": "Skyvern",
+      "category": "browser",
+      "primary_source": "https://docs.skyvern.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "visual fallback",
+        "workflow automation"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-028",
+      "product": "Pipecat",
+      "category": "voice",
+      "primary_source": "https://docs.pipecat.ai/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "realtime pipelines",
+        "turn detection",
+        "transports"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-029",
+      "product": "LiveKit Agents",
+      "category": "voice",
+      "primary_source": "https://docs.livekit.io/agents/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "realtime voice agents",
+        "rooms",
+        "interruptions"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-030",
+      "product": "TEN",
+      "category": "voice",
+      "primary_source": "https://github.com/ten-framework/ten-framework",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "realtime multimodal pipelines",
+        "VAD",
+        "turn detection",
+        "interruptions"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-031",
+      "product": "OpenAI Realtime",
+      "category": "voice",
+      "primary_source": "https://platform.openai.com/docs/guides/realtime",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "speech-to-speech",
+        "realtime events",
+        "tool calling"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-032",
+      "product": "Gemini Live",
+      "category": "voice",
+      "primary_source": "https://ai.google.dev/gemini-api/docs/live-api",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "realtime voice and vision",
+        "barge-in",
+        "multilingual speech",
+        "tool use"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-033",
+      "product": "Talon",
+      "category": "dictation",
+      "primary_source": "https://talonvoice.com/docs/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "cross-platform voice control",
+        "dictation",
+        "application-specific commands",
+        "accessibility input"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-034",
+      "product": "n8n",
+      "category": "automation",
+      "primary_source": "https://docs.n8n.io/advanced-ai/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "event and schedule triggers",
+        "workflow graphs",
+        "connectors",
+        "AI agents"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-035",
+      "product": "Raycast",
+      "category": "desktop-productivity",
+      "primary_source": "https://developers.raycast.com/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "command palette",
+        "extensions",
+        "quick AI"
+      ],
+      "status": "active"
+    },
+    {
+      "id": "COMP-036",
+      "product": "Alfred",
+      "category": "desktop-productivity",
+      "primary_source": "https://www.alfredapp.com/help/",
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "capabilities": [
+        "hotkeys",
+        "workflows",
+        "clipboard history"
+      ],
+      "status": "active"
+    }
+  ]
+}

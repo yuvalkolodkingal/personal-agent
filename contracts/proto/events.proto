@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package personal_agent.v1;
+
+// Append-only event shared by the desktop IPC and local control protocol.
+message EventEnvelope {
+  uint32 schema_version = 1;
+  string event_id = 2;
+  string wall_clock_timestamp = 3;
+  uint64 monotonic_sequence = 4;
+  string origin = 5;
+  string profile_id = 6;
+  optional string session_id = 7;
+  optional string goal_id = 8;
+  optional string task_id = 9;
+  optional string agent_id = 10;
+  string type = 11;
+  bytes payload_json = 12;
+}
+
+message SubscribeEventsRequest {
+  uint64 after_sequence = 1;
+}
+
+message ControlRequest {
+  string request_id = 1;
+  string command = 2;
+  bytes arguments_json = 3;
+}
+
+message ControlResponse {
+  string request_id = 1;
+  bool ok = 2;
+  bytes result_json = 3;
+  optional string error_code = 4;
+  optional string error_message = 5;
+}

@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "updated_on": "2026-08-26",
+  "rejections": [
+    {
+      "id": "REJ-001",
+      "behavior": "Unrestricted spoken eval or shell execution",
+      "products": [],
+      "reason": "Voice is not authentication and model text is untrusted; every effect must use a declared tool and policy gate.",
+      "category": "security",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-002",
+      "behavior": "Advertising, sponsored answers, or behavioral targeting",
+      "products": [
+        "commercial assistants"
+      ],
+      "reason": "Conflicts with the user-owned privacy model and product mission.",
+      "category": "advertising",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-003",
+      "behavior": "Claims of sentience or emotional dependency",
+      "products": [],
+      "reason": "Affective behavior may be configurable but must be presented as behavior, not consciousness.",
+      "category": "deceptive",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-004",
+      "behavior": "Silent permission widening by agents, plugins, or subagents",
+      "products": [],
+      "reason": "Violates least privilege and scoped consent.",
+      "category": "security",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-005",
+      "behavior": "Automatic installation of agent-written skills",
+      "products": [],
+      "reason": "Self-authored skills enter a user-review proposal queue.",
+      "category": "supply-chain",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-006",
+      "behavior": "Scraping services when API terms prohibit it",
+      "products": [],
+      "reason": "Commercial integrations use authorized APIs and connectors.",
+      "category": "legal",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-007",
+      "behavior": "Face or voice biometrics as authorization for consequential actions",
+      "products": [],
+      "reason": "Biometrics may personalize but are not an authentication factor.",
+      "category": "security",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-008",
+      "behavior": "Mobile first-party application",
+      "products": [
+        "legacy Jarvis mobile"
+      ],
+      "reason": "Desktop-only scope; the secure remote protocol remains available to third-party clients.",
+      "category": "scope",
+      "decision": "replaced-equivalently"
+    },
+    {
+      "id": "REJ-009",
+      "behavior": "Trademark-copying competitor persona or visual identity",
+      "products": [],
+      "reason": "Capabilities are deduplicated; branding remains Personal Agent with configurable JARVIS persona.",
+      "category": "legal",
+      "decision": "rejected"
+    },
+    {
+      "id": "REJ-010",
+      "behavior": "Trust OpenCode V1 before-hook mutation as the safety boundary",
+      "products": [
+        "OpenCode"
+      ],
+      "reason": "Upstream reports show argument mutation/short-circuit gaps. Effectful built-ins are disabled and replaced by gated MCP tools.",
+      "category": "security",
+      "decision": "replaced-equivalently",
+      "sources": [
+        "https://github.com/anomalyco/opencode/issues/42409",
+        "https://github.com/anomalyco/opencode/issues/32565"
+      ]
+    }
+  ]
+}

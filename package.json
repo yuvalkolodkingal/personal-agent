@@ -1,0 +1,25 @@
+{
+  "name": "personal-agent",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.0",
+  "workspaces": [
+    "apps/desktop",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build",
+    "check": "bun run contracts:check && bun run --filter '*' check",
+    "contracts:generate": "bun scripts/generate-contracts.ts",
+    "contracts:check": "bun scripts/generate-contracts.ts --check",
+    "dev": "bun run --cwd apps/desktop dev",
+    "test": "bun run --filter '*' test",
+    "tauri": "bunx tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "=2.11.4",
+    "@types/bun": "=1.4.0",
+    "@types/node": "=24.3.0",
+    "typescript": "=7.0.2"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@personal-agent/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": { "react": "=19.2.8" },
+  "devDependencies": { "@types/bun": "=1.4.0", "@types/react": "=19.2.18", "typescript": "=7.0.2" }
+}

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personal-agent.dev/schema/config/v1",
+  "title": "Personal Agent configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "persona": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "default": "JARVIS", "minLength": 1 },
+        "style": { "type": "string", "default": "Composed, concise, and quietly witty." }
+      },
+      "required": ["name"]
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_parallelism": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
+        "max_delegation_depth": { "type": "integer", "minimum": 0, "maximum": 8, "default": 3 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "opencode_version": { "const": "1.18.23" },
+        "startup_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "record_transcripts": { "type": "boolean", "default": true },
+        "record_tool_arguments": { "type": "boolean", "default": false }
+      }
+    },
+    "secret_aliases": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string",
+        "pattern": "^keychain://[^/]+/[^/]+$"
+      }
+    },
+    "risk_acknowledgements": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "scope": { "type": "string", "minLength": 1 },
+          "risk": { "enum": ["consequential", "irreversible"] },
+          "acknowledged": { "const": true }
+        },
+        "required": ["scope", "risk", "acknowledged"]
+      }
+    }
+  },
+  "required": ["schema_version", "persona"]
+}

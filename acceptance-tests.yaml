@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "updated_on": "2026-08-26",
+  "tests": [
+    {
+      "id": "AT-M0-LEGACY-MAP",
+      "milestone": "M0",
+      "behavior": "Every legacy module, command, setting, test, documented feature, limitation, and migration input maps to an existing capability and test.",
+      "verification": "python scripts/verify-registries.py",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M0-REGISTRY-SCHEMA",
+      "milestone": "M0",
+      "behavior": "Every capability record contains the mandatory provenance, route, platform, security, and acceptance fields.",
+      "verification": "python scripts/verify-registries.py",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M1-CONTRACT-DRIFT",
+      "milestone": "M1",
+      "behavior": "Generated Rust and TypeScript contracts match protobuf sources.",
+      "verification": "bun run contracts:check && cargo test -p personal-agent-contracts",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M1-EVENT-RECOVERY",
+      "milestone": "M1",
+      "behavior": "UI projection is rebuilt only from ordered persisted events.",
+      "verification": "cargo test -p personal-agent-core projection_rebuilds",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M1-STORAGE-ENCRYPTED",
+      "milestone": "M1",
+      "behavior": "SQLCipher is present, keyed before schema access, and events resume by sequence.",
+      "verification": "cargo test -p personal-agent-storage",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M1-CONFIG-ROUNDTRIP",
+      "milestone": "M1",
+      "behavior": "Canonical config schema validates TOML edits, repairs safe values, and rejects invalid risk acknowledgements.",
+      "verification": "cargo test -p personal-agent-core config",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M1-PLATFORM-BUILD",
+      "milestone": "M1",
+      "behavior": "Development desktop builds install and rebuild state on Windows, macOS, and Linux.",
+      "verification": "CI matrix plus installer smoke",
+      "kind": "mixed",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M2-STREAMED-TURN",
+      "milestone": "M2",
+      "behavior": "Fake and configured real providers complete a streamed tool-using turn on each platform.",
+      "verification": "runtime compatibility suite",
+      "kind": "mixed",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M2-SIDECAR-AUTH",
+      "milestone": "M2",
+      "behavior": "OpenCode binds loopback only with per-run auth and exact-version compatibility.",
+      "verification": "cargo test -p personal-agent-runtime",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M3-OFFLINE-VOICE",
+      "milestone": "M3",
+      "behavior": "Wake-to-spoken response works after all network interfaces are disabled.",
+      "verification": "licensed audio replay plus hardware run",
+      "kind": "mixed",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M3-CONVERSATION-STATES",
+      "milestone": "M3",
+      "behavior": "Typed, voice, sleep, mute, quiet, stop, follow-up, guest, and project states stay distinct.",
+      "verification": "conversation state-machine suite",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M3-BARGE-IN",
+      "milestone": "M3",
+      "behavior": "Internal speaker stop is under 50 ms and end-to-end barge-in is under 100 ms.",
+      "verification": "audio benchmark report",
+      "kind": "hardware",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M4-ACCESSIBLE-WORKSPACE",
+      "milestone": "M4",
+      "behavior": "Every essential action is keyboard and screen-reader accessible; reduced motion is honored.",
+      "verification": "Vitest accessibility plus visual regression",
+      "kind": "mixed",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M4-PROJECT-CONTEXT",
+      "milestone": "M4",
+      "behavior": "Opening, closing, and switching project context does not lose unrelated conversation state.",
+      "verification": "project integration suite",
+      "kind": "automated",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M5-POLICY-GATE",
+      "milestone": "M5",
+      "behavior": "Always-confirm effects ask, missing scopes deny, untrusted cross-zone requests cannot silently proceed, and audit contains no secrets.",
+      "verification": "cargo test -p personal-agent-policy -p personal-agent-tools",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M5-BROWSER-SAFE",
+      "milestone": "M5",
+      "behavior": "Isolated profile tasks work and malicious page instructions cannot cross data zones.",
+      "verification": "fixture-site and red-team suite",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M5-DESKTOP-TOOLS",
+      "milestone": "M5",
+      "behavior": "Representative accessibility-first desktop tasks complete with explicit degradation on all platforms.",
+      "verification": "platform VM/hardware suite",
+      "kind": "mixed",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M5-ROLLBACK",
+      "milestone": "M5",
+      "behavior": "Checkpoints precede mutations and rollback snapshots current state before restoring.",
+      "verification": "fault-injection suite",
+      "kind": "automated",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M6-DAG-RECOVERY",
+      "milestone": "M6",
+      "behavior": "A multi-hour DAG survives restart and provider failure without duplicate consequential actions.",
+      "verification": "chaos scenario",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M6-MEMORY-PROVENANCE",
+      "milestone": "M6",
+      "behavior": "Explicit facts are trusted, inference is queued, conflicts remain visible, and recalled text is not re-extracted.",
+      "verification": "cargo test -p personal-agent-memory",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M6-AUTOMATION-RECOVERY",
+      "milestone": "M6",
+      "behavior": "Missed runs follow policy, approvals suspend, and repeated failures pause an automation.",
+      "verification": "cargo test -p personal-agent-automation",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M7-PLUGIN-SAFETY",
+      "milestone": "M7",
+      "behavior": "Unsigned plugins default off; renderer code and policy-rewrite scopes are rejected.",
+      "verification": "cargo test -p personal-agent-plugins",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M7-REMOTE-PROTOCOL",
+      "milestone": "M7",
+      "behavior": "Third-party clients pair with fresh keys and cannot exceed negotiated capabilities.",
+      "verification": "protocol interoperability suite",
+      "kind": "automated",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M7-COMPETITOR-COVERAGE",
+      "milestone": "M7",
+      "behavior": "Every adopted competitor capability is core or an installable official pack with an evaluation.",
+      "verification": "registry coverage check",
+      "kind": "automated",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M8-MIGRATION-DRY-RUN",
+      "milestone": "M8",
+      "behavior": "Synthetic profiles dry-run and import idempotently without modifying source or copying plaintext secrets.",
+      "verification": "cargo test -p personal-agent-migration plus fixtures",
+      "kind": "automated",
+      "status": "in_progress"
+    },
+    {
+      "id": "AT-M9-LIFECYCLE",
+      "milestone": "M9",
+      "behavior": "Fresh install, update, health rollback, export, uninstall, and optional data deletion pass on every platform.",
+      "verification": "signed/unsigned installer matrix",
+      "kind": "mixed",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M9-PERFORMANCE",
+      "milestone": "M9",
+      "behavior": "Latency and idle resource targets report p50, p95, max, and sample count.",
+      "verification": "benchmark harness",
+      "kind": "hardware",
+      "status": "planned"
+    },
+    {
+      "id": "AT-M9-SECURITY",
+      "milestone": "M9",
+      "behavior": "No critical/high finding remains; SBOM, licenses, provenance, fuzzing, and red-team reports are complete.",
+      "verification": "release security gate",
+      "kind": "mixed",
+      "status": "planned"
+    }
+  ]
+}

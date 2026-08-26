@@ -1,0 +1,35 @@
+[package]
+name = "personal-agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+personal-agent-agent = { path = "../agent" }
+personal-agent-automation = { path = "../automation" }
+personal-agent-contracts = { path = "../contracts" }
+personal-agent-memory = { path = "../memory" }
+personal-agent-platform = { path = "../platform" }
+personal-agent-policy = { path = "../policy" }
+personal-agent-runtime = { path = "../runtime" }
+personal-agent-storage = { path = "../storage" }
+personal-agent-tools = { path = "../tools" }
+serde.workspace = true
+serde_json.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[[bin]]
+name = "personal-agent"
+path = "src/bin/personal-agent.rs"
+
+[[bin]]
+name = "jarvisctl"
+path = "src/bin/jarvisctl.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,699 @@
+{
+  "schema_version": 1,
+  "updated_on": "2026-08-26",
+  "capabilities": [
+    {
+      "id": "CAP-CONTRACTS",
+      "category": "architecture",
+      "behavior": "Versioned protobuf IPC/domain contracts and Draft 2020-12 schemas generate Rust and TypeScript types.",
+      "products": [
+        "Jarvis"
+      ],
+      "sources": [
+        "legacy://Jarvis"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "replaced-equivalently",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M1",
+      "acceptance_test_ids": [
+        "AT-M1-CONTRACT-DRIFT"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-STORAGE",
+      "category": "storage",
+      "behavior": "SQLCipher WAL event store, content-addressed blobs, transactional migrations, and rebuildable projections.",
+      "products": [
+        "Jarvis"
+      ],
+      "sources": [
+        "legacy://Jarvis"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "replaced-equivalently",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M1",
+      "acceptance_test_ids": [
+        "AT-M1-STORAGE-ENCRYPTED",
+        "AT-M1-EVENT-RECOVERY"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-CONFIG",
+      "category": "configuration",
+      "behavior": "Strict human-editable TOML backed by one canonical schema and keychain aliases.",
+      "products": [
+        "Jarvis",
+        "Home Assistant"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://developers.home-assistant.io/docs/voice/overview/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M1",
+      "acceptance_test_ids": [
+        "AT-M1-CONFIG-ROUNDTRIP"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-RUNTIME",
+      "category": "agent-runtime",
+      "behavior": "Provider-neutral AgentRuntime with pinned authenticated OpenCode sidecar, streaming, failover, and session lifecycle.",
+      "products": [
+        "Jarvis",
+        "OpenCode",
+        "Codex",
+        "Claude Code",
+        "Gemini CLI"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://opencode.ai/docs/",
+        "https://developers.openai.com/codex/",
+        "https://docs.anthropic.com/en/docs/claude-code/overview",
+        "https://github.com/google-gemini/gemini-cli"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M2",
+      "acceptance_test_ids": [
+        "AT-M2-STREAMED-TURN",
+        "AT-M2-SIDECAR-AUTH"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-VOICE",
+      "category": "audio",
+      "behavior": "Offline and hosted wake, VAD, STT, TTS, AEC, barge-in, dictation, multilingual, and visible microphone privacy.",
+      "products": [
+        "Jarvis",
+        "GLaDOS",
+        "OpenVoiceOS",
+        "Home Assistant Assist",
+        "Pipecat",
+        "LiveKit Agents"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://github.com/dnhkng/GlaDOS",
+        "https://openvoiceos.github.io/ovos-technical-manual/",
+        "https://developers.home-assistant.io/docs/voice/overview/",
+        "https://docs.pipecat.ai/",
+        "https://docs.livekit.io/agents/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M3",
+      "acceptance_test_ids": [
+        "AT-M3-OFFLINE-VOICE",
+        "AT-M3-BARGE-IN"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-CONVERSATION",
+      "category": "conversation",
+      "behavior": "Persistent typed and voice conversations with projects, persona, follow-up, guest, sleep, mute, quiet, and stop states.",
+      "products": [
+        "Jarvis",
+        "ChatGPT",
+        "Claude",
+        "Gemini",
+        "Alexa+"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://openai.com/chatgpt/overview/",
+        "https://www.anthropic.com/claude",
+        "https://gemini.google.com/",
+        "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M3",
+      "acceptance_test_ids": [
+        "AT-M3-CONVERSATION-STATES"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-WORKSPACE",
+      "category": "ui",
+      "behavior": "Cinematic HUD and accessible full workspace showing exact activity, agents, approvals, artifacts, usage, and diagnostics.",
+      "products": [
+        "Jarvis",
+        "Raycast",
+        "OpenHands",
+        "Cursor",
+        "Windsurf"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://developers.raycast.com/",
+        "https://docs.all-hands.dev/",
+        "https://docs.cursor.com/",
+        "https://docs.windsurf.com/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M4",
+      "acceptance_test_ids": [
+        "AT-M4-ACCESSIBLE-WORKSPACE"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-PROJECTS",
+      "category": "projects",
+      "behavior": "Per-project context, worktrees, terminals, project memory, and safe registered workspace boundaries.",
+      "products": [
+        "Jarvis",
+        "Codex",
+        "Claude Code",
+        "Aider",
+        "Cline"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://developers.openai.com/codex/",
+        "https://docs.anthropic.com/en/docs/claude-code/overview",
+        "https://aider.chat/docs/",
+        "https://docs.cline.bot/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M4",
+      "acceptance_test_ids": [
+        "AT-M4-PROJECT-CONTEXT"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-SAFETY",
+      "category": "security",
+      "behavior": "Tool schemas, scopes, risk/effect policy, scoped consent, data zones, checkpoints, rollback, egress, and immutable audit.",
+      "products": [
+        "Jarvis",
+        "OpenCode",
+        "Claude Code",
+        "Codex"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://opencode.ai/docs/",
+        "https://docs.anthropic.com/en/docs/claude-code/overview",
+        "https://developers.openai.com/codex/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "strengthened",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M5",
+      "acceptance_test_ids": [
+        "AT-M5-POLICY-GATE",
+        "AT-M5-ROLLBACK",
+        "AT-M9-SECURITY"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-DESKTOP",
+      "category": "native-tools",
+      "behavior": "Accessibility-first apps, windows, input, capture, clipboard, files, terminal, notifications, media, power, OCR, and health.",
+      "products": [
+        "Jarvis",
+        "OpenClaw",
+        "Raycast",
+        "Alfred"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://docs.openclaw.ai/",
+        "https://developers.raycast.com/",
+        "https://www.alfredapp.com/help/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M5",
+      "acceptance_test_ids": [
+        "AT-M5-DESKTOP-TOOLS"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-BROWSER",
+      "category": "browser",
+      "behavior": "Replaceable isolated Chromium/CDP engine with structured handles, takeover, domain policy, quarantine, and injection boundaries.",
+      "products": [
+        "Jarvis",
+        "Playwright MCP",
+        "Chrome DevTools MCP",
+        "browser-use",
+        "Stagehand",
+        "Skyvern"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://github.com/microsoft/playwright-mcp",
+        "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+        "https://docs.browser-use.com/",
+        "https://docs.stagehand.dev/",
+        "https://docs.skyvern.com/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "official-pack",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M5",
+      "acceptance_test_ids": [
+        "AT-M5-BROWSER-SAFE"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-AGENT",
+      "category": "agent-runtime",
+      "behavior": "Durable goals, validated task DAGs, planner/executor/reviewer agents, bounded parallelism, recovery, steering, and verification.",
+      "products": [
+        "OpenCode",
+        "Codex",
+        "Claude Code",
+        "OpenHands",
+        "Goose"
+      ],
+      "sources": [
+        "https://opencode.ai/docs/",
+        "https://developers.openai.com/codex/",
+        "https://docs.anthropic.com/en/docs/claude-code/overview",
+        "https://docs.all-hands.dev/",
+        "https://block.github.io/goose/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "new",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M6",
+      "acceptance_test_ids": [
+        "AT-M6-DAG-RECOVERY"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-MEMORY",
+      "category": "memory",
+      "behavior": "Working, episodic, semantic, procedural, project, and entity memory with provenance, review, conflict, expiry, FTS, and vectors.",
+      "products": [
+        "Jarvis",
+        "OpenClaw",
+        "ChatGPT",
+        "Claude"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://docs.openclaw.ai/",
+        "https://openai.com/chatgpt/overview/",
+        "https://www.anthropic.com/claude"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "strengthened",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M6",
+      "acceptance_test_ids": [
+        "AT-M6-MEMORY-PROVENANCE"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-AUTOMATION",
+      "category": "automation",
+      "behavior": "Cron, event, semantic, and heartbeat triggers with quiet hours, previous state, concurrency, missed runs, and failure pauses.",
+      "products": [
+        "Jarvis",
+        "ChatGPT Tasks",
+        "Home Assistant",
+        "automation platforms"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://help.openai.com/en/articles/10291617-scheduled-tasks-in-chatgpt",
+        "https://developers.home-assistant.io/docs/voice/overview/",
+        "https://docs.n8n.io/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "strengthened",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M6",
+      "acceptance_test_ids": [
+        "AT-M6-AUTOMATION-RECOVERY"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-EXTENSIONS",
+      "category": "extensions",
+      "behavior": "Agent Skills, experts, commands, MCP, OAuth connectors, signed plugins, WASI/process isolation, and proposal review.",
+      "products": [
+        "Jarvis",
+        "OpenCode",
+        "Claude Code",
+        "Codex",
+        "Cline"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://opencode.ai/docs/",
+        "https://docs.anthropic.com/en/docs/claude-code/overview",
+        "https://developers.openai.com/codex/",
+        "https://docs.cline.bot/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "strengthened",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M7",
+      "acceptance_test_ids": [
+        "AT-M7-PLUGIN-SAFETY",
+        "AT-M7-COMPETITOR-COVERAGE"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-CONNECTORS",
+      "category": "connectors",
+      "behavior": "Official productivity, communications, development, smart-home, media, cloud, travel, shopping, and creative packs.",
+      "products": [
+        "ChatGPT",
+        "Claude",
+        "Gemini",
+        "Alexa+",
+        "Home Assistant"
+      ],
+      "sources": [
+        "https://openai.com/chatgpt/overview/",
+        "https://www.anthropic.com/claude",
+        "https://gemini.google.com/",
+        "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus",
+        "https://developers.home-assistant.io/docs/voice/overview/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "new",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "official-pack",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M7",
+      "acceptance_test_ids": [
+        "AT-M7-COMPETITOR-COVERAGE"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "CAP-RESEARCH",
+      "category": "research",
+      "behavior": "Cited multi-source research, contradiction reporting, saved projects, structured extraction, and source provenance.",
+      "products": [
+        "ChatGPT",
+        "Perplexity",
+        "Gemini",
+        "Claude"
+      ],
+      "sources": [
+        "https://openai.com/chatgpt/overview/",
+        "https://www.perplexity.ai/help-center/en/articles/10352895-how-does-perplexity-work",
+        "https://gemini.google.com/",
+        "https://www.anthropic.com/claude"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "new",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M7",
+      "acceptance_test_ids": [
+        "AT-M7-COMPETITOR-COVERAGE"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "CAP-ARTIFACTS",
+      "category": "artifacts",
+      "behavior": "Versioned code, diffs, tables, charts, diagrams, reports, media, office documents, and whiteboard cards.",
+      "products": [
+        "Jarvis",
+        "ChatGPT",
+        "Claude",
+        "Gemini"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://openai.com/chatgpt/overview/",
+        "https://www.anthropic.com/claude",
+        "https://gemini.google.com/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M4",
+      "acceptance_test_ids": [
+        "AT-M4-ACCESSIBLE-WORKSPACE"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-REMOTE",
+      "category": "remote",
+      "behavior": "Optional secure, capability-negotiated third-party remote protocol with fresh pairing and revocation.",
+      "products": [
+        "Jarvis",
+        "OpenCode"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://opencode.ai/docs/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "official-pack",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M7",
+      "acceptance_test_ids": [
+        "AT-M7-REMOTE-PROTOCOL"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "CAP-MIGRATION",
+      "category": "migration",
+      "behavior": "Read-only discovery, dry-run, consented idempotent import, provenance, reports, and no plaintext secret transfer.",
+      "products": [
+        "Jarvis"
+      ],
+      "sources": [
+        "legacy://Jarvis"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "new",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M8",
+      "acceptance_test_ids": [
+        "AT-M8-MIGRATION-DRY-RUN"
+      ],
+      "status": "in_progress"
+    },
+    {
+      "id": "CAP-OPERATIONS",
+      "category": "operations",
+      "behavior": "Single-app lifecycle, watchdog, suspend recovery, signed multi-platform packaging, updates, rollback, export, uninstall, and support bundles.",
+      "products": [
+        "Jarvis",
+        "Tauri"
+      ],
+      "sources": [
+        "legacy://Jarvis",
+        "https://v2.tauri.app/"
+      ],
+      "verified_on": "2026-08-26",
+      "source_confidence": "high",
+      "legacy_status": "ported",
+      "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
+      "route": "core",
+      "platforms": {
+        "windows": "supported-or-gated",
+        "macos": "supported-or-gated",
+        "linux": "supported-or-gated"
+      },
+      "dependencies": [],
+      "milestone": "M9",
+      "acceptance_test_ids": [
+        "AT-M1-PLATFORM-BUILD",
+        "AT-M9-LIFECYCLE",
+        "AT-M9-PERFORMANCE"
+      ],
+      "status": "in_progress"
+    }
+  ]
+}

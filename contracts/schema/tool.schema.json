@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personal-agent.dev/schema/tool/v1",
+  "title": "Personal Agent tool manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "description", "input_schema", "output_schema", "scopes", "risk", "effect", "idempotency", "reversibility", "zones_read", "zones_written", "user_presence", "platforms"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "description": { "type": "string", "minLength": 1 },
+    "input_schema": { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+    "output_schema": { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+    "requires": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "risk": { "enum": ["read", "reversible", "consequential", "irreversible"] },
+    "effect": { "enum": ["observe", "local-write", "external-write", "communication", "commerce", "security", "power"] },
+    "idempotency": { "enum": ["safe", "with-key", "unsafe"] },
+    "reversibility": {
+      "type": "object",
+      "required": ["coverage"],
+      "properties": {
+        "coverage": { "enum": ["full", "partial", "none"] },
+        "rollback": { "type": "string" }
+      }
+    },
+    "zones_read": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "zones_written": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "user_presence": { "type": "boolean" },
+    "platforms": {
+      "type": "object",
+      "required": ["windows", "macos", "linux"],
+      "properties": {
+        "windows": { "$ref": "#/$defs/platform" },
+        "macos": { "$ref": "#/$defs/platform" },
+        "linux": { "$ref": "#/$defs/platform" }
+      }
+    }
+  },
+  "$defs": {
+    "platform": {
+      "type": "object",
+      "required": ["supported"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "remediation": { "type": "string" }
+      }
+    }
+  }
+}
