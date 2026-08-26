@@ -12,7 +12,7 @@ const navigation = [
 ] as const;
 type Destination = (typeof navigation)[number];
 type Json = Record<string, unknown>;
-type ChatMessage = { id: string; role: "user" | "assistant" | "system"; text: string; streaming?: boolean };
+type ChatMessage = { id: string; role: "user" | "assistant" | "system"; text: string; streaming?: boolean; failed?: boolean };
 type Attachment = { name: string; mime: string; url: string; size: number };
 
 type Diagnostic = {
@@ -27,7 +27,7 @@ const emptyProjection: Projection = {
   unclean_shutdowns: 0, recovered_unclean_run: false,
 };
 
-const fallbackConfig: AppConfig = {
+export const fallbackConfig: AppConfig = {
   schema_version: 1,
   persona: { name: "JARVIS", style: "Composed, concise, and quietly witty." },
   agent: { default_parallelism: 3, max_delegation_depth: 3, require_plan_for_multistep: true, verify_success_criteria: true, default_token_budget: 0, default_cost_budget_microusd: 0, default_wall_time_minutes: 0, default_tool_call_budget: 0 },
@@ -103,6 +103,8 @@ function ChatView({ config, catalog, projection, voiceStatus, messages, setMessa
   const [agent, setAgent] = useState(config.runtime.default_agent);
   const [effort, setEffort] = useState(config.runtime.default_effort);
   const [sessionMenu, setSessionMenu] = useState(false);
+  const [turnStage, setTurnStage] = useState("Ready");
+  const [turnSeconds, setTurnSeconds] = useState(0);
   const endRef = useRef<HTMLDivElement>(null);
   const sessions = asArray(resourceData(catalog, "sessions", []));
   const models = resourceData<RuntimeCapability[]>(catalog, "models", []);
@@ -117,7 +119,7 @@ function ChatView({ config, catalog, projection, voiceStatus, messages, setMessa
   const send = useCallback(async (raw: string, fromVoice = false) => {
     const text = raw.trim();
     if (!text || busy) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(""); setTurnStage("Connecting to model"); setTurnSeconds(0);
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "user", text }, { id: "streaming", role: "assistant", text: "", streaming: true }]);
     setComposer("");
     try {
@@ -151,18 +153,31 @@ function ChatView({ config, catalog, projection, voiceStatus, messages, setMessa
     const unlisten: Array<() => void> = [];
     void listen<EventEnvelope>("runtime-event", ({ payload }) => {
       onHistory(payload);
+      if (payload.type === "response.started") setTurnStage("Thinking");
+      if (payload.type === "reasoning.available") setTurnStage("Reasoning");
+      if (payload.type === "tool.started") setTurnStage(`Using ${String(eventPayload(payload).tool ?? "a tool")}`);
+      if (payload.type === "tool.completed") setTurnStage("Reviewing tool result");
+      if (payload.type === "response.retrying") setTurnStage(`Provider retry ${String(eventPayload(payload).attempt ?? "")}`.trim());
       if (payload.type === "response.delta") {
+        setTurnStage("Responding");
         const delta = String(eventPayload(payload).delta ?? eventPayload(payload).text ?? "");
         if (delta) setMessages((current) => current.map((item) => item.id === "streaming" ? { ...item, text: item.text + delta } : item));
       }
     }).then((fn) => unlisten.push(fn));
-    void listen<{ text: string; speak: boolean }>("runtime-turn-complete", ({ payload }) => {
-      setMessages((current) => current.map((item) => item.id === "streaming" ? { ...item, id: crypto.randomUUID(), text: item.text || payload.text || "Completed without a text response.", streaming: false } : item));
-      setBusy(false); void refreshCatalog();
+    void listen<{ text: string; speak: boolean; status?: string; error?: string | null }>("runtime-turn-complete", ({ payload }) => {
+      const failed = payload.status === "failed";
+      setMessages((current) => current.map((item) => item.id === "streaming" ? { ...item, id: crypto.randomUUID(), text: item.text || payload.text || payload.error || (failed ? "The turn failed before a response was produced." : "Completed without a text response."), streaming: false, failed } : item));
+      setBusy(false); setTurnStage(failed ? "Needs attention" : "Ready"); if (payload.error) setError(payload.error); void refreshCatalog();
       if (payload.speak && payload.text && voiceStatus.tts_ready) void invoke("voice_speak", { text: payload.text }).catch((caught) => setError(String(caught)));
     }).then((fn) => unlisten.push(fn));
     return () => unlisten.forEach((fn) => fn());
   }, [onHistory, refreshCatalog, setMessages, voiceStatus.tts_ready]);
+
+  useEffect(() => {
+    if (!busy) return;
+    const timer = window.setInterval(() => setTurnSeconds((seconds) => seconds + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
@@ -199,6 +214,15 @@ function ChatView({ config, catalog, projection, voiceStatus, messages, setMessa
     } catch (caught) { setError(String(caught)); }
   };
 
+  const stopTurn = async () => {
+    if (!activeSession) return;
+    try {
+      await invoke("session_action", { action: "abort", sessionId: activeSession, directory: config.runtime.working_directory, title: null, confirmed: false });
+      setMessages((current) => current.map((item) => item.id === "streaming" ? { ...item, id: crypto.randomUUID(), text: item.text || "Stopped.", streaming: false, failed: true } : item));
+      setBusy(false); setTurnStage("Stopped"); setError("");
+    } catch (caught) { setError(String(caught)); }
+  };
+
   const addFiles = async (files: FileList | null) => {
     if (!files) return;
     const maximum = Number(config.workspace.attachment_limit_mb ?? 25) * 1024 * 1024;
@@ -215,8 +239,8 @@ function ChatView({ config, catalog, projection, voiceStatus, messages, setMessa
   return <div className="chat-layout">
     <aside className="session-rail"><button className="new-session" onClick={() => void sessionAction("new", "")}>＋ New session</button><div className="session-list">{sessions.length ? sessions.map((session) => <button key={String(session.id)} className={activeSession === session.id ? "active" : ""} onClick={() => void sessionAction("resume", String(session.id))}><strong>{labelOf(session, "Session")}</strong><small>{String(session.id)}</small></button>) : <p>No saved sessions</p>}</div></aside>
     <section className="conversation">
-      <div className="conversation-toolbar"><select aria-label="Model" value={model} onChange={(event) => setModel(event.target.value)}><option value="">Default model</option>{models.map((item) => <option key={`${item.provider_id}/${item.model_id}`} value={`${item.provider_id}/${item.model_id}`}>{item.provider_id} / {item.model_id}</option>)}</select><select aria-label="Agent" value={agent} onChange={(event) => setAgent(event.target.value)}><option value="build">Build</option>{agents.map((item) => <option key={labelOf(item)} value={String(item.name ?? item.id)}>{labelOf(item)}</option>)}</select><select aria-label="Reasoning effort" value={effort} onChange={(event) => setEffort(event.target.value)}><option value="">Default effort</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select><span className={`runtime-dot ${projection.runtime_healthy ? "online" : "offline"}`}>{projection.runtime_healthy ? "Runtime connected" : "Runtime unavailable"}</span><div className="session-actions"><button onClick={() => setSessionMenu((value) => !value)}>•••</button>{sessionMenu && <div>{["rename", "fork", "compact", busy ? "abort" : "", "share", "unshare", "delete"].filter(Boolean).map((action) => <button key={action} onClick={() => void sessionAction(action)} disabled={!activeSession}>{action}</button>)}</div>}</div></div>
-      <div className="messages" aria-live="polite">{!messages.length && <div className="welcome"><div className="reactor-mini"><i /><span /></div><span className="eyebrow">{config.persona.name} · LOCAL CORE</span><h2>What shall we build?</h2><p>Use local voice, attach files or images, run slash commands, and let the bounded OpenCode runtime work inside <b>{config.runtime.working_directory}</b>.</p><div>{["Inspect this project", "Explain the current changes", "Run the test suite"].map((text) => <button key={text} onClick={() => setComposer(text)}>{text}</button>)}</div></div>}{messages.map((message) => <article key={message.id} className={`chat-message ${message.role}`}><div className="message-avatar">{message.role === "user" ? "Y" : "J"}</div><div><header><strong>{message.role === "user" ? "You" : config.persona.name}</strong>{message.streaming && <span>thinking / working…</span>}</header><p>{message.text || "…"}</p>{message.role === "assistant" && message.text && <div className="message-actions"><button onClick={() => void navigator.clipboard.writeText(message.text)}>Copy</button><button disabled={!voiceStatus.tts_ready} onClick={() => void invoke("voice_speak", { text: message.text })}>Speak</button></div>}</div></article>)}<div ref={endRef} /></div>
+      <div className="conversation-toolbar"><select aria-label="Model" value={model} onChange={(event) => setModel(event.target.value)}><option value="">Default model</option>{models.map((item) => <option key={`${item.provider_id}/${item.model_id}`} value={`${item.provider_id}/${item.model_id}`}>{item.provider_id} / {item.model_id}</option>)}</select><select aria-label="Agent" value={agent} onChange={(event) => setAgent(event.target.value)}><option value="build">Build</option>{agents.map((item) => <option key={labelOf(item)} value={String(item.name ?? item.id)}>{labelOf(item)}</option>)}</select><select aria-label="Reasoning effort" value={effort} onChange={(event) => setEffort(event.target.value)}><option value="">Default effort</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select>{busy ? <div className="turn-progress"><span className="thinking-pulse" /><strong>{turnStage}</strong><small>{turnSeconds}s</small><button onClick={() => void stopTurn()}>Stop</button></div> : <span className={`runtime-dot ${projection.runtime_healthy ? "online" : "offline"}`}>{projection.runtime_healthy ? "Ready" : "Runtime unavailable"}</span>}<div className="session-actions"><button aria-label="Session actions" onClick={() => setSessionMenu((value) => !value)}>•••</button>{sessionMenu && <div>{["rename", "fork", "compact", "share", "unshare", "delete"].map((action) => <button key={action} onClick={() => void sessionAction(action)} disabled={!activeSession}>{action}</button>)}</div>}</div></div>
+      <div className="messages" aria-live="polite">{!messages.length && <div className="welcome"><button className={`reactor-mini voice-hero ${voice.state}`} aria-label="Talk to your agent" disabled={!voiceStatus.stt_ready} onClick={() => voice.state === "listening" ? void voice.stop() : void voice.start()}><i /><span style={{ transform: `scale(${1 + voice.level * .45})` }} /><b>{voice.state === "listening" ? "Listening…" : "Tap to talk"}</b></button><span className="eyebrow">{config.persona.name} · PRIVATE VOICE CORE</span><h2>How can I help?</h2><p>Speak naturally or type below. Your local voice pipeline, connected models, tools, files, and sessions are available in one workspace.</p><div>{["Inspect this project", "Explain the current changes", "Run the test suite"].map((text) => <button key={text} onClick={() => setComposer(text)}>{text}</button>)}</div><small className="voice-hint">Hold <kbd>{config.voice.push_to_talk_hotkey || "Space"}</kbd> to talk · {voiceStatus.stt_ready ? "offline speech ready" : "install speech in Settings"}</small></div>}{messages.map((message) => <article key={message.id} className={`chat-message ${message.role} ${message.failed ? "failed" : ""}`}><div className="message-avatar">{message.role === "user" ? "Y" : config.persona.name.slice(0, 1)}</div><div><header><strong>{message.role === "user" ? "You" : config.persona.name}</strong>{message.streaming && <span><i className="thinking-pulse" />{turnStage} · {turnSeconds}s</span>}{message.failed && <span className="message-failed">Stopped / failed</span>}</header><p>{message.text || "…"}</p>{message.role === "assistant" && message.text && <div className="message-actions"><button onClick={() => void navigator.clipboard.writeText(message.text)}>Copy</button><button disabled={!voiceStatus.tts_ready} onClick={() => void invoke("voice_speak", { text: message.text })}>Speak</button></div>}</div></article>)}<div ref={endRef} /></div>
       {attachments.length > 0 && <div className="attachments">{attachments.map((item, index) => <span key={`${item.name}-${index}`}>{item.name}<button aria-label={`Remove ${item.name}`} onClick={() => setAttachments((current) => current.filter((_, position) => position !== index))}>×</button></span>)}</div>}{(error || voice.error) && <p className="error-banner" role="alert">{error || voice.error}</p>}
       <form className="composer" onSubmit={(event) => { event.preventDefault(); void send(composer); }}><label className="attach-button" title="Attach images or files">＋<input aria-label="Attach files" type="file" multiple onChange={(event) => void addFiles(event.target.files)} /></label><textarea aria-label="Message JARVIS" rows={1} value={composer} placeholder="Message JARVIS…  (/ for commands, @ for files)" onChange={(event) => setComposer(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(composer); } }} /><button type="button" className={`voice-button ${voice.state}`} aria-label={voice.state === "listening" ? "Stop voice capture" : "Start voice capture"} disabled={!voiceStatus.stt_ready || voice.state === "transcribing"} onClick={() => voice.state === "listening" ? void voice.stop() : void voice.start()}><span style={{ transform: `scale(${1 + voice.level * .35})` }}>●</span>{voice.state === "transcribing" ? "…" : "MIC"}</button><button className="send-button" type="submit" disabled={!composer.trim() || busy}>↑</button></form>
       <footer className="voice-strip"><span className={projection.microphone_active ? "live" : ""}>● {projection.microphone_active ? "MICROPHONE LIVE" : "MICROPHONE PRIVATE"}</span><span>STT {voiceStatus.stt_ready ? "READY" : "MISSING"}</span><span>TTS {voiceStatus.tts_ready ? "READY" : "MISSING"}</span><button onClick={() => void invoke("voice_stop")}>Stop audio</button></footer>
@@ -263,6 +287,6 @@ export function App() {
   useEffect(() => { const key = (event: KeyboardEvent) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setPalette((value) => !value); } if (event.key === "Escape") setPalette(false); }; window.addEventListener("keydown", key); return () => window.removeEventListener("keydown", key); }, []);
   const filteredNavigation = useMemo(() => navigation.filter((item) => item.toLowerCase().includes(paletteQuery.toLowerCase())), [paletteQuery]); const refreshCatalog = useCallback((next: RuntimeCatalog) => setCatalog(next), []); const addHistory = useCallback((event: EventEnvelope) => setHistory((current) => current.some((item) => item.event_id === event.event_id) ? current : [...current, event]), []); const toggleAutostart = () => { if (autostart === null) return; void invoke<boolean>("set_autostart", { enabled: !autostart }).then(setAutostart).catch((caught) => setBootError(String(caught))); };
   let content: React.ReactNode;
-  if (active === "Chat") content = <ChatView config={config} catalog={catalog} projection={projection} voiceStatus={voice} messages={messages} setMessages={setMessages} activeSession={activeSession} setActiveSession={setActiveSession} onProjection={setProjection} onHistory={addHistory} onCatalog={refreshCatalog} onVoice={setVoice} />; else if (["Goals & tasks", "Memory", "Automations", "Artifacts"].includes(active)) content = <DomainView destination={active} history={history} projection={projection} setHistory={setHistory} setProjection={setProjection} />; else if (active === "Projects & terminal") content = <ProjectView config={config} catalog={catalog} onCatalog={setCatalog} />; else if (active === "Integrations") content = <IntegrationsView catalog={catalog} config={config} onCatalog={setCatalog} />; else if (active === "Skills & agents") content = <CatalogView destination={active} catalog={catalog} />; else if (active === "History") content = <HistoryView history={history} />; else if (active === "Browser") content = <BrowserView config={config} />; else if (active === "Diagnostics") content = <DiagnosticsView diagnostic={diagnostic} catalog={catalog} projection={projection} voice={voice} />; else if (active === "Usage & egress") content = <UsageView history={history} />; else content = <ConfigEditor config={config} catalog={catalog} voice={voice} autostart={autostart} onAutostart={toggleAutostart} onConfig={setConfig} onVoice={setVoice} />;
+  if (active === "Chat") content = <ChatView config={config} catalog={catalog} projection={projection} voiceStatus={voice} messages={messages} setMessages={setMessages} activeSession={activeSession} setActiveSession={setActiveSession} onProjection={setProjection} onHistory={addHistory} onCatalog={refreshCatalog} onVoice={setVoice} />; else if (["Goals & tasks", "Memory", "Automations", "Artifacts"].includes(active)) content = <DomainView destination={active} history={history} projection={projection} setHistory={setHistory} setProjection={setProjection} />; else if (active === "Projects & terminal") content = <ProjectView config={config} catalog={catalog} onCatalog={setCatalog} />; else if (active === "Integrations") content = <IntegrationsView catalog={catalog} config={config} onCatalog={setCatalog} />; else if (active === "Skills & agents") content = <CatalogView destination={active} catalog={catalog} />; else if (active === "History") content = <HistoryView history={history} />; else if (active === "Browser") content = <BrowserView config={config} />; else if (active === "Diagnostics") content = <DiagnosticsView diagnostic={diagnostic} catalog={catalog} projection={projection} voice={voice} />; else if (active === "Usage & egress") content = <UsageView history={history} />; else content = <ConfigEditor config={config} catalog={catalog} voice={voice} autostart={autostart} onAutostart={toggleAutostart} onConfig={setConfig} onVoice={setVoice} onCatalog={setCatalog} />;
   return <div className={`app-shell ${config.ui.compact_sidebar ? "compact-sidebar" : ""}`}><aside className="sidebar"><div className="brand"><div className="brand-mark"><i /><b /></div><div><strong>PERSONAL<br />AGENT</strong><small>{config.persona.name} · BOUNDED</small></div></div><nav>{navigation.map((item) => <button key={item} className={active === item ? "active" : ""} aria-current={active === item ? "page" : undefined} aria-label={item} onClick={() => setActive(item)}><i>{icon(item)}</i><span>{item}</span>{item === "Goals & tasks" && projection.tasks_running > 0 && <b>{projection.tasks_running}</b>}</button>)}</nav><div className="profile"><span>Y</span><div><strong>Default profile</strong><small>Private · Local state</small></div></div></aside><main><header className="topbar"><div><span className="eyebrow">WORKSPACE / {active.toUpperCase()}</span><h1>{active === "Chat" ? "Good morning, Yuval." : active}</h1></div><div className="top-actions"><button><b>O</b> OpenCode <small>{diagnostic.opencode.pinned}</small></button><button>{config.persona.name} <small>{config.runtime.default_agent || "agent"}</small></button><button onClick={() => setConfig((current) => ({ ...current, ui: { ...current.ui, compact_sidebar: !current.ui.compact_sidebar } }))}>HUD</button><button onClick={() => setActive("Settings")}>{config.ui.accent.toUpperCase()}</button><button aria-label="Open command palette" onClick={() => setPalette(true)}><kbd>⌘</kbd><kbd>K</kbd></button></div></header>{bootError && <div className="boot-error">{bootError}<button onClick={() => setBootError("")}>×</button></div>}<div className="content">{content}</div><footer className="app-footer"><span className={projection.runtime_healthy ? "good" : "warn"}>● CORE {projection.runtime_healthy ? "ONLINE" : "DEGRADED"}</span><span>MICROPHONE {projection.microphone_active ? "LIVE" : "PRIVATE"}</span><span>PRIVATE MODE</span><span className="footer-right">LINUX · X86_64 <b>v{diagnostic.version}</b></span></footer></main>{palette && <div className="palette-backdrop" onMouseDown={() => setPalette(false)}><section className="command-palette" role="dialog" aria-label="COMMAND PALETTE" onMouseDown={(event) => event.stopPropagation()}><header><span>⌕</span><input autoFocus value={paletteQuery} placeholder="Go to…" onChange={(event) => setPaletteQuery(event.target.value)} /><kbd>ESC</kbd></header>{filteredNavigation.map((item) => <button key={item} onClick={() => { setActive(item); setPalette(false); setPaletteQuery(""); }}><i>{icon(item)}</i><span>{item}</span></button>)}</section></div>}</div>;
 }

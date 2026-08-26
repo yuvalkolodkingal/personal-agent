@@ -1652,9 +1652,40 @@ fn normalize_upstream_event(
         ),
         "session.next.step.failed" | "session.error" => (
             "response.failed",
-            selected_properties(properties, &["assistantMessageID"]),
+            selected_properties(properties, &["assistantMessageID", "error"]),
             true,
         ),
+        "session.status" => {
+            let status = properties
+                .pointer("/status/type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match status {
+                "idle" => (
+                    "response.completed",
+                    serde_json::json!({"terminal": true, "source": "session.status"}),
+                    true,
+                ),
+                "retry" => (
+                    "response.retrying",
+                    selected_properties(
+                        properties.get("status").unwrap_or(&Value::Null),
+                        &["attempt", "message", "next"],
+                    ),
+                    false,
+                ),
+                "busy" => (
+                    "response.started",
+                    serde_json::json!({"source": "session.status"}),
+                    false,
+                ),
+                _ => (
+                    "runtime.upstream_event",
+                    serde_json::json!({"upstream_type": upstream_type, "status": status}),
+                    false,
+                ),
+            }
+        }
         "session.idle" => (
             "response.completed",
             serde_json::json!({"terminal": true}),
@@ -2483,5 +2514,26 @@ mod tests {
                 .expect("payload JSON")
                 .contains("private chain of thought")
         );
+    }
+
+    #[test]
+    fn session_status_idle_is_terminal_and_retry_remains_live() {
+        let idle = json!({
+            "type": "session.status",
+            "properties": {"sessionID": "ses_test", "status": {"type": "idle"}}
+        });
+        let (event, terminal) =
+            normalize_upstream_event(1, "ses_test", &idle, None).expect("idle status");
+        assert_eq!(event.r#type, "response.completed");
+        assert!(terminal);
+
+        let retry = json!({
+            "type": "session.status",
+            "properties": {"sessionID": "ses_test", "status": {"type": "retry", "attempt": 2, "message": "rate limited"}}
+        });
+        let (event, terminal) =
+            normalize_upstream_event(2, "ses_test", &retry, None).expect("retry status");
+        assert_eq!(event.r#type, "response.retrying");
+        assert!(!terminal);
     }
 }

@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
 
@@ -179,7 +180,7 @@ pub(crate) async fn runtime_catalog(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Native turn orchestration keeps lifecycle outcomes in one auditable path.
 pub(crate) async fn chat_send(
     text: String,
     attachments: Option<Vec<Value>>,
@@ -244,10 +245,63 @@ pub(crate) async fn chat_send(
     });
 
     let session_for_task = session_id.clone();
+    let directory_for_task = directory.display().to_string();
     let mut receiver = receiver;
     tauri::async_runtime::spawn(async move {
         let mut response = String::new();
-        while let Some(event) = receiver.recv().await {
+        let started = Instant::now();
+        let mut outcome = "completed";
+        let mut failure: Option<String> = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(60), receiver.recv()).await;
+            let event = match next {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    outcome = "failed";
+                    failure = Some(
+                        "The OpenCode event stream ended before the turn completed.".to_owned(),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    let state = app.state::<DesktopState>();
+                    let status = state
+                        .runtime
+                        .lock()
+                        .await
+                        .request_json(
+                            reqwest::Method::GET,
+                            "/session/status",
+                            &[("directory", directory_for_task.clone())],
+                            None,
+                        )
+                        .await;
+                    let session_status = status
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.get(&session_for_task))
+                        .and_then(|value| value.get("type"))
+                        .and_then(Value::as_str);
+                    if session_status == Some("idle") {
+                        break;
+                    }
+                    if started.elapsed() >= Duration::from_mins(30) {
+                        let _ = state
+                            .runtime
+                            .lock()
+                            .await
+                            .abort_session(&session_for_task)
+                            .await;
+                        outcome = "failed";
+                        failure = Some(
+                            "The turn exceeded the 30 minute safety limit and was stopped."
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            };
             if event.r#type == "response.delta"
                 && let Ok(payload) = event.payload()
                 && let Some(delta) = payload
@@ -262,10 +316,39 @@ pub(crate) async fn chat_send(
                 let _ = profile.record_runtime_event(event.clone());
             }
             let _ = app.emit("runtime-event", &event);
+            if event.r#type == "response.failed" {
+                outcome = "failed";
+                failure = event
+                    .payload()
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .pointer("/error/data/message")
+                            .or_else(|| payload.pointer("/error/message"))
+                            .or_else(|| payload.get("message"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        Some(
+                            "The provider could not complete this turn. Check its connection and model settings."
+                                .to_owned(),
+                        )
+                    });
+                break;
+            }
             if matches!(
                 event.r#type.as_str(),
-                "response.completed" | "response.failed"
+                "runtime.stream_error" | "runtime.stream_closed"
             ) {
+                outcome = "failed";
+                failure = Some(
+                    "The OpenCode response stream disconnected. You can retry this message."
+                        .to_owned(),
+                );
+                break;
+            }
+            if event.r#type == "response.completed" {
                 break;
             }
         }
@@ -275,6 +358,9 @@ pub(crate) async fn chat_send(
                 "session_id": session_for_task,
                 "text": response,
                 "speak": speak_response,
+                "status": outcome,
+                "error": failure,
+                "elapsed_ms": started.elapsed().as_millis(),
             }),
         );
     });
@@ -789,6 +875,115 @@ fn valid_provider_id(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
+}
+
+fn valid_oauth_url(value: &str) -> bool {
+    value.len() <= 8_192
+        && (value.starts_with("https://")
+            || value.starts_with("http://127.0.0.1:")
+            || value.starts_with("http://localhost:"))
+}
+
+fn open_external_url(value: &str) -> Result<(), String> {
+    if !valid_oauth_url(value) {
+        return Err("provider returned an invalid authorization URL".to_owned());
+    }
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    };
+    command
+        .arg(value)
+        .spawn()
+        .map_err(|error| format!("could not open the authorization page: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn provider_oauth_authorize(
+    provider_id: String,
+    method: u32,
+    inputs: Option<BTreeMap<String, String>>,
+    open_browser: bool,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    if !valid_provider_id(&provider_id) || method > 32 {
+        return Err("provider or authentication method is invalid".to_owned());
+    }
+    let inputs = inputs.unwrap_or_default();
+    if inputs.len() > 32
+        || inputs.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > 128
+                || !key.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+                || value.len() > 4_096
+        })
+    {
+        return Err("provider authentication inputs are invalid".to_owned());
+    }
+    let config = config_snapshot(&state)?;
+    let directory = canonical_directory(&config, None)?.display().to_string();
+    let authorization = state
+        .runtime
+        .lock()
+        .await
+        .request_json(
+            reqwest::Method::POST,
+            &format!("/provider/{provider_id}/oauth/authorize"),
+            &[("directory", directory)],
+            Some(json!({"method": method, "inputs": inputs})),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let url = authorization
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "provider did not return an authorization URL".to_owned())?;
+    if !valid_oauth_url(url) {
+        return Err("provider returned an invalid authorization URL".to_owned());
+    }
+    if open_browser {
+        open_external_url(url)?;
+    }
+    Ok(authorization)
+}
+
+#[tauri::command]
+pub(crate) async fn provider_oauth_callback(
+    provider_id: String,
+    method: u32,
+    code: Option<String>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    if !valid_provider_id(&provider_id) || method > 32 {
+        return Err("provider or authentication method is invalid".to_owned());
+    }
+    let code = code.map(|value| value.trim().to_owned());
+    if code.as_ref().is_some_and(|value| value.len() > 16_384) {
+        return Err("authorization code is too long".to_owned());
+    }
+    let config = config_snapshot(&state)?;
+    let directory = canonical_directory(&config, None)?.display().to_string();
+    state
+        .runtime
+        .lock()
+        .await
+        .request_json(
+            reqwest::Method::POST,
+            &format!("/provider/{provider_id}/oauth/callback"),
+            &[("directory", directory)],
+            Some(json!({"method": method, "code": code})),
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

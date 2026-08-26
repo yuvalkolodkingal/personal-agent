@@ -7,7 +7,7 @@ const listen = vi.hoisted(() => vi.fn());
 const listeners = vi.hoisted(() => new Map<string, (event: { payload: unknown }) => void>());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
-import { App } from "./App";
+import { App, fallbackConfig } from "./App";
 
 const projection = { last_sequence: 0, active_profile: "default", active_session: null, goals_total: 0, tasks_running: 0, approvals_waiting: 0, microphone_active: false, runtime_healthy: true, unclean_shutdowns: 0, recovered_unclean_run: false };
 
@@ -72,5 +72,45 @@ describe("desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "↑" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("chat_send", expect.objectContaining({ text: "Inspect this project", attachments: [], speakResponse: false })));
     expect(screen.getByText("Inspect this project")).toBeInTheDocument();
+  });
+
+  it("always resolves a failed native turn instead of remaining in thinking", async () => {
+    render(<App />);
+    await waitFor(() => expect(listeners.has("runtime-turn-complete")).toBe(true));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), { target: { value: "Hello" } });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() => expect(screen.getByText("Connecting to model")).toBeInTheDocument());
+    act(() => listeners.get("runtime-turn-complete")?.({ payload: { text: "", speak: false, status: "failed", error: "Provider sign-in is required." } }));
+    expect((await screen.findAllByText("Provider sign-in is required.")).length).toBeGreaterThan(0);
+    expect(screen.getByText("Stopped / failed")).toBeInTheDocument();
+    expect(screen.queryByText("Connecting to model")).not.toBeInTheDocument();
+  });
+
+  it("starts the provider-advertised OpenCode OAuth flow inside settings", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap") return Promise.resolve({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: { stt_ready: true, tts_ready: true, playback_ready: true, details: [] },
+        catalog: {
+          provider_auth: { available: true, data: { openai: [{ type: "oauth", label: "ChatGPT Plus / Pro" }] } },
+          providers: { available: true, data: { all: [{ id: "openai", name: "OpenAI" }], connected: [] } },
+          models: { available: true, data: [{ provider_id: "openai", model_id: "gpt-5", local: false, reasoning: true, tool_calls: true, input_modalities: ["text"], output_modalities: ["text"] }] },
+        },
+      });
+      if (command === "provider_oauth_authorize") return Promise.resolve({ url: "https://auth.openai.com/authorize", method: "auto", instructions: "Complete sign-in in your browser." });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start voice capture" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Providers & models" }));
+    expect(await screen.findByText("ChatGPT Plus / Pro")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue with browser" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("provider_oauth_authorize", {
+      providerId: "openai", method: 0, inputs: {}, openBrowser: true,
+    }));
+    expect(await screen.findByRole("dialog", { name: "Complete provider sign in" })).toBeInTheDocument();
   });
 });

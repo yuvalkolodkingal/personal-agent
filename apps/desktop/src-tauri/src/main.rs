@@ -446,6 +446,8 @@ fn main() {
             api::runtime_operation,
             api::runtime_answer,
             api::domain_action,
+            api::provider_oauth_authorize,
+            api::provider_oauth_callback,
             api::provider_set_key,
             api::provider_revoke,
             api::voice_status,
