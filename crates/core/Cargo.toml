@@ -8,16 +8,16 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 ed25519-dalek.workspace = true
-personal-agent-agent = { path = "../agent" }
-personal-agent-automation = { path = "../automation" }
-personal-agent-contracts = { path = "../contracts" }
-personal-agent-memory = { path = "../memory" }
-personal-agent-migration = { path = "../migration" }
-personal-agent-platform = { path = "../platform" }
-personal-agent-policy = { path = "../policy" }
-personal-agent-runtime = { path = "../runtime" }
-personal-agent-storage = { path = "../storage" }
-personal-agent-tools = { path = "../tools" }
+personal-agent-agent = { path = "../agent", version = "=0.1.0" }
+personal-agent-automation = { path = "../automation", version = "=0.1.0" }
+personal-agent-contracts = { path = "../contracts", version = "=0.1.0" }
+personal-agent-memory = { path = "../memory", version = "=0.1.0" }
+personal-agent-migration = { path = "../migration", version = "=0.1.0" }
+personal-agent-platform = { path = "../platform", version = "=0.1.0" }
+personal-agent-policy = { path = "../policy", version = "=0.1.0" }
+personal-agent-runtime = { path = "../runtime", version = "=0.1.0" }
+personal-agent-storage = { path = "../storage", version = "=0.1.0" }
+personal-agent-tools = { path = "../tools", version = "=0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true

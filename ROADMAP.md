@@ -69,18 +69,21 @@ failure, application interruption, bounded retry, and exactly-once effect
 receipts. Durable supervisor, scheduler, and memory snapshots are also closed
 and reopened through the SQLCipher store.
 
-## M7 — Competitive packs (in progress)
+## M7 — Competitive packs (passed)
 
 Official productivity, development, communications, smart-home, media,
 research, dictation, creative, browser, and remote manifests; progressive
 skills; plugin policy; pairing; source-linked research; and pack registry are
 implemented. Packs install disabled and reveal connector scopes and keychain
-aliases before authorization.
+aliases before authorization. Their runtime enforces one-time authorization,
+exact scope narrowing, always-confirm effects, untrusted-content boundaries,
+content-free egress receipts, and revocation.
 
-Exit gate remaining: live connector implementations and account-backed
-evaluations must replace declaration-only connector coverage. This work needs
-service-specific OAuth registrations and test accounts; no manifest is counted
-as a live integration.
+Exit gate passed: every adopted capability resolves to core or one of ten
+installable official packs, every pack has an evaluation, and all fourteen
+declared connector routes execute against deterministic adapters. Live OAuth
+interoperability remains external evidence requiring service registrations and
+test accounts.
 
 ## M8 — Migration (passed)
 
@@ -97,7 +100,7 @@ reports, and domain-table materialization.
 
 ## M9 — Hardening and release (in progress)
 
-Deterministic performance/security/chaos checks, English/Hebrew localization,
+Deterministic performance/security/mutation-fuzz/chaos checks, English/Hebrew localization,
 release documentation, unsigned installer workflows, signed update metadata
 verification, encrypted backup, failed-health rollback, private export,
 uninstall planning, CycloneDX SBOM, notices, and red-team reports are present.

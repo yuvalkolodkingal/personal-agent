@@ -434,6 +434,33 @@ mod tests {
         assert_eq!(gateway.audits().len(), 1);
     }
 
+    #[test]
+    fn mutation_corpus_secret_shapes_are_always_redacted() {
+        let secret_shapes = [
+            ["-----BE", "GIN PRIVATE KEY-----fixture"].concat(),
+            ["Bear", "er fixture-token"].concat(),
+            ["s", "k-fixture-token"].concat(),
+            ["gh", "p_fixture-token"].concat(),
+            ["github_", "pat_fixture-token"].concat(),
+        ];
+        let mut state = 0xa076_1d64_78bd_642f_u64;
+        for _ in 0..2_048 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let secret = &secret_shapes[usize::try_from(state).unwrap_or(0) % secret_shapes.len()];
+            let padding = format!("{:016x}", state.wrapping_mul(0x2545_f491_4f6c_dd1d));
+            let value = serde_json::json!({
+                "ordinary": format!("{padding}{secret}{padding}"),
+                "nested": [{"authorization": secret}],
+            });
+            let redacted = redact_secrets(value);
+            let serialized = serde_json::to_string(&redacted).expect("serialize");
+            assert!(!serialized.contains(secret));
+            assert!(serialized.contains("[REDACTED]"));
+        }
+    }
+
     struct ReversibleTool {
         descriptor: ToolDescriptor,
         state: Arc<Mutex<String>>,

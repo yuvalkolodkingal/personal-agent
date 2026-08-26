@@ -22,6 +22,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-audit,cargo-deny }
       - run: python scripts/security-gate.py
-      - run: cargo audit --locked
+      - run: python scripts/verify-fuzz.py
+      - run: cargo audit
       - run: cargo deny check advisories bans licenses sources
       - uses: gitleaks/gitleaks-action@v2

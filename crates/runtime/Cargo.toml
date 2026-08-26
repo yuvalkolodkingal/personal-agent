@@ -8,9 +8,9 @@ license.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-personal-agent-contracts = { path = "../contracts" }
-personal-agent-policy = { path = "../policy" }
-personal-agent-tools = { path = "../tools" }
+personal-agent-contracts = { path = "../contracts", version = "=0.1.0" }
+personal-agent-policy = { path = "../policy", version = "=0.1.0" }
+personal-agent-tools = { path = "../tools", version = "=0.1.0" }
 progenitor.workspace = true
 progenitor-client.workspace = true
 regress.workspace = true

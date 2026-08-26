@@ -7,10 +7,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
-personal-agent-core = { path = "../../../crates/core" }
-personal-agent-migration = { path = "../../../crates/migration" }
-personal-agent-platform = { path = "../../../crates/platform" }
-personal-agent-runtime = { path = "../../../crates/runtime" }
+personal-agent-core = { path = "../../../crates/core", version = "=0.1.0" }
+personal-agent-migration = { path = "../../../crates/migration", version = "=0.1.0" }
+personal-agent-platform = { path = "../../../crates/platform", version = "=0.1.0" }
+personal-agent-runtime = { path = "../../../crates/runtime", version = "=0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true

@@ -1,15 +1,65 @@
+[graph]
+all-features = true
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
 [advisories]
-yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2024-0370", reason = "Unmaintained proc-macro-error is transitive through Tauri's GTK3 stack; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0411", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0412", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0413", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0414", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0415", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0416", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0417", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0418", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0419", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0420", reason = "Unmaintained GTK3 binding is required transitively by Tauri/WebKitGTK on Linux; no safe upgrade is available." },
+  { id = "RUSTSEC-2024-0429", reason = "glib 0.18 is selected by Tauri's Linux WebKitGTK stack; the affected iterator API is not called by Personal Agent and no safe transitive upgrade exists." },
+  { id = "RUSTSEC-2025-0075", reason = "Unmaintained rust-unic crate is transitive through Tauri urlpattern; no safe transitive upgrade is available." },
+  { id = "RUSTSEC-2025-0080", reason = "Unmaintained rust-unic crate is transitive through Tauri urlpattern; no safe transitive upgrade is available." },
+  { id = "RUSTSEC-2025-0081", reason = "Unmaintained rust-unic crate is transitive through Tauri urlpattern; no safe transitive upgrade is available." },
+  { id = "RUSTSEC-2025-0098", reason = "Unmaintained rust-unic crate is transitive through Tauri urlpattern; no safe transitive upgrade is available." },
+  { id = "RUSTSEC-2025-0100", reason = "Unmaintained rust-unic crate is transitive through Tauri urlpattern; no safe transitive upgrade is available." },
+]
 
 [licenses]
-confidence-threshold = 0.93
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "OpenSSL"]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+highlight = "simplest-path"
+workspace-default-features = "allow"
+external-default-features = "allow"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

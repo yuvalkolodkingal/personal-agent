@@ -16,6 +16,7 @@
     "opencode:contract:check": "python scripts/generate-opencode-contract.py --check",
     "packs:check": "python scripts/verify-packs.py",
     "performance:check": "python scripts/verify-performance.py",
+    "fuzz:check": "python scripts/verify-fuzz.py",
     "release:metadata": "python scripts/generate-release-metadata.py",
     "release:metadata:check": "python scripts/generate-release-metadata.py --check",
     "security:local": "python scripts/security-gate.py",

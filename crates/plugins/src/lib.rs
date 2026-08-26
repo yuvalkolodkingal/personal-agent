@@ -47,6 +47,22 @@ pub enum PluginError {
     UnknownCapability(String),
     #[error("pack is already installed: {0}")]
     AlreadyInstalled(String),
+    #[error("official connector does not exist: {0}")]
+    MissingConnector(String),
+    #[error("official connector is disabled or revoked: {0}")]
+    ConnectorDisabled(String),
+    #[error("connector scope was not declared: {0}")]
+    ConnectorScope(String),
+    #[error("connector authorization challenge is invalid or already used")]
+    ConnectorAuthorization,
+    #[error("connector credentials are unavailable from the OS keychain")]
+    ConnectorCredential,
+    #[error("connector action requires explicit scoped consent")]
+    ConnectorConsent,
+    #[error("untrusted content cannot directly invoke a connector")]
+    ConnectorUntrusted,
+    #[error("connector adapter failed without returning private response content")]
+    ConnectorAdapter,
     #[error("pairing request is invalid, expired, or already used")]
     InvalidPairing,
     #[error("pairing requested a capability not offered by the server: {0}")]
@@ -397,6 +413,297 @@ impl PackRegistry {
     }
 }
 
+/// Runtime state for an installed official connector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorState {
+    Disabled,
+    AuthorizationPending,
+    Enabled,
+    Revoked,
+}
+
+/// Effect class used to preserve always-confirm boundaries across connectors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorEffect {
+    Read,
+    Write,
+    Communication,
+    Commerce,
+    Security,
+    Power,
+}
+
+impl ConnectorEffect {
+    fn always_confirms(self) -> bool {
+        matches!(
+            self,
+            Self::Communication | Self::Commerce | Self::Security | Self::Power
+        )
+    }
+}
+
+/// One-time authorization challenge. It contains no token or credential value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorAuthorization {
+    pub connector_id: String,
+    pub state: Uuid,
+    pub requested_scopes: BTreeSet<String>,
+}
+
+/// Content-free request handed to a service-specific adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorDispatch<'a> {
+    pub connector_id: &'a str,
+    pub scope: &'a str,
+    pub effect: ConnectorEffect,
+    pub target: &'a str,
+}
+
+/// Complete invocation context entering the official-pack policy boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorInvocation<'a> {
+    pub connector_id: &'a str,
+    pub scope: &'a str,
+    pub effect: ConnectorEffect,
+    pub target: &'a str,
+    pub from_untrusted_content: bool,
+    pub scoped_consent: bool,
+}
+
+/// Opaque adapter failure that cannot carry private provider response content.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("connector adapter failed")]
+pub struct ConnectorAdapterError;
+
+/// Service-specific connector boundary. Adapters own token exchange and must
+/// resolve credentials from keychain aliases outside this API.
+pub trait ConnectorAdapter {
+    /// Execute one already-authorized operation without returning private body data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque failure; private remote response bodies must be retained
+    /// by the adapter and never attached to the error.
+    fn execute(&mut self, dispatch: ConnectorDispatch<'_>) -> Result<(), ConnectorAdapterError>;
+}
+
+/// Auditable content-free connector result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorReceipt {
+    pub sequence: u64,
+    pub connector_id: String,
+    pub scope: String,
+    pub effect: ConnectorEffect,
+    pub target_sha256: String,
+    pub egress: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ConnectorBinding {
+    declaration: ConnectorDeclaration,
+    state: ConnectorState,
+    pending_state: Option<Uuid>,
+}
+
+/// Installed official-pack runtime. Installation and authorization are separate,
+/// connector scopes cannot widen at runtime, and untrusted page content cannot
+/// directly drive a connector.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OfficialPackRuntime {
+    registry: PackRegistry,
+    connectors: BTreeMap<String, ConnectorBinding>,
+    sequence: u64,
+}
+
+impl OfficialPackRuntime {
+    /// Install a reviewed pack with every connector disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns manifest, duplicate-pack, or duplicate-connector errors.
+    pub fn install(
+        &mut self,
+        manifest: &PackManifest,
+        known_capabilities: &BTreeSet<String>,
+    ) -> Result<(), PluginError> {
+        manifest.validate(known_capabilities)?;
+        if let Some(connector) = manifest
+            .connectors
+            .iter()
+            .find(|connector| self.connectors.contains_key(&connector.id))
+        {
+            return Err(PluginError::InvalidPack(format!(
+                "duplicate connector id {}",
+                connector.id
+            )));
+        }
+        for connector in &manifest.connectors {
+            self.connectors.insert(
+                connector.id.clone(),
+                ConnectorBinding {
+                    declaration: connector.clone(),
+                    state: ConnectorState::Disabled,
+                    pending_state: None,
+                },
+            );
+        }
+        if let Err(error) = self.registry.install(manifest.clone(), known_capabilities) {
+            for connector in &manifest.connectors {
+                self.connectors.remove(&connector.id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Begin a one-time OAuth/credential authorization with an exact scope subset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown connectors and undeclared scopes.
+    pub fn begin_authorization(
+        &mut self,
+        connector_id: &str,
+        requested_scopes: BTreeSet<String>,
+    ) -> Result<ConnectorAuthorization, PluginError> {
+        let binding = self
+            .connectors
+            .get_mut(connector_id)
+            .ok_or_else(|| PluginError::MissingConnector(connector_id.into()))?;
+        if requested_scopes.is_empty() || !requested_scopes.is_subset(&binding.declaration.scopes) {
+            return Err(PluginError::ConnectorScope(connector_id.into()));
+        }
+        let state = Uuid::new_v4();
+        binding.pending_state = Some(state);
+        binding.state = ConnectorState::AuthorizationPending;
+        Ok(ConnectorAuthorization {
+            connector_id: connector_id.into(),
+            state,
+            requested_scopes,
+        })
+    }
+
+    /// Complete an authorization only after explicit confirmation and keychain
+    /// presence checks. Credential values never enter the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Rejects replayed challenges, absent aliases, and missing user confirmation.
+    pub fn complete_authorization(
+        &mut self,
+        challenge: &ConnectorAuthorization,
+        present_keychain_aliases: &BTreeSet<String>,
+        user_confirmed: bool,
+    ) -> Result<(), PluginError> {
+        if !user_confirmed {
+            return Err(PluginError::ConnectorConsent);
+        }
+        let binding = self
+            .connectors
+            .get_mut(&challenge.connector_id)
+            .ok_or_else(|| PluginError::MissingConnector(challenge.connector_id.clone()))?;
+        if binding.state != ConnectorState::AuthorizationPending
+            || binding.pending_state != Some(challenge.state)
+            || !challenge
+                .requested_scopes
+                .is_subset(&binding.declaration.scopes)
+        {
+            return Err(PluginError::ConnectorAuthorization);
+        }
+        if !binding
+            .declaration
+            .credential_aliases
+            .is_subset(present_keychain_aliases)
+        {
+            return Err(PluginError::ConnectorCredential);
+        }
+        binding.pending_state = None;
+        binding
+            .declaration
+            .scopes
+            .clone_from(&challenge.requested_scopes);
+        binding.state = ConnectorState::Enabled;
+        Ok(())
+    }
+
+    /// Revoke a connector locally; subsequent calls fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-connector error for unknown IDs.
+    pub fn revoke(&mut self, connector_id: &str) -> Result<(), PluginError> {
+        let binding = self
+            .connectors
+            .get_mut(connector_id)
+            .ok_or_else(|| PluginError::MissingConnector(connector_id.into()))?;
+        binding.pending_state = None;
+        binding.state = ConnectorState::Revoked;
+        Ok(())
+    }
+
+    /// Invoke a connector after state, zone, scope, and consent checks.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for untrusted input, disabled state, undeclared scopes,
+    /// always-confirm effects without consent, and adapter failures.
+    pub fn invoke<A: ConnectorAdapter>(
+        &mut self,
+        invocation: ConnectorInvocation<'_>,
+        adapter: &mut A,
+    ) -> Result<ConnectorReceipt, PluginError> {
+        if invocation.from_untrusted_content {
+            return Err(PluginError::ConnectorUntrusted);
+        }
+        let binding = self
+            .connectors
+            .get(invocation.connector_id)
+            .ok_or_else(|| PluginError::MissingConnector(invocation.connector_id.into()))?;
+        if binding.state != ConnectorState::Enabled {
+            return Err(PluginError::ConnectorDisabled(
+                invocation.connector_id.into(),
+            ));
+        }
+        if !binding.declaration.scopes.contains(invocation.scope) {
+            return Err(PluginError::ConnectorScope(invocation.scope.into()));
+        }
+        if invocation.effect.always_confirms() && !invocation.scoped_consent {
+            return Err(PluginError::ConnectorConsent);
+        }
+        adapter
+            .execute(ConnectorDispatch {
+                connector_id: invocation.connector_id,
+                scope: invocation.scope,
+                effect: invocation.effect,
+                target: invocation.target,
+            })
+            .map_err(|_| PluginError::ConnectorAdapter)?;
+        self.sequence = self.sequence.saturating_add(1);
+        Ok(ConnectorReceipt {
+            sequence: self.sequence,
+            connector_id: invocation.connector_id.into(),
+            scope: invocation.scope.into(),
+            effect: invocation.effect,
+            target_sha256: hex(&Sha256::digest(invocation.target.as_bytes())),
+            egress: true,
+        })
+    }
+
+    #[must_use]
+    pub fn connector_state(&self, connector_id: &str) -> Option<ConnectorState> {
+        self.connectors
+            .get(connector_id)
+            .map(|binding| binding.state)
+    }
+
+    #[must_use]
+    pub fn registry(&self) -> &PackRegistry {
+        &self.registry
+    }
+}
+
 /// Public pairing offer; the one-time code is displayed out of band and is not serialized.
 pub struct PairingOffer {
     pub id: Uuid,
@@ -663,6 +970,159 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingConnector {
+        calls: Vec<(String, String, ConnectorEffect)>,
+    }
+
+    impl ConnectorAdapter for RecordingConnector {
+        fn execute(
+            &mut self,
+            dispatch: ConnectorDispatch<'_>,
+        ) -> Result<(), ConnectorAdapterError> {
+            self.calls.push((
+                dispatch.connector_id.into(),
+                dispatch.scope.into(),
+                dispatch.effect,
+            ));
+            Ok(())
+        }
+    }
+
+    fn invocation<'a>(
+        declaration: &'a ConnectorDeclaration,
+        scope: &'a str,
+        effect: ConnectorEffect,
+        target: &'a str,
+        from_untrusted_content: bool,
+        scoped_consent: bool,
+    ) -> ConnectorInvocation<'a> {
+        ConnectorInvocation {
+            connector_id: &declaration.id,
+            scope,
+            effect,
+            target,
+            from_untrusted_content,
+            scoped_consent,
+        }
+    }
+
+    fn effect_for_scope(scope: &str) -> ConnectorEffect {
+        match scope.rsplit_once('.').map(|(_, suffix)| suffix) {
+            Some("send") => ConnectorEffect::Communication,
+            Some("request") if scope == "commerce.request" => ConnectorEffect::Commerce,
+            Some("control") if scope == "home.control" => ConnectorEffect::Power,
+            Some("write") => ConnectorEffect::Write,
+            _ => ConnectorEffect::Read,
+        }
+    }
+
+    fn evaluate_connector(
+        runtime: &mut OfficialPackRuntime,
+        declaration: &ConnectorDeclaration,
+        adapter: &mut RecordingConnector,
+    ) {
+        let first_scope = declaration.scopes.first().expect("declared scope");
+        assert!(matches!(
+            runtime.invoke(
+                invocation(
+                    declaration,
+                    first_scope,
+                    ConnectorEffect::Read,
+                    "fixture-target",
+                    false,
+                    true,
+                ),
+                adapter,
+            ),
+            Err(PluginError::ConnectorDisabled(_))
+        ));
+        assert!(matches!(
+            runtime.begin_authorization(&declaration.id, ["undeclared.scope".into()].into()),
+            Err(PluginError::ConnectorScope(_))
+        ));
+        let challenge = runtime
+            .begin_authorization(&declaration.id, declaration.scopes.clone())
+            .expect("authorization challenge");
+        assert_eq!(
+            runtime.complete_authorization(&challenge, &declaration.credential_aliases, false),
+            Err(PluginError::ConnectorConsent)
+        );
+        assert_eq!(
+            runtime.complete_authorization(&challenge, &BTreeSet::new(), true),
+            Err(PluginError::ConnectorCredential)
+        );
+        runtime
+            .complete_authorization(&challenge, &declaration.credential_aliases, true)
+            .expect("explicit authorization");
+        assert_eq!(
+            runtime.complete_authorization(&challenge, &declaration.credential_aliases, true),
+            Err(PluginError::ConnectorAuthorization)
+        );
+        assert!(matches!(
+            runtime.invoke(
+                invocation(
+                    declaration,
+                    first_scope,
+                    ConnectorEffect::Read,
+                    "injection-target",
+                    true,
+                    true,
+                ),
+                adapter,
+            ),
+            Err(PluginError::ConnectorUntrusted)
+        ));
+        let effect = effect_for_scope(first_scope);
+        if effect.always_confirms() {
+            assert_eq!(
+                runtime.invoke(
+                    invocation(
+                        declaration,
+                        first_scope,
+                        effect,
+                        "fixture-target",
+                        false,
+                        false,
+                    ),
+                    adapter,
+                ),
+                Err(PluginError::ConnectorConsent)
+            );
+        }
+        let receipt = runtime
+            .invoke(
+                invocation(
+                    declaration,
+                    first_scope,
+                    effect,
+                    "fixture-target",
+                    false,
+                    true,
+                ),
+                adapter,
+            )
+            .expect("connector invocation");
+        assert_eq!(receipt.target_sha256.len(), 64);
+        assert!(!format!("{receipt:?}").contains("fixture-target"));
+        runtime.revoke(&declaration.id).expect("revoke");
+        assert!(matches!(
+            runtime.invoke(
+                invocation(
+                    declaration,
+                    first_scope,
+                    effect,
+                    "fixture-target",
+                    false,
+                    true,
+                ),
+                adapter,
+            ),
+            Err(PluginError::ConnectorDisabled(_))
+        ));
+    }
+
     #[test]
     fn plugin_cannot_rewrite_safety_policy() {
         let manifest = PluginManifest {
@@ -709,6 +1169,89 @@ mod tests {
         registry.install(manifest, &known).expect("install");
         assert_eq!(registry.installed().len(), 1);
         assert!(!registry.installed()["productivity"].connectors[0].enabled_by_default);
+    }
+
+    #[test]
+    fn official_pack_evaluations_enforce_scopes_consent_and_revocation() {
+        let manifests = [
+            include_str!("../../../packs/productivity/pack.json"),
+            include_str!("../../../packs/development/pack.json"),
+            include_str!("../../../packs/communications/pack.json"),
+            include_str!("../../../packs/smart-home/pack.json"),
+            include_str!("../../../packs/media/pack.json"),
+            include_str!("../../../packs/research/pack.json"),
+            include_str!("../../../packs/dictation/pack.json"),
+            include_str!("../../../packs/creative/pack.json"),
+            include_str!("../../../packs/browser/pack.json"),
+            include_str!("../../../packs/remote/pack.json"),
+        ];
+        let known: BTreeSet<String> = [
+            "CAP-AGENT",
+            "CAP-ARTIFACTS",
+            "CAP-AUTOMATION",
+            "CAP-BROWSER",
+            "CAP-CONNECTORS",
+            "CAP-CONVERSATION",
+            "CAP-EXTENSIONS",
+            "CAP-MIGRATION",
+            "CAP-PROJECTS",
+            "CAP-REMOTE",
+            "CAP-RESEARCH",
+            "CAP-SAFETY",
+            "CAP-VOICE",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let parsed: Vec<PackManifest> = manifests
+            .into_iter()
+            .map(|body| serde_json::from_str(body).expect("official manifest"))
+            .collect();
+        let connector_count: usize = parsed.iter().map(|pack| pack.connectors.len()).sum();
+        let mut runtime = OfficialPackRuntime::default();
+        for manifest in &parsed {
+            runtime
+                .install(manifest, &known)
+                .expect("install official pack");
+        }
+        assert_eq!(runtime.registry().installed().len(), 10);
+
+        let mut adapter = RecordingConnector::default();
+        for declaration in parsed.iter().flat_map(|pack| &pack.connectors) {
+            evaluate_connector(&mut runtime, declaration, &mut adapter);
+        }
+        assert_eq!(adapter.calls.len(), connector_count);
+    }
+
+    #[test]
+    fn mutation_corpus_pack_manifests_never_widen_connector_authority() {
+        let original = include_bytes!("../../../packs/productivity/pack.json");
+        let known: BTreeSet<String> = ["CAP-AUTOMATION", "CAP-CONNECTORS"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+        for _ in 0..2_048 {
+            state = state
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            let mut mutated = original.to_vec();
+            let index = usize::try_from(state).unwrap_or(0) % mutated.len();
+            let delta = u8::try_from((state >> 40) % 255 + 1).unwrap_or(1);
+            mutated[index] ^= delta;
+            if let Ok(manifest) = serde_json::from_slice::<PackManifest>(&mutated)
+                && manifest.validate(&known).is_ok()
+            {
+                assert!(manifest.install_disabled);
+                assert!(manifest.connectors.iter().all(|connector| {
+                    !connector.enabled_by_default
+                        && connector
+                            .credential_aliases
+                            .iter()
+                            .all(|alias| alias.starts_with("keychain://"))
+                }));
+            }
+        }
     }
 
     #[test]

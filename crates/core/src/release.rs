@@ -347,6 +347,33 @@ mod tests {
         );
     }
     #[test]
+    fn mutation_corpus_release_metadata_fails_closed() {
+        let (manifest, public_key) = signed_manifest(b"fixture installer");
+        let original = serde_json::to_vec(&manifest).expect("serialize");
+        let mut state = 0x9e37_79b9_u64;
+        for _ in 0..2_048 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let mut mutated = original.clone();
+            let index = usize::try_from(state).unwrap_or(0) % mutated.len();
+            let delta = u8::try_from((state >> 32) % 255 + 1).unwrap_or(1);
+            mutated[index] ^= delta;
+            if let Ok(candidate) = serde_json::from_slice::<SignedReleaseManifest>(&mutated)
+                && candidate.verify(&public_key).is_ok()
+            {
+                assert_eq!(
+                    candidate.signing_bytes().expect("candidate signing bytes"),
+                    manifest.signing_bytes().expect("original signing bytes")
+                );
+                assert_eq!(
+                    decode_hex::<64>(&candidate.signature_hex),
+                    decode_hex::<64>(&manifest.signature_hex)
+                );
+            }
+        }
+    }
+    #[test]
     fn uninstall_deletion_requires_confirmation_and_export() {
         let mut plan = UninstallPlan {
             data_paths: vec![PathBuf::from("profile")],

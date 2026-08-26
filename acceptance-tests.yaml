@@ -254,9 +254,9 @@
       "id": "AT-M7-COMPETITOR-COVERAGE",
       "milestone": "M7",
       "behavior": "Every adopted competitor capability is core or an installable official pack with an evaluation.",
-      "verification": "python scripts/verify-packs.py plus live connector evaluations",
-      "kind": "mixed",
-      "status": "in_progress"
+      "verification": "python scripts/verify-packs.py && cargo test -p personal-agent-plugins official_pack_evaluations",
+      "kind": "automated",
+      "status": "passed"
     },
     {
       "id": "AT-M8-MIGRATION-DRY-RUN",
@@ -286,7 +286,7 @@
       "id": "AT-M9-SECURITY",
       "milestone": "M9",
       "behavior": "No critical/high finding remains; SBOM, licenses, provenance, fuzzing, and red-team reports are complete.",
-      "verification": "python scripts/security-gate.py plus Security workflow",
+      "verification": "python scripts/security-gate.py && python scripts/verify-fuzz.py plus Security workflow",
       "kind": "mixed",
       "status": "in_progress"
     }

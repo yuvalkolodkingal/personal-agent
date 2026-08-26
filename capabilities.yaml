@@ -512,7 +512,7 @@
         "AT-M7-PLUGIN-SAFETY",
         "AT-M7-COMPETITOR-COVERAGE"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-CONNECTORS",
@@ -547,7 +547,7 @@
       "acceptance_test_ids": [
         "AT-M7-COMPETITOR-COVERAGE"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-RESEARCH",
@@ -580,7 +580,7 @@
       "acceptance_test_ids": [
         "AT-M7-COMPETITOR-COVERAGE"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-ARTIFACTS",

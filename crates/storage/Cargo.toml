@@ -5,11 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
-personal-agent-agent = { path = "../agent" }
-personal-agent-automation = { path = "../automation" }
-personal-agent-contracts = { path = "../contracts" }
-personal-agent-memory = { path = "../memory" }
-personal-agent-migration = { path = "../migration" }
+personal-agent-agent = { path = "../agent", version = "=0.1.0" }
+personal-agent-automation = { path = "../automation", version = "=0.1.0" }
+personal-agent-contracts = { path = "../contracts", version = "=0.1.0" }
+personal-agent-memory = { path = "../memory", version = "=0.1.0" }
+personal-agent-migration = { path = "../migration", version = "=0.1.0" }
 prost.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true

@@ -10,6 +10,6 @@
 | Agent/memory/automation | Four-hour virtual restart/provider chaos, effect receipts, review/conflict retrieval, missed runs | Multi-hour wall-clock soak with a real provider |
 | Packs/remote | Ten manifests/evals, disabled connectors, exact fresh pairing grants | OAuth/live account interoperability |
 | Migration | Co-located/split fixtures, idempotency, content-free reports, no canary transfer | Optional user-reviewed personal import |
-| Release | Signed-metadata fixture, encrypted backup, rollback, export, uninstall plan, SBOM | Signing/notarization, physical performance, cross-OS install/update/uninstall |
+| Release | Signed-metadata fixture, encrypted backup, rollback, export, uninstall plan, SBOM, 6,144-case mutation corpus | Signing/notarization, physical performance, cross-OS install/update/uninstall |
 
 External cells must be reported as unavailable or pending; they are never silently promoted to passed.
