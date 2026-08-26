@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use personal_agent_core::{AppProjection, ProfileState, load_or_initialize_config};
+mod api;
+
+use personal_agent_core::{
+    AppProjection, PersonalAgentConfig, ProfileState, load_or_initialize_config,
+};
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
 use personal_agent_runtime::{AgentRuntime, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::path::BaseDirectory;
@@ -17,10 +21,27 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct DesktopState {
     profile: Mutex<ProfileState>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
+    config: RwLock<PersonalAgentConfig>,
+    config_path: PathBuf,
+    sidecar_executable: PathBuf,
+    safety_plugin: PathBuf,
+    active_session: tokio::sync::Mutex<Option<ActiveSession>>,
+    voice_playback: tokio::sync::Mutex<Option<VoicePlayback>>,
     lifecycle: Mutex<Option<LifecycleMarker>>,
     migration_review: Mutex<Option<MigrationReview>>,
     app_data: PathBuf,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+#[derive(Clone)]
+struct ActiveSession {
+    id: String,
+    directory: PathBuf,
+}
+
+struct VoicePlayback {
+    child: tokio::process::Child,
+    wav: PathBuf,
 }
 
 struct MigrationReview {
@@ -55,6 +76,54 @@ fn sidecar_path() -> Result<PathBuf, std::io::Error> {
     } else {
         "opencode"
     }))
+}
+
+fn runtime_from_parts(
+    executable: PathBuf,
+    safety_plugin: PathBuf,
+    app_data: &Path,
+    config: &PersonalAgentConfig,
+) -> OpenCodeSidecar {
+    let mut runtime_config = OpenCodeConfig::pinned(
+        executable,
+        safety_plugin,
+        app_data.join("runtime/opencode-profile"),
+    );
+    runtime_config.startup_timeout = Duration::from_millis(config.runtime.startup_timeout_ms);
+    runtime_config.default_model = (!config.runtime.default_model.trim().is_empty()).then(|| {
+        if config.runtime.default_model.contains('/') {
+            config.runtime.default_model.clone()
+        } else {
+            format!(
+                "{}/{}",
+                config.runtime.default_provider, config.runtime.default_model
+            )
+        }
+    });
+    runtime_config.small_model =
+        (!config.runtime.small_model.trim().is_empty()).then(|| config.runtime.small_model.clone());
+    runtime_config.managed_config = config.opencode.clone();
+    runtime_config.providers = config
+        .opencode
+        .get("provider")
+        .and_then(serde_json::Value::as_object)
+        .map(|providers| {
+            providers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    OpenCodeSidecar::new(runtime_config)
+}
+
+fn configured_runtime(state: &DesktopState, config: &PersonalAgentConfig) -> OpenCodeSidecar {
+    runtime_from_parts(
+        state.sidecar_executable.clone(),
+        state.safety_plugin.clone(),
+        &state.app_data,
+        config,
+    )
 }
 
 fn init_logging(
@@ -268,9 +337,16 @@ fn clean_shutdown(app: &tauri::AppHandle) {
     {
         tracing::warn!(%error, "clean lifecycle marker removal failed");
     }
+    if let Ok(mut playback) = state.voice_playback.try_lock()
+        && let Some(mut playback) = playback.take()
+    {
+        let _ = tauri::async_runtime::block_on(playback.child.kill());
+        let _ = std::fs::remove_file(playback.wav);
+    }
     tracing::info!("desktop host stopped");
 }
 
+#[allow(clippy::too_many_lines)] // Tauri setup keeps lifecycle ordering explicit in one entrypoint.
 fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, arguments, _working_directory| {
@@ -302,7 +378,8 @@ fn main() {
                 architecture = std::env::consts::ARCH,
                 "desktop host starting"
             );
-            let config = load_or_initialize_config(&app_data.join("config.toml"))?;
+            let config_path = app_data.join("config.toml");
+            let config = load_or_initialize_config(&config_path)?;
             let lifecycle = LifecycleMarker::begin(
                 &app_data.join("lifecycle/run-state.json"),
                 env!("CARGO_PKG_VERSION"),
@@ -315,17 +392,22 @@ fn main() {
             let safety_plugin = app
                 .path()
                 .resolve("opencode-plugin/index.ts", BaseDirectory::Resource)?;
-            let mut runtime_config = OpenCodeConfig::pinned(
-                sidecar_path()?,
-                safety_plugin,
-                app_data.join("runtime/opencode-profile"),
+            let sidecar_executable = sidecar_path()?;
+            let sidecar = runtime_from_parts(
+                sidecar_executable.clone(),
+                safety_plugin.clone(),
+                &app_data,
+                &config.config,
             );
-            runtime_config.startup_timeout =
-                Duration::from_millis(config.config.runtime.startup_timeout_ms);
-            let sidecar = OpenCodeSidecar::new(runtime_config);
             app.manage(DesktopState {
                 profile: Mutex::new(profile),
                 runtime: tokio::sync::Mutex::new(sidecar),
+                config: RwLock::new(config.config),
+                config_path,
+                sidecar_executable,
+                safety_plugin,
+                active_session: tokio::sync::Mutex::new(None),
+                voice_playback: tokio::sync::Mutex::new(None),
                 lifecycle: Mutex::new(Some(lifecycle)),
                 migration_review: Mutex::new(None),
                 app_data,
@@ -355,6 +437,23 @@ fn main() {
             submit_message,
             autostart_status,
             set_autostart,
+            api::bootstrap,
+            api::save_config,
+            api::runtime_catalog,
+            api::chat_send,
+            api::session_action,
+            api::runtime_resource,
+            api::runtime_operation,
+            api::runtime_answer,
+            api::domain_action,
+            api::provider_set_key,
+            api::provider_revoke,
+            api::voice_status,
+            api::microphone_state,
+            api::voice_transcribe,
+            api::voice_speak,
+            api::voice_stop,
+            api::voice_install,
             migration_dry_run,
             migration_import,
         ]);

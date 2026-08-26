@@ -202,6 +202,9 @@ pub struct OpenCodeConfig {
     pub providers: BTreeMap<String, Value>,
     pub default_model: Option<String>,
     pub small_model: Option<String>,
+    /// Managed `OpenCode` features such as agents, commands, MCP, instructions,
+    /// providers, keybinds, and formatters. Runtime security keys overwrite it.
+    pub managed_config: Value,
 }
 
 impl OpenCodeConfig {
@@ -219,6 +222,7 @@ impl OpenCodeConfig {
             providers: BTreeMap::new(),
             default_model: None,
             small_model: None,
+            managed_config: serde_json::json!({}),
         }
     }
 }
@@ -573,6 +577,116 @@ impl OpenCodeSidecar {
         }
     }
 
+    fn raw_client(&self) -> Result<reqwest::Client, RuntimeError> {
+        let credential = BASE64_STANDARD.encode(format!(
+            "{}:{}",
+            self.config.username,
+            self.config.password.expose_secret()
+        ));
+        let authorization = reqwest::header::HeaderValue::from_str(&format!("Basic {credential}"))
+            .map_err(|_| RuntimeError::Rejected("runtime authorization is invalid".into()))?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(Into::into)
+    }
+
+    /// Call one reviewed `OpenCode` operation without disclosing the loopback
+    /// endpoint or per-run credential to the renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sidecar is unavailable, the route is not a
+    /// canonical API path, the request fails, or the response is not JSON.
+    pub async fn request_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        if !path.starts_with('/') || path.contains("..") || path.contains(['?', '#']) {
+            return Err(RuntimeError::Rejected(
+                "runtime API path is not canonical".into(),
+            ));
+        }
+        let endpoint = self.endpoint.as_ref().ok_or(RuntimeError::NotRunning)?;
+        let url = endpoint
+            .join(path.trim_start_matches('/'))
+            .map_err(|_| RuntimeError::Rejected("runtime API URL is invalid".into()))?;
+        let mut request = self.raw_client()?.request(method, url).query(query);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(2_000)
+                .collect::<String>();
+            return Err(RuntimeError::Rejected(format!(
+                "OpenCode API returned HTTP {status}: {detail}"
+            )));
+        }
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| RuntimeError::Rejected("OpenCode API returned invalid JSON".into()))
+    }
+
+    /// Read the complete `OpenCode` Desktop catalog through the native boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace cannot be canonicalized. Individual
+    /// unavailable resources remain explicit inside the returned catalog.
+    pub async fn desktop_catalog(&self, directory: &Path) -> Result<Value, RuntimeError> {
+        let directory = std::fs::canonicalize(directory)?;
+        let directory = directory.display().to_string();
+        let query = [("directory", directory)];
+        let resources = [
+            ("sessions", "/session"),
+            ("session_status", "/session/status"),
+            ("providers", "/provider"),
+            ("provider_auth", "/provider/auth"),
+            ("agents", "/agent"),
+            ("commands", "/command"),
+            ("skills", "/skill"),
+            ("mcp", "/mcp"),
+            ("projects", "/project"),
+            ("path", "/path"),
+            ("vcs", "/vcs"),
+            ("vcs_status", "/vcs/status"),
+            ("permissions", "/permission"),
+            ("questions", "/question"),
+            ("config", "/config"),
+            ("config_providers", "/config/providers"),
+            ("shells", "/pty/shells"),
+        ];
+        let mut catalog = serde_json::Map::new();
+        for (name, route) in resources {
+            let value = match self
+                .request_json(reqwest::Method::GET, route, &query, None)
+                .await
+            {
+                Ok(value) => serde_json::json!({"available": true, "data": value}),
+                Err(error) => serde_json::json!({
+                    "available": false,
+                    "reason": error.to_string()
+                }),
+            };
+            catalog.insert(name.to_owned(), value);
+        }
+        Ok(Value::Object(catalog))
+    }
+
     fn safety_config_overlay(&self) -> Result<String, RuntimeError> {
         let plugin = std::fs::canonicalize(&self.config.safety_plugin)?;
         if !plugin.is_file() {
@@ -583,18 +697,32 @@ impl OpenCodeSidecar {
         let plugin_url = Url::from_file_path(plugin).map_err(|()| {
             RuntimeError::Rejected("OpenCode safety plugin path is invalid".into())
         })?;
-        let mut overlay = serde_json::json!({
-            "autoupdate": false,
-            "plugin": [plugin_url.as_str()],
-            "share": "disabled",
-            "agent": {
-                "title": {"disable": true},
-                "summary": {"disable": true}
-            }
-        });
+        let mut overlay = self.config.managed_config.clone();
+        if !overlay.is_object() {
+            return Err(RuntimeError::Rejected(
+                "managed OpenCode configuration must be an object".into(),
+            ));
+        }
         let object = overlay
             .as_object_mut()
-            .expect("static OpenCode overlay is an object");
+            .expect("validated OpenCode overlay is an object");
+        object.insert("autoupdate".to_owned(), Value::Bool(false));
+        object.insert(
+            "plugin".to_owned(),
+            Value::Array(vec![Value::String(plugin_url.to_string())]),
+        );
+        object.insert("share".to_owned(), Value::String("disabled".to_owned()));
+        let agents = object
+            .entry("agent".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        if !agents.is_object() {
+            return Err(RuntimeError::Rejected(
+                "managed OpenCode agent configuration must be an object".into(),
+            ));
+        }
+        let agents = agents.as_object_mut().expect("validated agent object");
+        agents.insert("title".to_owned(), serde_json::json!({"disable": true}));
+        agents.insert("summary".to_owned(), serde_json::json!({"disable": true}));
         if !self.config.providers.is_empty() {
             object.insert(
                 "enabled_providers".to_owned(),
@@ -775,6 +903,117 @@ impl OpenCodeSidecar {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Submit text plus `OpenCode` file/image parts while keeping the sidecar
+    /// endpoint and authentication entirely inside the native boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized attachments, an unknown
+    /// session, a rejected prompt, or a failed authenticated sidecar request.
+    pub async fn submit_with_attachments(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        attachments: Vec<Value>,
+    ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
+        if prompt.trim().is_empty() {
+            return Err(RuntimeError::Rejected("prompt must not be blank".into()));
+        }
+        let mut parts = vec![serde_json::json!({"type": "text", "text": prompt})];
+        for attachment in attachments {
+            let object = attachment.as_object().ok_or_else(|| {
+                RuntimeError::Rejected("prompt attachment must be an object".into())
+            })?;
+            let mime = object.get("mime").and_then(Value::as_str).unwrap_or("");
+            let url = object.get("url").and_then(Value::as_str).unwrap_or("");
+            let filename = object
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            if object.get("type").and_then(Value::as_str) != Some("file")
+                || mime.is_empty()
+                || mime.len() > 255
+                || filename.is_empty()
+                || filename.len() > 512
+                || !url.starts_with("data:")
+                || url.len() > 36 * 1024 * 1024
+            {
+                return Err(RuntimeError::Rejected(
+                    "prompt attachment is invalid or exceeds the 25 MiB limit".into(),
+                ));
+            }
+            parts.push(serde_json::json!({
+                "type": "file", "mime": mime, "filename": filename, "url": url,
+            }));
+        }
+        let directory = self.registered_session_directory(session_id)?;
+        let client = self.generated_client()?.clone();
+        let event_response = client
+            .event_subscribe()
+            .directory(&directory)
+            .send()
+            .await
+            .map_err(|_| api_failure("session event subscription"))?;
+        let session = client
+            .session_get()
+            .session_id(session_id)
+            .directory(&directory)
+            .send()
+            .await
+            .map_err(|_| api_failure("session prompt context"))?;
+        let session = serde_json::to_value(session.into_inner())
+            .map_err(|_| api_failure("session prompt context response"))?;
+        let message_id = format!("msg_{}", Uuid::new_v4().simple());
+        let mut prompt_body = serde_json::Map::from_iter([
+            ("messageID".to_owned(), Value::String(message_id.clone())),
+            ("parts".to_owned(), Value::Array(parts)),
+        ]);
+        if let (Some(provider_id), Some(model_id)) = (
+            session.pointer("/model/providerID").and_then(Value::as_str),
+            session.pointer("/model/id").and_then(Value::as_str),
+        ) {
+            prompt_body.insert(
+                "model".to_owned(),
+                serde_json::json!({"providerID": provider_id, "modelID": model_id}),
+            );
+        }
+        if let Some(agent) = session.get("agent").and_then(Value::as_str) {
+            prompt_body.insert("agent".to_owned(), Value::String(agent.to_owned()));
+        }
+        if let Some(variant) = session.pointer("/model/variant").and_then(Value::as_str) {
+            prompt_body.insert("variant".to_owned(), Value::String(variant.to_owned()));
+        }
+        let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
+            Value::Object(prompt_body),
+            "session prompt body",
+        )?;
+        client
+            .session_prompt_async()
+            .session_id(session_id)
+            .directory(&directory)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| api_failure("session prompt"))?;
+        let (tx, rx) = mpsc::channel(128);
+        tx.send(runtime_event(
+            1,
+            session_id,
+            "response.admitted",
+            &serde_json::json!({"message_id": message_id}),
+        )?)
+        .await
+        .map_err(|_| RuntimeError::StreamClosed)?;
+        let session_id = session_id.to_owned();
+        tokio::spawn(forward_sse_events(
+            event_response.into_inner(),
+            tx,
+            session_id,
+            2,
+        ));
+        Ok(rx)
     }
 }
 
@@ -1089,86 +1328,13 @@ impl AgentRuntime for OpenCodeSidecar {
         prompt: &str,
         plan: Option<Value>,
     ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
-        if prompt.trim().is_empty() {
-            return Err(RuntimeError::Rejected("prompt must not be blank".into()));
-        }
         if plan.is_some() {
             return Err(RuntimeError::Rejected(
                 "structured plan submission is not supported by the pinned runtime API".into(),
             ));
         }
-        let directory = self.registered_session_directory(session_id)?;
-        let client = self.generated_client()?.clone();
-        let event_response = client
-            .event_subscribe()
-            .directory(&directory)
-            .send()
+        self.submit_with_attachments(session_id, prompt, Vec::new())
             .await
-            .map_err(|_| api_failure("session event subscription"))?;
-        let session = client
-            .session_get()
-            .session_id(session_id)
-            .directory(&directory)
-            .send()
-            .await
-            .map_err(|_| api_failure("session prompt context"))?;
-        let session = serde_json::to_value(session.into_inner())
-            .map_err(|_| api_failure("session prompt context response"))?;
-        let message_id = format!("msg_{}", Uuid::new_v4().simple());
-        let mut prompt_body = serde_json::Map::from_iter([
-            ("messageID".to_owned(), Value::String(message_id.clone())),
-            (
-                "parts".to_owned(),
-                serde_json::json!([{"type": "text", "text": prompt}]),
-            ),
-        ]);
-        if let (Some(provider_id), Some(model_id)) = (
-            session.pointer("/model/providerID").and_then(Value::as_str),
-            session.pointer("/model/id").and_then(Value::as_str),
-        ) {
-            prompt_body.insert(
-                "model".to_owned(),
-                serde_json::json!({"providerID": provider_id, "modelID": model_id}),
-            );
-        }
-        if let Some(agent) = session.get("agent").and_then(Value::as_str) {
-            prompt_body.insert("agent".to_owned(), Value::String(agent.to_owned()));
-        }
-        if let Some(variant) = session.pointer("/model/variant").and_then(Value::as_str) {
-            prompt_body.insert("variant".to_owned(), Value::String(variant.to_owned()));
-        }
-        let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
-            Value::Object(prompt_body),
-            "session prompt body",
-        )?;
-        client
-            .session_prompt_async()
-            .session_id(session_id)
-            .directory(&directory)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| api_failure("session prompt"))?;
-        let (tx, rx) = mpsc::channel(128);
-        let admitted_event = runtime_event(
-            1,
-            session_id,
-            "response.admitted",
-            &serde_json::json!({
-                "message_id": message_id,
-            }),
-        )?;
-        tx.send(admitted_event)
-            .await
-            .map_err(|_| RuntimeError::StreamClosed)?;
-        let session_id = session_id.to_owned();
-        tokio::spawn(forward_sse_events(
-            event_response.into_inner(),
-            tx,
-            session_id,
-            2,
-        ));
-        Ok(rx)
     }
     async fn answer(
         &mut self,

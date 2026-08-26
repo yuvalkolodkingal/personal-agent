@@ -1,5 +1,12 @@
 //! Replaceable, privacy-aware audio pipeline and deterministic endpointing primitives.
 
+mod native;
+
+pub use native::{
+    NativeVoiceConfig, NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper,
+    transcribe_pcm,
+};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

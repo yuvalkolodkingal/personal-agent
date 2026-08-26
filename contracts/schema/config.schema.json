@@ -4,62 +4,163 @@
   "title": "Personal Agent configuration",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "percentage": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "keychainAlias": { "type": "string", "pattern": "^keychain://[^/]+/[^/]+$" }
+  },
   "properties": {
     "schema_version": { "const": 1 },
     "persona": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "default": "JARVIS", "minLength": 1 },
         "style": { "type": "string", "default": "Composed, concise, and quietly witty." }
-      },
-      "required": ["name"]
+      }, "required": ["name"]
     },
     "agent": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "properties": {
         "default_parallelism": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
-        "max_delegation_depth": { "type": "integer", "minimum": 0, "maximum": 8, "default": 3 }
+        "max_delegation_depth": { "type": "integer", "minimum": 0, "maximum": 8, "default": 3 },
+        "require_plan_for_multistep": { "type": "boolean", "default": true },
+        "verify_success_criteria": { "type": "boolean", "default": true },
+        "default_token_budget": { "type": "integer", "minimum": 0, "default": 0 },
+        "default_cost_budget_microusd": { "type": "integer", "minimum": 0, "default": 0 },
+        "default_wall_time_minutes": { "type": "integer", "minimum": 0, "default": 0 },
+        "default_tool_call_budget": { "type": "integer", "minimum": 0, "default": 0 }
       }
     },
     "runtime": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "properties": {
         "opencode_version": { "const": "1.18.23" },
-        "startup_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 }
+        "startup_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 },
+        "default_provider": { "type": "string", "default": "" },
+        "default_model": { "type": "string", "default": "" },
+        "small_model": { "type": "string", "default": "" },
+        "default_agent": { "type": "string", "default": "build" },
+        "default_effort": { "type": "string", "default": "" },
+        "working_directory": { "type": "string", "minLength": 1 },
+        "auto_compact": { "type": "boolean", "default": true }
       }
     },
     "privacy": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "properties": {
         "record_transcripts": { "type": "boolean", "default": true },
-        "record_tool_arguments": { "type": "boolean", "default": false }
+        "record_tool_arguments": { "type": "boolean", "default": false },
+        "transcript_retention_days": { "type": "integer", "minimum": 0, "maximum": 3650, "default": 90 },
+        "redact_secrets": { "type": "boolean", "default": true },
+        "guest_mode_by_default": { "type": "boolean", "default": false },
+        "analytics": { "const": false }
       }
     },
-    "secret_aliases": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "type": "string",
-        "pattern": "^keychain://[^/]+/[^/]+$"
+    "ui": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "theme": { "type": "string", "default": "midnight" },
+        "accent": { "enum": ["cyan", "blue", "violet", "amber", "green", "red"], "default": "cyan" },
+        "locale": { "type": "string", "default": "en" },
+        "text_scale_percent": { "type": "integer", "minimum": 75, "maximum": 200, "default": 100 },
+        "reduced_motion": { "type": "boolean", "default": false },
+        "hud_enabled": { "type": "boolean", "default": true },
+        "start_in_hud": { "type": "boolean", "default": false },
+        "overlay": { "type": "boolean", "default": false },
+        "show_reasoning": { "type": "boolean", "default": true },
+        "show_tool_details": { "type": "boolean", "default": true },
+        "session_tabs": { "type": "boolean", "default": true },
+        "compact_sidebar": { "type": "boolean", "default": false },
+        "command_palette_hotkey": { "type": "string", "default": "Ctrl+K" },
+        "global_hotkey": { "type": "string", "default": "Ctrl+Space" }
       }
     },
+    "voice": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "mode": { "enum": ["wake-only", "hybrid", "continuous", "push-to-talk"], "default": "push-to-talk" },
+        "input_device": { "type": "string", "default": "" },
+        "output_device": { "type": "string", "default": "" },
+        "language": { "type": "string", "default": "en" },
+        "response_language": { "type": "string", "default": "en" },
+        "stt_backend": { "enum": ["whisper.cpp", "hosted", "system"], "default": "whisper.cpp" },
+        "stt_model": { "enum": ["tiny", "base", "small", "medium", "large-v3-turbo"], "default": "base" },
+        "stt_executable": { "type": "string", "default": "" },
+        "stt_model_path": { "type": "string", "default": "" },
+        "tts_backend": { "enum": ["piper", "kokoro", "hosted", "system"], "default": "piper" },
+        "tts_voice": { "type": "string", "default": "en_US-lessac-medium" },
+        "tts_executable": { "type": "string", "default": "" },
+        "tts_model_path": { "type": "string", "default": "" },
+        "speech_rate_percent": { "type": "integer", "minimum": 25, "maximum": 300, "default": 100 },
+        "volume_percent": { "type": "integer", "minimum": 0, "maximum": 200, "default": 100 },
+        "input_gain_percent": { "type": "integer", "minimum": 0, "maximum": 800, "default": 100 },
+        "ducking_percent": { "$ref": "#/$defs/percentage", "default": 30 },
+        "wake_phrases": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "stop_phrases": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "sleep_phrases": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "wake_threshold_milli": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 930 },
+        "vad_start_milli": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 600 },
+        "vad_stop_milli": { "type": "integer", "minimum": 0, "maximum": 999, "default": 350 },
+        "endpoint_short_ms": { "type": "integer", "minimum": 100, "maximum": 5000, "default": 700 },
+        "endpoint_long_ms": { "type": "integer", "minimum": 100, "maximum": 10000, "default": 1400 },
+        "pre_roll_ms": { "type": "integer", "minimum": 0, "maximum": 5000, "default": 500 },
+        "refractory_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 2000 },
+        "wake_enabled": { "type": "boolean", "default": false },
+        "push_to_talk": { "type": "boolean", "default": true },
+        "push_to_talk_hotkey": { "type": "string", "default": "Space" },
+        "barge_in": { "type": "boolean", "default": true },
+        "echo_cancellation": { "type": "boolean", "default": true },
+        "noise_suppression": { "type": "boolean", "default": true },
+        "automatic_gain_control": { "type": "boolean", "default": true },
+        "offline_only": { "type": "boolean", "default": true },
+        "speak_typed_responses": { "type": "boolean", "default": false },
+        "quiet_mode": { "type": "boolean", "default": false },
+        "speaker_verification": { "type": "boolean", "default": false },
+        "meeting_speaker_labels": { "type": "boolean", "default": false },
+        "vocabulary": { "type": "array", "items": { "type": "string" } },
+        "hosted_stt_credential_alias": { "oneOf": [{ "const": "" }, { "$ref": "#/$defs/keychainAlias" }] },
+        "hosted_tts_credential_alias": { "oneOf": [{ "const": "" }, { "$ref": "#/$defs/keychainAlias" }] }
+      }
+    },
+    "workspace": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "default_project": { "type": "string" }, "restore_sessions": { "type": "boolean", "default": true },
+        "confirm_session_delete": { "type": "boolean", "default": true }, "open_files_in_app": { "type": "boolean", "default": true },
+        "terminal_shell": { "type": "string" }, "attachment_limit_mb": { "type": "integer", "minimum": 1, "maximum": 500, "default": 25 },
+        "diff_viewer": { "type": "boolean", "default": true }
+      }
+    },
+    "browser": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false }, "isolated_profiles": { "type": "boolean", "default": true },
+        "personal_profile_opt_in": { "type": "boolean", "default": false }, "quarantine_downloads": { "type": "boolean", "default": true },
+        "allow_third_party_subresources": { "type": "boolean", "default": false },
+        "allowed_domains": { "type": "array", "items": { "type": "string" } }, "blocked_domains": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "memory": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean", "default": true }, "inferred_memory_requires_review": { "type": "boolean", "default": true }, "recall_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 }, "embedding_model": { "type": "string" } }
+    },
+    "automation": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean", "default": true }, "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 8, "default": 2 }, "pause_after_failures": { "type": "integer", "minimum": 1, "maximum": 20, "default": 3 }, "quiet_hours_start": { "type": "string" }, "quiet_hours_end": { "type": "string" }, "missed_run_policy": { "enum": ["skip", "run-once", "catch-up"] } }
+    },
+    "notifications": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean", "default": true }, "task_completion": { "type": "boolean", "default": true }, "approvals": { "type": "boolean", "default": true }, "failures": { "type": "boolean", "default": true }, "sound": { "type": "boolean", "default": false } }
+    },
+    "updates": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "channel": { "enum": ["stable", "beta"] }, "check_on_startup": { "type": "boolean", "default": true }, "automatic_download": { "type": "boolean", "default": false }, "automatic_install": { "type": "boolean", "default": false } }
+    },
+    "opencode": { "type": "object", "description": "Managed OpenCode config; security-owned keys are enforced natively and secrets are keychain aliases." },
+    "secret_aliases": { "type": "array", "default": [], "items": { "$ref": "#/$defs/keychainAlias" } },
     "risk_acknowledgements": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "scope": { "type": "string", "minLength": 1 },
-          "risk": { "enum": ["consequential", "irreversible"] },
-          "acknowledged": { "const": true }
-        },
-        "required": ["scope", "risk", "acknowledged"]
-      }
+      "type": "array", "default": [],
+      "items": { "type": "object", "additionalProperties": false, "properties": { "scope": { "type": "string", "minLength": 1 }, "risk": { "enum": ["consequential", "irreversible"] }, "acknowledged": { "const": true } }, "required": ["scope", "risk", "acknowledged"] }
     }
   },
   "required": ["schema_version", "persona"]

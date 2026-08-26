@@ -14,9 +14,11 @@ pub use artifacts::{
     Whiteboard, WhiteboardCard, sanitized_html_report, terminal_safe_text,
 };
 pub use config::{
-    AgentConfig, CONFIG_SCHEMA, ConfigError, ConfigFileError, ConfigLoad, KeychainAlias,
-    PersonaConfig, PersonalAgentConfig, PrivacyConfig, RiskAcknowledgement, RiskLevel,
-    RuntimeConfig, default_config_toml, load_or_initialize_config, parse_config,
+    AgentConfig, AutomationConfig, BrowserConfig, CONFIG_SCHEMA, ConfigError, ConfigFileError,
+    ConfigLoad, KeychainAlias, MemoryConfig, NotificationConfig, PersonaConfig,
+    PersonalAgentConfig, PrivacyConfig, RiskAcknowledgement, RiskLevel, RuntimeConfig, UiConfig,
+    UpdateConfig, VoiceConfig, WorkspaceConfig, default_config_toml, load_or_initialize_config,
+    parse_config,
 };
 pub use conversation::{
     ControlState, ConversationContext, ConversationError, ConversationState, InputModality,
@@ -257,6 +259,37 @@ impl ProfileState {
         self.store.append(&event)?;
         self.projection.apply(&event)?;
         Ok(self.projection.clone())
+    }
+
+    /// Persist one normalized runtime event with a profile-global monotonic
+    /// sequence so live sessions survive restart and can rebuild the UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be persisted or projected.
+    pub fn record_runtime_event(
+        &mut self,
+        mut event: EventEnvelope,
+    ) -> Result<AppProjection, CoreError> {
+        event.monotonic_sequence = self.projection.last_sequence + 1;
+        event.profile_id.clone_from(&self.profile_id);
+        self.store.append(&event)?;
+        self.projection.apply(&event)?;
+        Ok(self.projection.clone())
+    }
+
+    /// Return persisted events for history/timeline rendering. Secrets remain
+    /// filtered at event creation and the renderer never receives the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encrypted event store cannot be queried.
+    pub fn events_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>, CoreError> {
+        Ok(self.store.after(sequence, limit.min(1_000))?)
     }
 
     /// Import one reviewed legacy plan into the encrypted profile and rebuild

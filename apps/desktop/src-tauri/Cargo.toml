@@ -7,16 +7,23 @@ license.workspace = true
 publish = false
 
 [dependencies]
+personal-agent-audio = { path = "../../../crates/audio", version = "=0.1.0" }
+personal-agent-agent = { path = "../../../crates/agent", version = "=0.1.0" }
+personal-agent-contracts = { path = "../../../crates/contracts", version = "=0.1.0" }
 personal-agent-core = { path = "../../../crates/core", version = "=0.1.0" }
 personal-agent-migration = { path = "../../../crates/migration", version = "=0.1.0" }
 personal-agent-platform = { path = "../../../crates/platform", version = "=0.1.0" }
 personal-agent-runtime = { path = "../../../crates/runtime", version = "=0.1.0" }
+reqwest.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-single-instance.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
