@@ -28,9 +28,9 @@ authors = ["Personal Agent contributors"]
 
 [workspace.dependencies]
 async-trait = "=0.1.92"
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 chrono = { version = "=0.4.45", features = ["serde"] }
-ed25519-dalek = "=2.2.0"
+ed25519-dalek = "=3.0.0"
 futures-util = "=0.3.34"
 keyring = "=4.1.6"
 libc = "=0.2.189"
