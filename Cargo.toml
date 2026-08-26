@@ -28,20 +28,33 @@ authors = ["Personal Agent contributors"]
 
 [workspace.dependencies]
 async-trait = "=0.1.92"
+base64 = "=0.22.1"
 chrono = { version = "=0.4.45", features = ["serde"] }
+ed25519-dalek = "=2.2.0"
+futures-util = "=0.3.34"
+keyring = "=4.1.6"
+libc = "=0.2.189"
 petgraph = "=0.8.3"
 prost = "=0.14.4"
+progenitor = "=0.14.0"
+progenitor-client = "=0.14.0"
+regress = "=0.11.1"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "backup", "chrono", "serde_json", "uuid"] }
 secrecy = { version = "=0.10.3", features = ["serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
-tauri = "=2.11.5"
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
+tauri-plugin-autostart = "=2.5.1"
+tauri-plugin-single-instance = "=2.4.3"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
-tokio = { version = "=1.53.1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml = "=1.1.4"
 tracing = "=0.1.44"
+tracing-appender = "=0.2.5"
+tracing-subscriber = { version = "=0.3.23", features = ["json"] }
 url = { version = "=2.5.8", features = ["serde"] }
 uuid = { version = "=1.25.0", features = ["serde", "v4", "v7"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Personal Agent</title>
+  <desc id="desc">A cyan agent core surrounded by a precise diamond frame on deep navy.</desc>
+  <defs>
+    <radialGradient id="background" cx="50%" cy="42%" r="70%">
+      <stop offset="0" stop-color="#14384a"/>
+      <stop offset="0.48" stop-color="#081722"/>
+      <stop offset="1" stop-color="#03070c"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="45%" r="56%">
+      <stop offset="0" stop-color="#e7fdff"/>
+      <stop offset="0.14" stop-color="#86f2ff"/>
+      <stop offset="0.42" stop-color="#22bdd7"/>
+      <stop offset="1" stop-color="#0a2936"/>
+    </radialGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9af6ff"/>
+      <stop offset="0.5" stop-color="#2bd5ed"/>
+      <stop offset="1" stop-color="#187d99"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="220" fill="url(#background)"/>
+  <path d="M512 128 896 512 512 896 128 512Z" fill="none" stroke="url(#frame)" stroke-width="34"/>
+  <path d="M512 218 806 512 512 806 218 512Z" fill="none" stroke="#2bcce4" stroke-opacity=".42" stroke-width="10"/>
+  <circle cx="512" cy="512" r="205" fill="none" stroke="#55e8f6" stroke-opacity=".45" stroke-width="9" stroke-dasharray="21 25"/>
+  <circle cx="512" cy="512" r="142" fill="#1ed7ec" opacity=".2" filter="url(#glow)"/>
+  <circle cx="512" cy="512" r="112" fill="url(#core)" stroke="#a2f7ff" stroke-width="11" filter="url(#glow)"/>
+  <circle cx="512" cy="512" r="36" fill="#eaffff"/>
+  <path d="M512 276v42M512 706v42M276 512h42M706 512h42" stroke="#9bf5ff" stroke-width="18" stroke-linecap="round"/>
+</svg>

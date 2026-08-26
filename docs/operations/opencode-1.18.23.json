@@ -2,6 +2,13 @@
   "version": "1.18.23",
   "verified_on": "2026-08-26",
   "release": "https://github.com/anomalyco/opencode/releases/tag/v1.18.23",
+  "authenticated_openapi": {
+    "path": "/doc",
+    "sha256": "dfb7d42a555389f0c662fa2b4a8af1d61633c96710cf54bce3ff2404e2e7d896",
+    "bytes": 478742,
+    "operation_count": 188,
+    "schema_count": 472
+  },
   "artifacts": {
     "darwin-arm64": { "name": "opencode-darwin-arm64.zip", "sha256": "373cf36673836f2ce8847295a0bb2cd2447d03c769b44d84185916bd471b4274" },
     "darwin-x64": { "name": "opencode-darwin-x64.zip", "sha256": "6b617da75b5773836fcdc7247d7ea2bd39aec942a58b89a041bafb3d4d2a8c23" },

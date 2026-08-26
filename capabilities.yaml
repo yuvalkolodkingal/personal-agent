@@ -27,7 +27,7 @@
       "acceptance_test_ids": [
         "AT-M1-CONTRACT-DRIFT"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-STORAGE",
@@ -55,7 +55,7 @@
         "AT-M1-STORAGE-ENCRYPTED",
         "AT-M1-EVENT-RECOVERY"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-CONFIG",
@@ -84,7 +84,7 @@
       "acceptance_test_ids": [
         "AT-M1-CONFIG-ROUNDTRIP"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-RUNTIME",
@@ -118,7 +118,14 @@
       "milestone": "M2",
       "acceptance_test_ids": [
         "AT-M2-STREAMED-TURN",
-        "AT-M2-SIDECAR-AUTH"
+        "AT-M2-SIDECAR-AUTH",
+        "AT-M2-OPENAPI-FINGERPRINT",
+        "AT-M2-GENERATED-CLIENT",
+        "AT-M2-FAKE-TOOL-TURN",
+        "AT-M2-SYNTHETIC-PROVIDER",
+        "AT-M2-SAFETY-PLUGIN",
+        "AT-M2-PROFILE-ISOLATION",
+        "AT-M2-NATIVE-TOOL-BRIDGE"
       ],
       "status": "in_progress"
     },
@@ -193,7 +200,7 @@
       "acceptance_test_ids": [
         "AT-M3-CONVERSATION-STATES"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-WORKSPACE",
@@ -403,7 +410,7 @@
       "acceptance_test_ids": [
         "AT-M6-DAG-RECOVERY"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-MEMORY",
@@ -436,7 +443,7 @@
       "acceptance_test_ids": [
         "AT-M6-MEMORY-PROVENANCE"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-AUTOMATION",
@@ -469,7 +476,7 @@
       "acceptance_test_ids": [
         "AT-M6-AUTOMATION-RECOVERY"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-EXTENSIONS",
@@ -540,7 +547,7 @@
       "acceptance_test_ids": [
         "AT-M7-COMPETITOR-COVERAGE"
       ],
-      "status": "planned"
+      "status": "in_progress"
     },
     {
       "id": "CAP-RESEARCH",
@@ -573,7 +580,7 @@
       "acceptance_test_ids": [
         "AT-M7-COMPETITOR-COVERAGE"
       ],
-      "status": "planned"
+      "status": "in_progress"
     },
     {
       "id": "CAP-ARTIFACTS",
@@ -635,7 +642,7 @@
       "acceptance_test_ids": [
         "AT-M7-REMOTE-PROTOCOL"
       ],
-      "status": "planned"
+      "status": "passed"
     },
     {
       "id": "CAP-MIGRATION",
@@ -662,7 +669,7 @@
       "acceptance_test_ids": [
         "AT-M8-MIGRATION-DRY-RUN"
       ],
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "CAP-OPERATIONS",
@@ -689,6 +696,7 @@
       "dependencies": [],
       "milestone": "M9",
       "acceptance_test_ids": [
+        "AT-M1-LIFECYCLE-RECOVERY",
         "AT-M1-PLATFORM-BUILD",
         "AT-M9-LIFECYCLE",
         "AT-M9-PERFORMANCE"

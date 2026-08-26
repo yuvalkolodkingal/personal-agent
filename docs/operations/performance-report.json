@@ -1,0 +1,36 @@
+{
+  "external_hardware_required": [
+    "end_to_end_barge_in",
+    "cloud_first_audio",
+    "idle_cpu",
+    "idle_resident_memory",
+    "warm_ui_startup"
+  ],
+  "hotkey_to_listening": {
+    "maximum_microseconds": 0,
+    "p50_microseconds": 0,
+    "p95_microseconds": 0,
+    "sample_count": 100
+  },
+  "internal_speaker_stop": {
+    "maximum_microseconds": 1,
+    "p50_microseconds": 0,
+    "p95_microseconds": 0,
+    "sample_count": 100
+  },
+  "measurement": "deterministic-replay",
+  "network": "disabled",
+  "offline_deterministic_command": {
+    "maximum_microseconds": 57,
+    "p50_microseconds": 21,
+    "p95_microseconds": 27,
+    "sample_count": 100
+  },
+  "schema_version": 1,
+  "wake_detection_to_listening": {
+    "maximum_microseconds": 50,
+    "p50_microseconds": 20,
+    "p95_microseconds": 26,
+    "sample_count": 100
+  }
+}

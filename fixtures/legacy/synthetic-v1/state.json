@@ -1,0 +1,10 @@
+{
+  "sessions": {"assistant": "legacy-session-must-not-resume"},
+  "project": "alpha",
+  "expert": "reviewer",
+  "muted": true,
+  "asleep": false,
+  "guest": false,
+  "quiet_until": 0,
+  "unrecognized_private_state": "do not map"
+}

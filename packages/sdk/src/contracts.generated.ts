@@ -1,5 +1,5 @@
 // Generated from contracts/proto/events.proto. Do not edit.
-export const CONTRACT_SOURCE_SHA256 = "8821049676b65923f276505ab437c326abf1919801308393e1c1b7e8803460b4" as const;
+export const CONTRACT_SOURCE_SHA256 = "9e95299c9f54ae7121013324f3e0f8e3801e57801397fa5c3b850c2a5ec0c1b2" as const;
 export const EVENT_SCHEMA_VERSION = 1 as const;
 
 export interface EventEnvelope {

@@ -223,8 +223,8 @@ recorded; transcripts and arguments are configurable.
 Transactional tables are events, profiles, sessions, goals, tasks, task_edges,
 agent_runs, tool_runs, permission_requests, consent_grants, checkpoints,
 memories, memory_links, automations, automation_runs, artifacts, connectors,
-provider_usage, egress, settings, and migration_runs. Large blobs are encrypted
-and content-addressed.
+provider_usage, egress, settings, migration_runs, and internal migration_items.
+Large blobs are encrypted and content-addressed.
 
 Legacy discovery never modifies source. Dry-run precedes personal copying;
 versioned mappings convert settings; history becomes legacy events; memory

@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"remote","name":"Third-party Remote Protocol","version":"0.1.0","category":"remote","publisher":"Personal Agent","official":true,"capabilities":["CAP-REMOTE","CAP-SAFETY"],"connectors":[],"evaluation_ids":["EVAL-PACK-REMOTE"],"install_disabled":true}

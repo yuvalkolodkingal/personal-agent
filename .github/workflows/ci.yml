@@ -12,14 +12,17 @@ jobs:
   registries-and-web:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: 1.4.0 }
       - run: bun install --frozen-lockfile
       - run: python scripts/verify-registries.py
+      - run: python scripts/verify-packs.py
+      - run: python scripts/generate-release-metadata.py --check
       - run: bun run contracts:check
       - run: bun run check
       - run: bun run test
+      - run: python scripts/verify-performance.py
       - run: bun run --cwd apps/desktop build
 
   rust:
@@ -29,13 +32,19 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-          - os: macos-15
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-26
             target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Linux desktop dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -44,17 +53,150 @@ jobs:
           toolchain: 1.98.0
           target: ${{ matrix.target }}
           components: rustfmt,clippy
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.0 }
+      - run: bun install --frozen-lockfile
+      - run: bun run sidecar:fetch --target=${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --target ${{ matrix.target }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --target ${{ matrix.target }} --locked
+      - run: bunx tauri build --debug --no-bundle
+        working-directory: apps/desktop
 
-  intel-macos-compile:
-    runs-on: macos-15
+  installer-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: macos-26
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf rpm2cpio cpio
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: 1.98.0
-          target: x86_64-apple-darwin
-      - run: cargo check --workspace --target x86_64-apple-darwin
+          target: ${{ matrix.target }}
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.0 }
+      - run: bun install --frozen-lockfile
+      - run: bun run sidecar:fetch --target=${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: bunx tauri build --debug --bundles ${{ matrix.bundles }}
+        working-directory: apps/desktop
+      - name: Verify Debian payload
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="$(find target/debug/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$artifact"
+          extract="$(mktemp -d)"
+          dpkg-deb --extract "$artifact" "$extract"
+          test -x "$extract/usr/bin/personal-agent-desktop"
+          test "$("$extract/usr/bin/opencode" --version)" = "1.18.23"
+          cmp packages/opencode-plugin/src/index.ts "$extract/usr/lib/Personal Agent/opencode-plugin/index.ts"
+      - name: Verify RPM and AppImage payloads
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rpm="$(find target/debug/bundle/rpm -maxdepth 1 -name '*.rpm' -print -quit)"
+          appimage="$(find target/debug/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$rpm" && test -n "$appimage"
+          rpm_extract="$(mktemp -d)"
+          (cd "$rpm_extract" && rpm2cpio "$rpm" | cpio -id --quiet)
+          test -x "$rpm_extract/usr/bin/personal-agent-desktop"
+          app_extract="$(mktemp -d)"
+          (cd "$app_extract" && "$appimage" --appimage-extract >/dev/null)
+          test -x "$app_extract/squashfs-root/usr/bin/personal-agent-desktop"
+      - name: Verify NSIS payload
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem target/debug/bundle/nsis/*.exe | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer is missing' }
+          $extract = Join-Path $env:RUNNER_TEMP 'personal-agent-nsis'
+          7z x $installer.FullName "-o$extract" -y | Out-Null
+          $hostBinary = Get-ChildItem $extract -Recurse -Filter personal-agent-desktop.exe | Select-Object -First 1
+          $sidecar = Get-ChildItem $extract -Recurse -Filter opencode.exe | Select-Object -First 1
+          $safetyPlugin = Get-ChildItem $extract -Recurse -Filter index.ts | Where-Object { $_.FullName -match 'opencode-plugin' } | Select-Object -First 1
+          if (-not $hostBinary -or -not $sidecar -or -not $safetyPlugin) { throw 'NSIS payload is incomplete' }
+          if ((& $sidecar.FullName --version).Trim() -ne '1.18.23') { throw 'sidecar version mismatch' }
+          if ((Get-FileHash $safetyPlugin.FullName).Hash -ne (Get-FileHash packages/opencode-plugin/src/index.ts).Hash) { throw 'safety plugin mismatch' }
+          if (-not (Get-ChildItem target/debug/bundle/msi/*.msi | Select-Object -First 1)) { throw 'MSI bundle is missing' }
+      - name: Build and inspect unsigned MSIX
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'personal-agent-msix'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/debug/personal-agent-desktop.exe $stage
+          Copy-Item apps/desktop/src-tauri/binaries/opencode-x86_64-pc-windows-msvc.exe (Join-Path $stage 'opencode.exe')
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'opencode-plugin') | Out-Null
+          Copy-Item packages/opencode-plugin/src/index.ts (Join-Path $stage 'opencode-plugin/index.ts')
+          Copy-Item apps/desktop/src-tauri/icons/Square150x150Logo.png $stage
+          Copy-Item apps/desktop/src-tauri/icons/Square44x44Logo.png $stage
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+            <Identity Name="dev.personal-agent.desktop" Publisher="CN=Personal Agent Unsigned Development" Version="0.1.0.0" ProcessorArchitecture="x64"/>
+            <Properties><DisplayName>Personal Agent</DisplayName><PublisherDisplayName>Personal Agent</PublisherDisplayName><Logo>Square150x150Logo.png</Logo></Properties>
+            <Resources><Resource Language="en-us"/></Resources>
+            <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0"/></Dependencies>
+            <Applications><Application Id="App" Executable="personal-agent-desktop.exe" EntryPoint="Windows.FullTrustApplication"><uap:VisualElements DisplayName="Personal Agent" Description="Bounded desktop assistant" BackgroundColor="transparent" Square150x150Logo="Square150x150Logo.png" Square44x44Logo="Square44x44Logo.png"/></Application></Applications>
+            <Capabilities><rescap:Capability Name="runFullTrust"/></Capabilities>
+          </Package>
+          '@ | Set-Content -Encoding utf8 (Join-Path $stage 'AppxManifest.xml')
+          $makeappx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter makeappx.exe | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw 'MakeAppx is unavailable' }
+          New-Item -ItemType Directory -Force -Path target/debug/bundle/msix | Out-Null
+          & $makeappx.FullName pack /d $stage /p target/debug/bundle/msix/Personal-Agent_0.1.0_x64.msix /o
+          $unpacked = Join-Path $env:RUNNER_TEMP 'personal-agent-msix-unpacked'
+          & $makeappx.FullName unpack /p target/debug/bundle/msix/Personal-Agent_0.1.0_x64.msix /d $unpacked /o
+          if (-not (Test-Path (Join-Path $unpacked 'personal-agent-desktop.exe'))) { throw 'MSIX payload is incomplete' }
+      - name: Verify macOS app payload
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$(find target/debug/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$bundle"
+          test -x "$bundle/Contents/MacOS/personal-agent-desktop"
+          test "$("$bundle/Contents/MacOS/opencode" --version)" = "1.18.23"
+          cmp packages/opencode-plugin/src/index.ts "$bundle/Contents/Resources/opencode-plugin/index.ts"
+      - name: Build and inspect unsigned macOS PKG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$(find target/debug/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          mkdir -p target/debug/bundle/pkg
+          pkgbuild --component "$bundle" --install-location /Applications target/debug/bundle/pkg/Personal-Agent_0.1.0_arm64.pkg
+          expanded="$(mktemp -d)"
+          pkgutil --expand target/debug/bundle/pkg/Personal-Agent_0.1.0_arm64.pkg "$expanded/package"
+          test -f "$expanded/package/Payload"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-${{ matrix.target }}-installers
+          path: |
+            target/debug/bundle/**/*.deb
+            target/debug/bundle/**/*.rpm
+            target/debug/bundle/**/*.AppImage
+            target/debug/bundle/**/*.exe
+            target/debug/bundle/**/*.msi
+            target/debug/bundle/**/*.msix
+            target/debug/bundle/**/*.dmg
+            target/debug/bundle/**/*.pkg
+          if-no-files-found: error

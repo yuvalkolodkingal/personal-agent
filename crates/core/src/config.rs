@@ -1,6 +1,9 @@
 //! Canonical, strict, human-editable application configuration.
 
 use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use thiserror::Error;
 
 /// JSON Schema used by editors and external tooling.
@@ -53,6 +56,20 @@ pub struct PersonalAgentConfig {
     pub risk_acknowledgements: Vec<RiskAcknowledgement>,
 }
 
+impl Default for PersonalAgentConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: schema_version(),
+            persona: PersonaConfig::default(),
+            agent: AgentConfig::default(),
+            runtime: RuntimeConfig::default(),
+            privacy: PrivacyConfig::default(),
+            secret_aliases: Vec::new(),
+            risk_acknowledgements: Vec::new(),
+        }
+    }
+}
+
 /// Configurable assistant identity. It describes behavior and never sentience.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +77,15 @@ pub struct PersonaConfig {
     pub name: String,
     #[serde(default = "persona_style")]
     pub style: String,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            name: "JARVIS".to_owned(),
+            style: persona_style(),
+        }
+    }
 }
 
 /// Bounded agent concurrency controls.
@@ -186,6 +212,64 @@ pub enum ConfigError {
     RiskNotAcknowledged,
 }
 
+/// Canonical configuration file failure.
+#[derive(Debug, Error)]
+pub enum ConfigFileError {
+    #[error("configuration file cannot be accessed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
+/// Render the safe default configuration used for a fresh profile.
+///
+/// # Errors
+///
+/// Returns an error only if TOML serialization fails.
+pub fn default_config_toml() -> Result<String, ConfigError> {
+    toml::to_string_pretty(&PersonalAgentConfig::default()).map_err(ConfigError::Serialize)
+}
+
+/// Load canonical TOML, creating a private safe-default file only when absent.
+///
+/// Existing invalid configuration is never overwritten or silently repaired on
+/// disk. The returned value identifies safe defaults that were materialized in
+/// memory so the UI can explain them before an explicit save.
+///
+/// # Errors
+///
+/// Returns an I/O or strict configuration-validation error.
+pub fn load_or_initialize_config(path: &Path) -> Result<ConfigLoad, ConfigFileError> {
+    match fs::read_to_string(path) {
+        Ok(input) => Ok(parse_config(&input)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let rendered = default_config_toml()?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path) {
+                Ok(mut file) => {
+                    file.write_all(rendered.as_bytes())?;
+                    file.sync_all()?;
+                    Ok(parse_config(&rendered)?)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(parse_config(&fs::read_to_string(path)?)?)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Parse strict TOML, materialize safe defaults, then validate security invariants.
 ///
 /// # Errors
@@ -247,11 +331,7 @@ fn validate(config: &PersonalAgentConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::StartupTimeout);
     }
     for alias in &config.secret_aliases {
-        let Some(path) = alias.0.strip_prefix("keychain://") else {
-            return Err(ConfigError::SecretAlias);
-        };
-        let mut parts = path.split('/');
-        if parts.next().is_none_or(str::is_empty) || parts.next().is_none_or(str::is_empty) {
+        if personal_agent_platform::SecretReference::parse(&alias.0).is_err() {
             return Err(ConfigError::SecretAlias);
         }
     }
@@ -317,5 +397,18 @@ mod tests {
             "https://json-schema.org/draft/2020-12/schema"
         );
         assert!(schema["properties"]["risk_acknowledgements"].is_object());
+    }
+
+    #[test]
+    fn config_file_initializes_once_and_preserves_invalid_edits() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("config.toml");
+        let initialized = load_or_initialize_config(&path).expect("initialize");
+        assert_eq!(initialized.config.persona.name, "JARVIS");
+        assert!(initialized.repaired_fields.is_empty());
+
+        fs::write(&path, "invalid = true\n").expect("edit fixture");
+        assert!(load_or_initialize_config(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).expect("read"), "invalid = true\n");
     }
 }

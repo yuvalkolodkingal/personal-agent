@@ -1,0 +1,4 @@
+{"ts":1787600000.0,"role":"user","text":"Synthetic migration question","context":"assistant","source":"typed","turn":1}
+{"ts":1787600001.0,"role":"assistant","text":"Synthetic migration answer","context":"assistant","turn":1}
+{"role":"tool","text":"tool arguments are not conversation history"}
+not valid json

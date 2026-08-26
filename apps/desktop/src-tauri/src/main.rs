@@ -1,13 +1,370 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use personal_agent_core::{AppProjection, ProfileState, load_or_initialize_config};
+use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
+use personal_agent_platform::{LifecycleMarker, OsSecretStore};
+use personal_agent_runtime::{AgentRuntime, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+use tauri::menu::{Menu, MenuItem};
+use tauri::path::BaseDirectory;
+use tauri::tray::TrayIconBuilder;
+use tauri::{Manager, WindowEvent};
+use tauri_plugin_autostart::ManagerExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+struct DesktopState {
+    profile: Mutex<ProfileState>,
+    runtime: tokio::sync::Mutex<OpenCodeSidecar>,
+    lifecycle: Mutex<Option<LifecycleMarker>>,
+    migration_review: Mutex<Option<MigrationReview>>,
+    app_data: PathBuf,
+    _log_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+struct MigrationReview {
+    token: String,
+    plan: MigrationPlan,
+}
+
+#[derive(serde::Serialize)]
+struct MigrationReviewResponse {
+    review_token: String,
+    plan: MigrationPlan,
+}
+
+#[derive(serde::Serialize)]
+struct MigrationImportResponse {
+    report: MigrationReport,
+    projection: AppProjection,
+    json_report_path: String,
+    markdown_report_path: String,
+}
+
+fn sidecar_path() -> Result<PathBuf, std::io::Error> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "application executable has no parent directory",
+        )
+    })?;
+    Ok(directory.join(if cfg!(target_os = "windows") {
+        "opencode.exe"
+    } else {
+        "opencode"
+    }))
+}
+
+fn init_logging(
+    directory: &Path,
+) -> Result<tracing_appender::non_blocking::WorkerGuard, std::io::Error> {
+    std::fs::create_dir_all(directory)?;
+    let appender = tracing_appender::rolling::daily(directory, "personal-agent.jsonl");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(writer)
+        .finish()
+        .try_init()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(guard)
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main")
+        && let Err(error) = window.show().and_then(|()| window.set_focus())
+    {
+        tracing::warn!(%error, "main window could not be shown");
+    }
+}
+
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Personal Agent", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut builder = TrayIconBuilder::with_id("personal-agent")
+        .menu(&menu)
+        .tooltip("Personal Agent")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn diagnostics() -> serde_json::Value {
     personal_agent_core::diagnostic_snapshot()
 }
 
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri command arguments are framework-owned values.
+fn projection(state: tauri::State<'_, DesktopState>) -> Result<AppProjection, String> {
+    state
+        .profile
+        .lock()
+        .map(|profile| profile.projection().clone())
+        .map_err(|_| "profile state lock is poisoned".to_owned())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri deserializes and owns IPC arguments.
+fn submit_message(
+    text: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<AppProjection, String> {
+    state
+        .profile
+        .lock()
+        .map_err(|_| "profile state lock is poisoned".to_owned())?
+        .submit_user_message(&text)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri provides an owned application handle.
+fn autostart_status(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri provides an owned application handle.
+fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|error| error.to_string())?;
+    manager.is_enabled().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri deserializes and owns IPC arguments.
+fn migration_dry_run(
+    config_root: String,
+    data_root: String,
+    opencode_auth: Option<String>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<MigrationReviewResponse, String> {
+    if config_root.trim().is_empty() || data_root.trim().is_empty() {
+        return Err("both legacy configuration and data roots are required".to_owned());
+    }
+    let roots = LegacyRoots {
+        config_root: PathBuf::from(config_root),
+        data_root: PathBuf::from(data_root),
+        opencode_auth: opencode_auth
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from),
+    };
+    let plan =
+        personal_agent_migration::discover_profile(&roots).map_err(|error| error.to_string())?;
+    let review_token = uuid::Uuid::new_v4().to_string();
+    let review = MigrationReview {
+        token: review_token.clone(),
+        plan: plan.clone(),
+    };
+    *state
+        .migration_review
+        .lock()
+        .map_err(|_| "migration review lock is poisoned".to_owned())? = Some(review);
+    tracing::info!(
+        input_count = plan.inputs.len(),
+        source_fingerprint = %plan.source_fingerprint,
+        "legacy migration dry run reviewed"
+    );
+    Ok(MigrationReviewResponse { review_token, plan })
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri deserializes and owns IPC arguments.
+fn migration_import(
+    review_token: String,
+    confirmed: bool,
+    adopt_opencode_auth: bool,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<MigrationImportResponse, String> {
+    if !confirmed {
+        return Err("legacy migration requires explicit confirmation".to_owned());
+    }
+    let reviewed = state
+        .migration_review
+        .lock()
+        .map_err(|_| "migration review lock is poisoned".to_owned())?
+        .take()
+        .ok_or_else(|| "run and review a migration dry run first".to_owned())?;
+    if reviewed.token != review_token {
+        return Err("migration review token does not match the latest dry run".to_owned());
+    }
+    let current = personal_agent_migration::discover_profile(&reviewed.plan.roots)
+        .map_err(|error| error.to_string())?;
+    if current.source_fingerprint != reviewed.plan.source_fingerprint {
+        return Err("legacy source changed after review; run a new dry run".to_owned());
+    }
+    let mut profile = state
+        .profile
+        .lock()
+        .map_err(|_| "profile state lock is poisoned".to_owned())?;
+    let report = profile
+        .import_legacy(
+            &current,
+            MigrationConsent {
+                copy_personal_data: true,
+                adopt_opencode_auth,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let projection = profile.projection().clone();
+    let written =
+        personal_agent_migration::write_reports(&report, &state.app_data.join("migration-reports"))
+            .map_err(|error| error.to_string())?;
+    tracing::info!(
+        imported = report.summary.imported,
+        already_present = report.summary.already_present,
+        skipped = report.summary.skipped,
+        invalid = report.summary.invalid,
+        "legacy migration completed"
+    );
+    Ok(MigrationImportResponse {
+        report,
+        projection,
+        json_report_path: written.json.to_string_lossy().into_owned(),
+        markdown_report_path: written.markdown.to_string_lossy().into_owned(),
+    })
+}
+
+fn persist_runtime_health(state: &DesktopState, health: &RuntimeHealth) {
+    if let Ok(mut profile) = state.profile.lock() {
+        if let Err(error) = profile.record_runtime_health(health) {
+            tracing::error!(%error, "runtime health could not be persisted");
+        }
+    } else {
+        tracing::error!("profile state lock is poisoned");
+    }
+}
+
+fn clean_shutdown(app: &tauri::AppHandle) {
+    let state = app.state::<DesktopState>();
+    if let Ok(mut runtime) = state.runtime.try_lock()
+        && let Err(error) = tauri::async_runtime::block_on(runtime.stop())
+    {
+        tracing::warn!(%error, "runtime did not stop cleanly");
+    }
+    if let Ok(mut lifecycle) = state.lifecycle.lock()
+        && let Some(marker) = lifecycle.take()
+        && let Err(error) = marker.finish()
+    {
+        tracing::warn!(%error, "clean lifecycle marker removal failed");
+    }
+    tracing::info!("desktop host stopped");
+}
+
 fn main() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![diagnostics])
-        .run(tauri::generate_context!())
-        .expect("Personal Agent desktop host failed");
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _working_directory| {
+            tracing::info!(argument_count = arguments.len(), "secondary launch redirected");
+            show_main_window(app);
+        }))
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("Personal Agent")
+                .arg("--autostart")
+                .build(),
+        )
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    tracing::warn!(%error, "main window could not be hidden");
+                }
+            }
+        })
+        .setup(|app| {
+            let app_data = app.path().app_data_dir()?;
+            let log_guard = init_logging(&app_data.join("logs"))?;
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                platform = std::env::consts::OS,
+                architecture = std::env::consts::ARCH,
+                "desktop host starting"
+            );
+            let config = load_or_initialize_config(&app_data.join("config.toml"))?;
+            let lifecycle = LifecycleMarker::begin(
+                &app_data.join("lifecycle/run-state.json"),
+                env!("CARGO_PKG_VERSION"),
+            )?;
+            let previous_unclean_run = lifecycle.previous_unclean_run();
+            let database = app_data.join("profiles/default.db");
+            let mut profile = ProfileState::open(&database, "default", &OsSecretStore)?;
+            profile.record_lifecycle_start(previous_unclean_run)?;
+
+            let safety_plugin = app
+                .path()
+                .resolve("opencode-plugin/index.ts", BaseDirectory::Resource)?;
+            let mut runtime_config = OpenCodeConfig::pinned(
+                sidecar_path()?,
+                safety_plugin,
+                app_data.join("runtime/opencode-profile"),
+            );
+            runtime_config.startup_timeout =
+                Duration::from_millis(config.config.runtime.startup_timeout_ms);
+            let sidecar = OpenCodeSidecar::new(runtime_config);
+            app.manage(DesktopState {
+                profile: Mutex::new(profile),
+                runtime: tokio::sync::Mutex::new(sidecar),
+                lifecycle: Mutex::new(Some(lifecycle)),
+                migration_review: Mutex::new(None),
+                app_data,
+                _log_guard: log_guard,
+            });
+            install_tray(app)?;
+
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<DesktopState>();
+                let health = match state.runtime.lock().await.start().await {
+                    Ok(health) => health,
+                    Err(error) => RuntimeHealth {
+                        healthy: false,
+                        version: personal_agent_runtime::OPENCODE_VERSION.to_owned(),
+                        detail: error.to_string(),
+                    },
+                };
+                tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
+                persist_runtime_health(&state, &health);
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            diagnostics,
+            projection,
+            submit_message,
+            autostart_status,
+            set_autostart,
+            migration_dry_run,
+            migration_import,
+        ]);
+
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("Personal Agent desktop host could not be built");
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            clean_shutdown(app);
+        }
+    });
 }

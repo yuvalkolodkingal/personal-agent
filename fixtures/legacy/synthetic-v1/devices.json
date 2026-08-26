@@ -1,0 +1,10 @@
+{
+  "devices": {
+    "phone-1": {
+      "name": "Synthetic phone",
+      "platform": "test",
+      "pairing_private_key": "fixture-provider-value-must-never-migrate",
+      "grants": ["config", "tools"]
+    }
+  }
+}

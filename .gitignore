@@ -3,6 +3,7 @@ node_modules/
 /dist
 /apps/desktop/dist
 /apps/desktop/src-tauri/gen/
+/apps/desktop/src-tauri/binaries/opencode-*
 /.idea
 /.vscode
 .DS_Store

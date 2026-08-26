@@ -15,7 +15,7 @@ React UI ── Tauri IPC ──► Rust Core ──► SQLCipher event store
                                       │ authenticated loopback HTTP + SSE
                                       ▼
                                  OpenCode 1.18.23
-                                      │ Personal Agent MCP only for effects
+                                      │ safety plugin + authenticated native bridge
                                       ▼
                                   Tool Gateway
 ```
@@ -25,10 +25,18 @@ events but never owns a database handle, provider secret, OpenCode credential,
 or native capability. The OpenCode endpoint and ephemeral basic-auth secret
 remain inside `crates/runtime`.
 
-OpenCode model output is untrusted. Effectful built-ins are disabled in both
-the agent tool map and permission configuration. Personal Agent tools are
-declared over MCP and execute only after native schema, scope, data-zone,
-policy, consent, checkpoint, filtering, audit, and postcondition stages.
+Profile database keys live in macOS Keychain, Windows Credential Manager, or
+Linux Secret Service. Configuration and IPC carry only
+`keychain://service/account` references. The desktop opens SQLCipher after the
+OS store returns the key, rebuilds its projection, then launches the bundled
+sidecar asynchronously; normalized health is appended as another event.
+
+OpenCode model output is untrusted. Filesystem and effectful built-ins are
+disabled in both the agent tool map and permission configuration. The initial
+native status tool uses an ephemeral loopback credential and exact registered
+session/directory scope; subsequent native/MCP tools share the same gateway.
+Every admitted tool executes only after native schema, scope, data-zone, policy,
+consent, checkpoint, filtering, audit, and postcondition stages.
 
 ## State model
 
@@ -38,10 +46,28 @@ state is a projection and is disposable. Stream clients reconnect with the
 last applied sequence. Additive events are ignored by older projections while
 schema-major incompatibility fails explicitly.
 
+Conversation controls are a separate deterministic state machine. Sleep, mute,
+quiet, stop, guest, and follow-up are not aliases: mute turns capture off,
+sleep leaves only wake-word privacy state, quiet suppresses spoken output, stop
+is a transient foreground abort, and guest dispatches use restricted tools and
+separate history scope. Typed messages are always silent and never activate the
+microphone. General and per-project sessions survive persona/model switches.
+
 SQLCipher is keyed before schema access. File-backed databases use WAL, full
 synchronous writes, foreign keys, and a busy timeout. Migrations are
 transactional. Large artifacts move to encrypted content-addressed storage;
 the database stores hashes and metadata.
+
+Legacy import has a separate review boundary. The renderer requests a
+metadata-only plan; native code holds the plan behind a one-time review token
+and rechecks its source fingerprint after explicit confirmation. Prepared
+records never appear in logs or reports. SQLCipher atomically commits a
+deterministic `migration_items` record and its domain materialization: history
+as legacy-origin events, Markdown as provenance-bearing memory, safe settings,
+disabled automations/connectors, and quarantined extension artifacts. Completed
+content-free reports are recorded in `migration_runs` and written as private
+JSON/Markdown files. Environment files, traces, auth, pairing keys, MCP
+arguments/headers, symlinks, and unknown config fields do not cross the boundary.
 
 ## Execution and concurrency
 

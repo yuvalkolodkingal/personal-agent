@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "synthetic-calendar": {
+      "command": "synthetic-server",
+      "args": ["--token", "fixture-provider-value-must-never-migrate"],
+      "env": {"PROVIDER_TOKEN": "fixture-provider-value-must-never-migrate"}
+    }
+  }
+}

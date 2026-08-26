@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"dictation","name":"Local Dictation","version":"0.1.0","category":"dictation","publisher":"Personal Agent","official":true,"capabilities":["CAP-VOICE"],"connectors":[],"evaluation_ids":["EVAL-PACK-DICTATION"],"install_disabled":true}

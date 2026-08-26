@@ -1,0 +1,11 @@
+[[task]]
+name = "morning-brief"
+cron = "0 8 * * *"
+prompt = "Summarize the synthetic day."
+deliver = "notify"
+
+[[task]]
+name = "broken-delivery"
+cron = "0 9 * * *"
+prompt = "This must remain disabled."
+deliver = "telepathy"

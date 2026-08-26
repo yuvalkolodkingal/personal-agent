@@ -51,6 +51,14 @@
       "status": "passed"
     },
     {
+      "id": "AT-M1-LIFECYCLE-RECOVERY",
+      "milestone": "M1",
+      "behavior": "A surviving process marker is recorded as an unclean recovery event; a normal exit clears it, and CLI config checks are read-only.",
+      "verification": "cargo test -p personal-agent-platform lifecycle_marker && cargo test -p personal-agent-core config_check",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
       "id": "AT-M1-PLATFORM-BUILD",
       "milestone": "M1",
       "behavior": "Development desktop builds install and rebuild state on Windows, macOS, and Linux.",
@@ -72,7 +80,63 @@
       "behavior": "OpenCode binds loopback only with per-run auth and exact-version compatibility.",
       "verification": "cargo test -p personal-agent-runtime",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-OPENAPI-FINGERPRINT",
+      "milestone": "M2",
+      "behavior": "Startup rejects the pinned sidecar if its authenticated OpenAPI contract differs from the reviewed release fingerprint.",
+      "verification": "cargo test -p personal-agent-runtime bundled_sidecar",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-GENERATED-CLIENT",
+      "milestone": "M2",
+      "behavior": "The generated authenticated stable client discovers project-scoped models and creates, resumes, forks, compacts or rejects, and aborts isolated sidecar sessions.",
+      "verification": "cargo test -p personal-agent-runtime bundled_sidecar",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-FAKE-TOOL-TURN",
+      "milestone": "M2",
+      "behavior": "The deterministic fake provider streams normalized response and tool lifecycle events through a terminal event.",
+      "verification": "cargo test -p personal-agent-runtime fake_runtime_streams_a_deterministic_tool_turn_to_terminal",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-SYNTHETIC-PROVIDER",
+      "milestone": "M2",
+      "behavior": "The stable sidecar loads an isolated OpenAI-compatible provider and completes an advertised native-gateway tool turn with normalized streaming and terminal state.",
+      "verification": "cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-SAFETY-PLUGIN",
+      "milestone": "M2",
+      "behavior": "The packaged OpenCode plugin has a loader-compatible export shape, fails unknown permission callbacks closed, and removes every effectful upstream built-in before a model request.",
+      "verification": "bun --cwd packages/opencode-plugin test && cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-PROFILE-ISOLATION",
+      "milestone": "M2",
+      "behavior": "Version probes and the running sidecar use an application-owned private profile and do not inherit ambient provider keys, OpenCode overrides, proxy settings, or package-manager configuration.",
+      "verification": "cargo test -p personal-agent-runtime sidecar_profile_is_private_and_excludes_ambient_credentials",
+      "kind": "automated",
+      "status": "passed"
+    },
+    {
+      "id": "AT-M2-NATIVE-TOOL-BRIDGE",
+      "milestone": "M2",
+      "behavior": "The sidecar plugin can invoke only an authenticated, registered-session-scoped native tool; rejected tokens/scopes are unaudited and an accepted call traverses policy, filtering, verification, and audit.",
+      "verification": "cargo test -p personal-agent-runtime native_tool_bridge_requires_authentication_and_registered_session_scope && cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
+      "kind": "automated",
+      "status": "passed"
     },
     {
       "id": "AT-M3-OFFLINE-VOICE",
@@ -86,17 +150,17 @@
       "id": "AT-M3-CONVERSATION-STATES",
       "milestone": "M3",
       "behavior": "Typed, voice, sleep, mute, quiet, stop, follow-up, guest, and project states stay distinct.",
-      "verification": "conversation state-machine suite",
+      "verification": "cargo test -p personal-agent-core conversation",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M3-BARGE-IN",
       "milestone": "M3",
       "behavior": "Internal speaker stop is under 50 ms and end-to-end barge-in is under 100 ms.",
-      "verification": "audio benchmark report",
+      "verification": "python scripts/verify-performance.py plus physical audio run",
       "kind": "hardware",
-      "status": "planned"
+      "status": "in_progress"
     },
     {
       "id": "AT-M4-ACCESSIBLE-WORKSPACE",
@@ -110,9 +174,9 @@
       "id": "AT-M4-PROJECT-CONTEXT",
       "milestone": "M4",
       "behavior": "Opening, closing, and switching project context does not lose unrelated conversation state.",
-      "verification": "project integration suite",
+      "verification": "cargo test -p personal-agent-core project_persona_and_model_switches_preserve_unrelated_contexts",
       "kind": "automated",
-      "status": "planned"
+      "status": "passed"
     },
     {
       "id": "AT-M5-POLICY-GATE",
@@ -126,9 +190,9 @@
       "id": "AT-M5-BROWSER-SAFE",
       "milestone": "M5",
       "behavior": "Isolated profile tasks work and malicious page instructions cannot cross data zones.",
-      "verification": "fixture-site and red-team suite",
+      "verification": "cargo test -p personal-agent-browser",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M5-DESKTOP-TOOLS",
@@ -142,17 +206,17 @@
       "id": "AT-M5-ROLLBACK",
       "milestone": "M5",
       "behavior": "Checkpoints precede mutations and rollback snapshots current state before restoring.",
-      "verification": "fault-injection suite",
+      "verification": "cargo test -p personal-agent-tools rollback",
       "kind": "automated",
-      "status": "planned"
+      "status": "passed"
     },
     {
       "id": "AT-M6-DAG-RECOVERY",
       "milestone": "M6",
       "behavior": "A multi-hour DAG survives restart and provider failure without duplicate consequential actions.",
-      "verification": "chaos scenario",
+      "verification": "cargo test -p personal-agent-agent multi_hour_goal && cargo test -p personal-agent-storage durable_runtime_snapshots",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M6-MEMORY-PROVENANCE",
@@ -160,15 +224,15 @@
       "behavior": "Explicit facts are trusted, inference is queued, conflicts remain visible, and recalled text is not re-extracted.",
       "verification": "cargo test -p personal-agent-memory",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M6-AUTOMATION-RECOVERY",
       "milestone": "M6",
       "behavior": "Missed runs follow policy, approvals suspend, and repeated failures pause an automation.",
-      "verification": "cargo test -p personal-agent-automation",
+      "verification": "cargo test -p personal-agent-automation && cargo test -p personal-agent-storage durable_runtime_snapshots",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M7-PLUGIN-SAFETY",
@@ -182,49 +246,49 @@
       "id": "AT-M7-REMOTE-PROTOCOL",
       "milestone": "M7",
       "behavior": "Third-party clients pair with fresh keys and cannot exceed negotiated capabilities.",
-      "verification": "protocol interoperability suite",
+      "verification": "cargo test -p personal-agent-plugins remote",
       "kind": "automated",
-      "status": "planned"
+      "status": "passed"
     },
     {
       "id": "AT-M7-COMPETITOR-COVERAGE",
       "milestone": "M7",
       "behavior": "Every adopted competitor capability is core or an installable official pack with an evaluation.",
-      "verification": "registry coverage check",
-      "kind": "automated",
-      "status": "planned"
+      "verification": "python scripts/verify-packs.py plus live connector evaluations",
+      "kind": "mixed",
+      "status": "in_progress"
     },
     {
       "id": "AT-M8-MIGRATION-DRY-RUN",
       "milestone": "M8",
-      "behavior": "Synthetic profiles dry-run and import idempotently without modifying source or copying plaintext secrets.",
-      "verification": "cargo test -p personal-agent-migration plus fixtures",
+      "behavior": "Synthetic and anonymized profiles dry-run and import idempotently without modifying source or copying plaintext secrets.",
+      "verification": "cargo test -p personal-agent-migration -p personal-agent-storage -p personal-agent-core plus fixtures",
       "kind": "automated",
-      "status": "in_progress"
+      "status": "passed"
     },
     {
       "id": "AT-M9-LIFECYCLE",
       "milestone": "M9",
       "behavior": "Fresh install, update, health rollback, export, uninstall, and optional data deletion pass on every platform.",
-      "verification": "signed/unsigned installer matrix",
+      "verification": "cargo test -p personal-agent-core release -p personal-agent-storage plus unsigned installer CI matrix",
       "kind": "mixed",
-      "status": "planned"
+      "status": "in_progress"
     },
     {
       "id": "AT-M9-PERFORMANCE",
       "milestone": "M9",
       "behavior": "Latency and idle resource targets report p50, p95, max, and sample count.",
-      "verification": "benchmark harness",
+      "verification": "python scripts/verify-performance.py plus reference hardware",
       "kind": "hardware",
-      "status": "planned"
+      "status": "in_progress"
     },
     {
       "id": "AT-M9-SECURITY",
       "milestone": "M9",
       "behavior": "No critical/high finding remains; SBOM, licenses, provenance, fuzzing, and red-team reports are complete.",
-      "verification": "release security gate",
+      "verification": "python scripts/security-gate.py plus Security workflow",
       "kind": "mixed",
-      "status": "planned"
+      "status": "in_progress"
     }
   ]
 }

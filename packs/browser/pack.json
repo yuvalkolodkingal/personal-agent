@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"browser","name":"Isolated Browser","version":"0.1.0","category":"browser","publisher":"Personal Agent","official":true,"capabilities":["CAP-BROWSER","CAP-SAFETY"],"connectors":[],"evaluation_ids":["EVAL-PACK-BROWSER"],"install_disabled":true}

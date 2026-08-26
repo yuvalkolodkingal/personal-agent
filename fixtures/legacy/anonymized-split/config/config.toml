@@ -1,0 +1,9 @@
+[persona]
+name = "JARVIS"
+style = "Brief and direct."
+
+[history]
+enabled = true
+
+[integrations]
+projects = ["/anonymized/work/project"]

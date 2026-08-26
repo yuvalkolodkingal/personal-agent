@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use personal_agent_policy::{
-    CallContext, ConsentGrant, DataZone, PolicyDecision, PolicyEngine, ToolDescriptor,
+    CallContext, ConsentGrant, DataZone, Effect, PolicyDecision, PolicyEngine, ToolDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +39,14 @@ pub struct ToolOutput {
     pub verified: bool,
 }
 
+/// Result of a transactional rollback. The current state is checkpointed first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RollbackOutput {
+    pub restored_checkpoint_id: String,
+    pub rescue_checkpoint_id: String,
+    pub verified: bool,
+}
+
 /// Immutable audit record, excluding raw secret values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolAudit {
@@ -49,6 +57,17 @@ pub struct ToolAudit {
     pub decision: String,
     pub succeeded: bool,
     pub output_bytes: usize,
+    pub reason: String,
+    pub estimated_cost_usd: f64,
+}
+
+/// Content-free outbound data record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EgressRecord {
+    pub call_id: Uuid,
+    pub destination: String,
+    pub kind: String,
+    pub size_bytes: usize,
     pub reason: String,
 }
 
@@ -67,6 +86,10 @@ pub enum ToolError {
     Execution(String),
     #[error("tool postcondition failed: {0}")]
     Postcondition(String),
+    #[error("tool does not support rollback")]
+    RollbackUnsupported,
+    #[error("rollback failed: {0}")]
+    Rollback(String),
 }
 
 /// Native or isolated executable implementation.
@@ -97,6 +120,24 @@ pub trait ToolImplementation: Send + Sync {
     ///
     /// Returns a typed postcondition error when the effect did not occur.
     async fn verify(&self, call: &ToolCall, output: &Value) -> Result<(), ToolError>;
+    /// Snapshot the current state immediately before rollback so the rollback
+    /// operation is itself recoverable.
+    async fn snapshot_current(&self, _call: &ToolCall) -> Result<Option<String>, ToolError> {
+        Ok(None)
+    }
+    /// Restore a prior checkpoint.
+    async fn rollback(&self, _call: &ToolCall, _checkpoint_id: &str) -> Result<Value, ToolError> {
+        Err(ToolError::RollbackUnsupported)
+    }
+    /// Verify that rollback reached the checkpoint's observable state.
+    async fn verify_rollback(
+        &self,
+        _call: &ToolCall,
+        _checkpoint_id: &str,
+        _output: &Value,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::RollbackUnsupported)
+    }
 }
 
 /// Registered gateway with one fixed core policy engine.
@@ -105,6 +146,7 @@ pub struct ToolGateway {
     policy: PolicyEngine,
     tools: HashMap<String, Arc<dyn ToolImplementation>>,
     audits: Vec<ToolAudit>,
+    egress: Vec<EgressRecord>,
     max_output_bytes: usize,
 }
 
@@ -122,6 +164,10 @@ impl ToolGateway {
     #[must_use]
     pub fn audits(&self) -> &[ToolAudit] {
         &self.audits
+    }
+    #[must_use]
+    pub fn egress(&self) -> &[EgressRecord] {
+        &self.egress
     }
 
     /// Execute validation → policy → checkpoint → effect → filtering → verification → audit.
@@ -162,6 +208,14 @@ impl ToolGateway {
             PolicyDecision::Deny { reason } => return Err(ToolError::Denied(reason.clone())),
         };
         let rollback_id = tool.checkpoint(&call).await?;
+        if tool.descriptor().reversible
+            && tool.descriptor().effect != Effect::Observe
+            && rollback_id.is_none()
+        {
+            return Err(ToolError::Execution(
+                "required checkpoint implementation returned no checkpoint".into(),
+            ));
+        }
         if rollback_id.is_some() {
             call.checkpoint_available = true;
         }
@@ -176,7 +230,8 @@ impl ToolGateway {
                     decision: decision_label,
                     succeeded: false,
                     output_bytes: 0,
-                    reason: error.to_string(),
+                    reason: "tool implementation returned an execution error".into(),
+                    estimated_cost_usd: call.estimated_cost_usd,
                 });
                 return Err(error);
             }
@@ -193,17 +248,87 @@ impl ToolGateway {
         tool.verify(&call, &filtered).await?;
         self.audits.push(ToolAudit {
             call_id: call.call_id,
-            tool_id: call.tool_id,
-            target: call.target,
+            tool_id: call.tool_id.clone(),
+            target: call.target.clone(),
             at: Utc::now(),
             decision: decision_label,
             succeeded: true,
             output_bytes: encoded.len(),
             reason: "postcondition verified".into(),
+            estimated_cost_usd: call.estimated_cost_usd,
         });
+        if matches!(
+            tool.descriptor().effect,
+            Effect::ExternalWrite
+                | Effect::Communication
+                | Effect::Commerce
+                | Effect::Security
+                | Effect::Power
+        ) {
+            self.egress.push(EgressRecord {
+                call_id: call.call_id,
+                destination: call.target.clone(),
+                kind: format!("{:?}", tool.descriptor().effect).to_lowercase(),
+                size_bytes: encoded.len(),
+                reason: "declared tool effect".into(),
+            });
+        }
         Ok(ToolOutput {
             value: filtered,
             rollback_id,
+            verified: true,
+        })
+    }
+
+    /// Transactionally restore a tool checkpoint after first preserving the
+    /// current state as a rescue checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/non-reversible tools, missing rescue snapshots, restore
+    /// failures, oversized output, or failed rollback verification.
+    pub async fn rollback(
+        &mut self,
+        call: &ToolCall,
+        checkpoint_id: &str,
+    ) -> Result<RollbackOutput, ToolError> {
+        let tool = self
+            .tools
+            .get(&call.tool_id)
+            .cloned()
+            .ok_or_else(|| ToolError::UnknownTool(call.tool_id.clone()))?;
+        if !tool.descriptor().reversible {
+            return Err(ToolError::RollbackUnsupported);
+        }
+        let rescue_checkpoint_id = tool
+            .snapshot_current(call)
+            .await?
+            .ok_or_else(|| ToolError::Rollback("current state could not be checkpointed".into()))?;
+        let raw = tool.rollback(call, checkpoint_id).await?;
+        let filtered = redact_secrets(raw);
+        let encoded = serde_json::to_vec(&filtered)
+            .map_err(|error| ToolError::Rollback(error.to_string()))?;
+        if encoded.len() > self.max_output_bytes {
+            return Err(ToolError::Rollback(format!(
+                "rollback output exceeds {} byte limit",
+                self.max_output_bytes
+            )));
+        }
+        tool.verify_rollback(call, checkpoint_id, &filtered).await?;
+        self.audits.push(ToolAudit {
+            call_id: call.call_id,
+            tool_id: call.tool_id.clone(),
+            target: call.target.clone(),
+            at: Utc::now(),
+            decision: "rollback requested through native gateway".into(),
+            succeeded: true,
+            output_bytes: encoded.len(),
+            reason: "current state snapshotted and prior checkpoint restored".into(),
+            estimated_cost_usd: call.estimated_cost_usd,
+        });
+        Ok(RollbackOutput {
+            restored_checkpoint_id: checkpoint_id.into(),
+            rescue_checkpoint_id,
             verified: true,
         })
     }
@@ -225,7 +350,21 @@ fn redact_secrets(value: Value) -> Value {
             Value::Object(map)
         }
         Value::Array(items) => Value::Array(items.into_iter().map(redact_secrets).collect()),
+        Value::String(text) => Value::String(redact_secret_text(&text)),
         other => other,
+    }
+}
+
+fn redact_secret_text(text: &str) -> String {
+    if text.contains("-----BEGIN")
+        || text.contains("Bearer ")
+        || text.contains("sk-")
+        || text.contains("ghp_")
+        || text.contains("github_pat_")
+    {
+        "[REDACTED]".into()
+    } else {
+        text.into()
     }
 }
 
@@ -233,6 +372,7 @@ fn redact_secrets(value: Value) -> Value {
 mod tests {
     use super::*;
     use personal_agent_policy::{Effect, Idempotency, Risk};
+    use std::sync::Mutex;
     struct ReadTool {
         descriptor: ToolDescriptor,
     }
@@ -292,5 +432,141 @@ mod tests {
         let output = gateway.call(call, &[]).await.expect("call");
         assert_eq!(output.value["token"], "[REDACTED]");
         assert_eq!(gateway.audits().len(), 1);
+    }
+
+    struct ReversibleTool {
+        descriptor: ToolDescriptor,
+        state: Arc<Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl ToolImplementation for ReversibleTool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+        fn validate_input(&self, input: &Value) -> Result<(), ToolError> {
+            input
+                .get("value")
+                .and_then(Value::as_str)
+                .map(|_| ())
+                .ok_or_else(|| ToolError::InvalidInput("value string required".into()))
+        }
+        async fn checkpoint(&self, _: &ToolCall) -> Result<Option<String>, ToolError> {
+            Ok(Some(self.state.lock().expect("state").clone()))
+        }
+        async fn execute(&self, call: &ToolCall) -> Result<Value, ToolError> {
+            let next = call.input["value"].as_str().expect("validated").to_owned();
+            *self.state.lock().expect("state") = next.clone();
+            Ok(serde_json::json!({"value":next}))
+        }
+        async fn verify(&self, _: &ToolCall, output: &Value) -> Result<(), ToolError> {
+            if self.state.lock().expect("state").as_str() == output["value"] {
+                Ok(())
+            } else {
+                Err(ToolError::Postcondition("state mismatch".into()))
+            }
+        }
+        async fn snapshot_current(&self, _: &ToolCall) -> Result<Option<String>, ToolError> {
+            Ok(Some(self.state.lock().expect("state").clone()))
+        }
+        async fn rollback(&self, _: &ToolCall, checkpoint_id: &str) -> Result<Value, ToolError> {
+            *self.state.lock().expect("state") = checkpoint_id.into();
+            Ok(serde_json::json!({"value":checkpoint_id}))
+        }
+        async fn verify_rollback(
+            &self,
+            _: &ToolCall,
+            checkpoint_id: &str,
+            _: &Value,
+        ) -> Result<(), ToolError> {
+            if self.state.lock().expect("state").as_str() == checkpoint_id {
+                Ok(())
+            } else {
+                Err(ToolError::Postcondition("rollback mismatch".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_snapshots_current_state_before_verified_restore() {
+        let descriptor = ToolDescriptor {
+            id: "file.fixture.write".into(),
+            version: "1.0.0".into(),
+            description: "fixture write".into(),
+            scopes: ["file.write".into()].into(),
+            risk: Risk::Reversible,
+            effect: Effect::ExternalWrite,
+            idempotency: Idempotency::WithKey,
+            reversible: true,
+            zones_read: [DataZone::TrustedLocalState].into(),
+            zones_written: [DataZone::TrustedLocalState].into(),
+            user_presence: false,
+        };
+        let state = Arc::new(Mutex::new("before".into()));
+        let mut gateway = ToolGateway::new(4096);
+        gateway.register(Arc::new(ReversibleTool {
+            descriptor,
+            state: Arc::clone(&state),
+        }));
+        let call = ToolCall {
+            call_id: Uuid::now_v7(),
+            goal_id: Uuid::now_v7(),
+            task_id: None,
+            tool_id: "file.fixture.write".into(),
+            target: "registered-workspace/file".into(),
+            input: serde_json::json!({"value":"after"}),
+            input_zones: [DataZone::UserInstruction].into(),
+            granted_scopes: ["file.write".into()].into(),
+            estimated_cost_usd: 0.0,
+            background: false,
+            user_present: true,
+            checkpoint_available: true,
+        };
+        let output = gateway.call(call.clone(), &[]).await.expect("mutation");
+        assert_eq!(output.rollback_id.as_deref(), Some("before"));
+        assert_eq!(state.lock().expect("state").as_str(), "after");
+        let restored = gateway.rollback(&call, "before").await.expect("rollback");
+        assert_eq!(restored.rescue_checkpoint_id, "after");
+        assert_eq!(state.lock().expect("state").as_str(), "before");
+        assert!(restored.verified);
+        assert_eq!(gateway.egress().len(), 1);
+        assert_eq!(gateway.egress()[0].destination, "registered-workspace/file");
+    }
+
+    #[tokio::test]
+    async fn reversible_mutation_fails_before_execution_without_real_checkpoint() {
+        let descriptor = ToolDescriptor {
+            id: "broken.write".into(),
+            version: "1".into(),
+            description: "broken".into(),
+            scopes: ["write".into()].into(),
+            risk: Risk::Reversible,
+            effect: Effect::LocalWrite,
+            idempotency: Idempotency::WithKey,
+            reversible: true,
+            zones_read: [DataZone::TrustedLocalState].into(),
+            zones_written: [DataZone::TrustedLocalState].into(),
+            user_presence: false,
+        };
+        let mut gateway = ToolGateway::new(4096);
+        gateway.register(Arc::new(ReadTool { descriptor }));
+        let call = ToolCall {
+            call_id: Uuid::now_v7(),
+            goal_id: Uuid::now_v7(),
+            task_id: None,
+            tool_id: "broken.write".into(),
+            target: "workspace".into(),
+            input: serde_json::json!({}),
+            input_zones: [DataZone::UserInstruction].into(),
+            granted_scopes: ["write".into()].into(),
+            estimated_cost_usd: 0.0,
+            background: false,
+            user_present: true,
+            checkpoint_available: true,
+        };
+        assert!(
+            matches!(gateway.call(call, &[]).await, Err(ToolError::Execution(message)) if message.contains("checkpoint"))
+        );
+        assert!(gateway.audits().is_empty());
     }
 }

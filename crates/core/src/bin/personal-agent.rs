@@ -1,14 +1,12 @@
 fn main() {
-    let command = std::env::args().nth(1).unwrap_or_else(|| "status".into());
-    match command.as_str() {
-        "status" | "doctor" => println!(
-            "{}",
-            serde_json::to_string_pretty(&personal_agent_core::diagnostic_snapshot())
-                .expect("diagnostics")
-        ),
-        _ => {
-            eprintln!("usage: personal-agent [status|doctor]");
-            std::process::exit(2);
-        }
+    let response = personal_agent_core::run_cli(std::env::args_os().skip(1));
+    if !response.stdout.is_empty() {
+        print!("{}", response.stdout);
+    }
+    if !response.stderr.is_empty() {
+        eprint!("{}", response.stderr);
+    }
+    if response.exit_code != 0 {
+        std::process::exit(response.exit_code);
     }
 }

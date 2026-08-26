@@ -58,34 +58,49 @@ desktop backends, quarantine, egress, and rollback.
 
 Exit gate: representative platform/browser tasks and injection red-team gates.
 
-## M6 — Memory, automation, and agent runtime (in progress)
+## M6 — Memory, automation, and agent runtime (passed)
 
 Typed acyclic goals/tasks, completion verification, memory trust/provenance,
 automation failure policy, durable scheduler, retrieval, delegates, recovery,
 monitoring, and control UI.
 
-Exit gate: a multi-hour goal survives restart/provider failure without duplicate
-consequential action.
+Exit gate passed: a four-hour virtual goal test covers user preemption, provider
+failure, application interruption, bounded retry, and exactly-once effect
+receipts. Durable supervisor, scheduler, and memory snapshots are also closed
+and reopened through the SQLCipher store.
 
-## M7 — Competitive packs (planned)
+## M7 — Competitive packs (in progress)
 
 Official productivity, development, communications, smart-home, media,
-research, dictation, and creative packs plus plugin registry.
+research, dictation, creative, browser, and remote manifests; progressive
+skills; plugin policy; pairing; source-linked research; and pack registry are
+implemented. Packs install disabled and reveal connector scopes and keychain
+aliases before authorization.
 
-Exit gate: every adopted capability is core/pack and evaluated.
+Exit gate remaining: live connector implementations and account-backed
+evaluations must replace declaration-only connector coverage. This work needs
+service-specific OAuth registrations and test accounts; no manifest is counted
+as a live integration.
 
-## M8 — Migration (in progress)
+## M8 — Migration (passed)
 
-Read-only discovery and initial secret-aware dry-run types exist. Complete
-synthetic fixtures, mappings, confirmed import, reports, and compatibility CLI.
+Read-only metadata discovery, split/co-located roots, explicit confirmation,
+versioned mappings, legacy events and memory provenance, disabled extension and
+automation quarantine, remote re-pairing, SQLCipher materialization,
+content-free private reports, Settings review, and compatibility CLI are
+implemented.
 
-Exit gate: anonymized/synthetic profiles import idempotently without source
-changes.
+Exit gate passed: co-located synthetic and split anonymized profiles import
+idempotently without source changes or credential canary transfer. The suite
+also verifies symlink refusal, malformed-record isolation, private dual-format
+reports, and domain-table materialization.
 
-## M9 — Hardening and release (planned)
+## M9 — Hardening and release (in progress)
 
-Performance/security/fuzz/chaos/localization/docs/installers/signing/updater/
-rollback/export/uninstall and final reports.
+Deterministic performance/security/chaos checks, English/Hebrew localization,
+release documentation, unsigned installer workflows, signed update metadata
+verification, encrypted backup, failed-health rollback, private export,
+uninstall planning, CycloneDX SBOM, notices, and red-team reports are present.
 
 Exit gate: all product completion criteria pass. Signing credentials, store
 access, unavailable OS/hardware, and commercial accounts may block only their

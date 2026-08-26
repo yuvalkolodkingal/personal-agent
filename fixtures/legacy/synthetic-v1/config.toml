@@ -1,0 +1,13 @@
+[persona]
+name = "JARVIS"
+style = "Precise and calm."
+
+[history]
+enabled = true
+
+[trace]
+record_arguments = false
+
+[integrations]
+projects = ["/synthetic/projects/alpha"]
+provider_token = "fixture-provider-value-must-never-migrate"
