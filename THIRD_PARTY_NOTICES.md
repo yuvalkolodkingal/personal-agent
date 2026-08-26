@@ -156,6 +156,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `gdkx11-sys 0.18.2` — MIT — `pkg:cargo/gdkx11-sys@0.18.2`
 - `gdkx11 0.18.2` — MIT — `pkg:cargo/gdkx11@0.18.2`
 - `generic-array 0.14.7` — MIT — `pkg:cargo/generic-array@0.14.7`
+- `gethostname 1.1.0` — Apache-2.0 — `pkg:cargo/gethostname@1.1.0`
 - `getrandom 0.2.17` — MIT OR Apache-2.0 — `pkg:cargo/getrandom@0.2.17`
 - `getrandom 0.3.4` — MIT OR Apache-2.0 — `pkg:cargo/getrandom@0.3.4`
 - `getrandom 0.4.3` — MIT OR Apache-2.0 — `pkg:cargo/getrandom@0.4.3`
@@ -165,6 +166,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `glib-sys 0.18.1` — MIT — `pkg:cargo/glib-sys@0.18.1`
 - `glib 0.18.5` — MIT — `pkg:cargo/glib@0.18.5`
 - `glob 0.3.4` — MIT OR Apache-2.0 — `pkg:cargo/glob@0.3.4`
+- `global-hotkey 0.8.0` — Apache-2.0 OR MIT — `pkg:cargo/global-hotkey@0.8.0`
 - `gobject-sys 0.18.0` — MIT — `pkg:cargo/gobject-sys@0.18.0`
 - `gtk-sys 0.18.2` — MIT — `pkg:cargo/gtk-sys@0.18.2`
 - `gtk3-macros 0.18.2` — MIT — `pkg:cargo/gtk3-macros@0.18.2`
@@ -416,6 +418,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `tauri-codegen 2.6.3` — Apache-2.0 OR MIT — `pkg:cargo/tauri-codegen@2.6.3`
 - `tauri-macros 2.6.3` — Apache-2.0 OR MIT — `pkg:cargo/tauri-macros@2.6.3`
 - `tauri-plugin-autostart 2.5.1` — Apache-2.0 OR MIT — `pkg:cargo/tauri-plugin-autostart@2.5.1`
+- `tauri-plugin-global-shortcut 2.3.2` — Apache-2.0 OR MIT — `pkg:cargo/tauri-plugin-global-shortcut@2.3.2`
 - `tauri-plugin-single-instance 2.4.3` — Apache-2.0 OR MIT — `pkg:cargo/tauri-plugin-single-instance@2.4.3`
 - `tauri-plugin 2.6.3` — Apache-2.0 OR MIT — `pkg:cargo/tauri-plugin@2.6.3`
 - `tauri-runtime-wry 2.11.4` — Apache-2.0 OR MIT — `pkg:cargo/tauri-runtime-wry@2.11.4`
@@ -566,6 +569,9 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `wry 0.55.1` — Apache-2.0 OR MIT — `pkg:cargo/wry@0.55.1`
 - `x11-dl 2.21.0` — MIT — `pkg:cargo/x11-dl@2.21.0`
 - `x11 2.21.0` — MIT — `pkg:cargo/x11@2.21.0`
+- `x11rb-protocol 0.13.2` — MIT OR Apache-2.0 — `pkg:cargo/x11rb-protocol@0.13.2`
+- `x11rb 0.13.2` — MIT OR Apache-2.0 — `pkg:cargo/x11rb@0.13.2`
+- `xkeysym 0.2.1` — MIT OR Apache-2.0 OR Zlib — `pkg:cargo/xkeysym@0.2.1`
 - `yoke-derive 0.8.2` — Unicode-3.0 — `pkg:cargo/yoke-derive@0.8.2`
 - `yoke 0.8.3` — Unicode-3.0 — `pkg:cargo/yoke@0.8.3`
 - `zbus-secret-service-keyring-store 1.0.1` — MIT OR Apache-2.0 — `pkg:cargo/zbus-secret-service-keyring-store@1.0.1`

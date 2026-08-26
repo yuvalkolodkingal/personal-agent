@@ -1853,6 +1853,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "name": "gethostname",
+      "purl": "pkg:cargo/gethostname@1.1.0",
+      "type": "library",
+      "version": "1.1.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -1956,6 +1968,18 @@
       "purl": "pkg:cargo/glob@0.3.4",
       "type": "library",
       "version": "0.3.4"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "name": "global-hotkey",
+      "purl": "pkg:cargo/global-hotkey@0.8.0",
+      "type": "library",
+      "version": "0.8.0"
     },
     {
       "group": "crates.io",
@@ -4976,6 +5000,18 @@
           "expression": "Apache-2.0 OR MIT"
         }
       ],
+      "name": "tauri-plugin-global-shortcut",
+      "purl": "pkg:cargo/tauri-plugin-global-shortcut@2.3.2",
+      "type": "library",
+      "version": "2.3.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
       "name": "tauri-plugin-single-instance",
       "purl": "pkg:cargo/tauri-plugin-single-instance@2.4.3",
       "type": "library",
@@ -6773,6 +6809,42 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "x11rb-protocol",
+      "purl": "pkg:cargo/x11rb-protocol@0.13.2",
+      "type": "library",
+      "version": "0.13.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "x11rb",
+      "purl": "pkg:cargo/x11rb@0.13.2",
+      "type": "library",
+      "version": "0.13.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR Zlib"
+        }
+      ],
+      "name": "xkeysym",
+      "purl": "pkg:cargo/xkeysym@0.2.1",
+      "type": "library",
+      "version": "0.2.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "Unicode-3.0"
         }
       ],
@@ -7178,7 +7250,7 @@
       "version": "0.1.0"
     }
   },
-  "serialNumber": "urn:uuid:a4877367-ae98-5795-8698-f240cbbd4604",
+  "serialNumber": "urn:uuid:b448d270-d9c1-5f58-be4f-c9fe1903020c",
   "specVersion": "1.6",
   "version": 1
 }

@@ -21,6 +21,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
+tauri-plugin-global-shortcut.workspace = true
 tauri-plugin-single-instance.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -28,6 +29,9 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "=2.0.2"
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }

@@ -26,15 +26,26 @@ export function useVoiceCapture(
   const [state, setState] = useState<VoiceCaptureState>("idle");
   const [error, setError] = useState("");
   const [level, setLevel] = useState(0);
+  const stateRef = useRef<VoiceCaptureState>("idle");
+  const stopRequested = useRef(false);
   const stream = useRef<MediaStream | null>(null);
   const context = useRef<AudioContext | null>(null);
   const source = useRef<MediaStreamAudioSourceNode | null>(null);
   const processor = useRef<ScriptProcessorNode | null>(null);
   const chunks = useRef<Float32Array[]>([]);
 
+  const transition = useCallback((next: VoiceCaptureState) => {
+    stateRef.current = next;
+    setState(next);
+  }, []);
+
   const stop = useCallback(async () => {
+    if (stateRef.current === "requesting" && (!stream.current || !context.current)) {
+      stopRequested.current = true;
+      return;
+    }
     if (!stream.current || !context.current) return;
-    setState("transcribing");
+    transition("transcribing");
     processor.current?.disconnect();
     source.current?.disconnect();
     stream.current.getTracks().forEach((track) => track.stop());
@@ -53,22 +64,26 @@ export function useVoiceCapture(
     try {
       const projection = await invoke<Projection>("microphone_state", { active: false, mode: config.voice.mode });
       onProjection(projection);
+      if (merged.length < sampleRate / 10) throw new Error("No speech was captured. Hold the microphone button a little longer and try again.");
       const transcript = await invoke<{ text: string }>("voice_transcribe", {
         samples: downsample(merged, sampleRate), sampleRateHz: 16_000,
       });
+      if (!transcript.text.trim()) throw new Error("No speech was detected. Check the selected microphone and input level.");
       onTranscript(transcript.text);
-      setState("idle");
+      transition("idle");
     } catch (caught) {
       setError(String(caught));
-      setState("error");
+      transition("error");
     }
-  }, [config.voice.mode, onProjection, onTranscript]);
+  }, [config.voice.mode, onProjection, onTranscript, transition]);
 
   const start = useCallback(async () => {
-    if (state === "listening" || state === "requesting") return;
-    setState("requesting");
+    if (["listening", "requesting", "transcribing"].includes(stateRef.current)) return;
+    stopRequested.current = false;
+    transition("requesting");
     setError("");
     try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone capture is unavailable in this system webview.");
       const media = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: config.voice.input_device || undefined,
@@ -78,9 +93,17 @@ export function useVoiceCapture(
           channelCount: 1,
         },
       });
+      if (stopRequested.current) {
+        media.getTracks().forEach((track) => track.stop());
+        transition("idle");
+        return;
+      }
       const audioContext = new AudioContext();
+      await audioContext.resume();
       const input = audioContext.createMediaStreamSource(media);
       const node = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentOutput = audioContext.createGain();
+      silentOutput.gain.value = 0;
       chunks.current = [];
       node.onaudioprocess = (event) => {
         const data = new Float32Array(event.inputBuffer.getChannelData(0));
@@ -95,19 +118,31 @@ export function useVoiceCapture(
         setLevel(Math.min(1, Math.sqrt(sum / data.length) * 8));
       };
       input.connect(node);
-      node.connect(audioContext.destination);
+      node.connect(silentOutput);
+      silentOutput.connect(audioContext.destination);
       stream.current = media;
       context.current = audioContext;
       source.current = input;
       processor.current = node;
       const projection = await invoke<Projection>("microphone_state", { active: true, mode: config.voice.mode });
       onProjection(projection);
-      setState("listening");
+      transition("listening");
+      if (stopRequested.current) await stop();
     } catch (caught) {
+      processor.current?.disconnect();
+      source.current?.disconnect();
+      stream.current?.getTracks().forEach((track) => track.stop());
+      void context.current?.close();
+      stream.current = null;
+      context.current = null;
+      processor.current = null;
+      source.current = null;
+      setLevel(0);
+      void invoke<Projection>("microphone_state", { active: false, mode: config.voice.mode }).then(onProjection).catch(() => undefined);
       setError(String(caught));
-      setState("error");
+      transition("error");
     }
-  }, [config.voice, onProjection, state]);
+  }, [config.voice, onProjection, stop, transition]);
 
   useEffect(() => () => {
     processor.current?.disconnect();

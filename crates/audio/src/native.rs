@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
@@ -208,13 +208,38 @@ pub async fn transcribe_pcm(
         .map_err(|error| AudioError::Processing(error.to_string()))?;
     let stem = request_stem("stt");
     let wav = working_directory.join(format!("{stem}.wav"));
-    let output = working_directory.join(&stem);
     write_pcm16_wav(&wav, samples, sample_rate_hz)?;
+    let result = transcribe_wav(executable, model, working_directory, &wav, language).await;
+    let _ = fs::remove_file(&wav);
+    result
+}
+
+/// Transcribe an existing private WAV file using local `whisper.cpp`.
+///
+/// # Errors
+///
+/// Returns an error when the engine, model, or input is missing, the process
+/// fails, or no usable speech is recognized.
+pub async fn transcribe_wav(
+    executable: &Path,
+    model: &Path,
+    working_directory: &Path,
+    wav: &Path,
+    language: &str,
+) -> Result<Transcript, AudioError> {
+    if !executable.is_file() || !model.is_file() || !wav.is_file() {
+        return Err(AudioError::Unavailable(
+            "offline Whisper executable, model, or WAV input is missing".into(),
+        ));
+    }
+    fs::create_dir_all(working_directory)
+        .map_err(|error| AudioError::Processing(error.to_string()))?;
+    let output = working_directory.join(request_stem("stt-output"));
     let result = Command::new(executable)
         .args(["-m"])
         .arg(model)
         .args(["-f"])
-        .arg(&wav)
+        .arg(wav)
         .args(["-l", language, "-otxt", "-of"])
         .arg(&output)
         .args(["-nt", "-np"])
@@ -229,7 +254,6 @@ pub async fn transcribe_pcm(
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&result.stdout).into_owned();
     }
-    let _ = fs::remove_file(&wav);
     let _ = fs::remove_file(&text_path);
     if !result.status.success() {
         let detail = String::from_utf8_lossy(&result.stderr)
@@ -292,6 +316,7 @@ pub async fn synthesize_piper(
     if let Some(config) = config.filter(|path| path.is_file()) {
         command.arg("--config").arg(config);
     }
+    command.kill_on_drop(true);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -303,16 +328,20 @@ pub async fn synthesize_piper(
         .take()
         .ok_or_else(|| AudioError::Processing("Piper stdin is unavailable".into()))?;
     stdin
-        .write_all(text.as_bytes())
+        .write_all(format!("{}\n", text.trim()).as_bytes())
         .await
         .map_err(|error| AudioError::Processing(error.to_string()))?;
     stdin
         .shutdown()
         .await
         .map_err(|error| AudioError::Processing(error.to_string()))?;
-    let output = child
-        .wait_with_output()
+    // Async pipe shutdown flushes bytes but does not necessarily close the
+    // descriptor. Piper reads until EOF, so explicitly drop our writer before
+    // waiting or synthesis remains stuck forever.
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
         .await
+        .map_err(|_| AudioError::Processing("Piper synthesis timed out".into()))?
         .map_err(|error| AudioError::Processing(error.to_string()))?;
     if !output.status.success() || !wav.is_file() {
         let detail = String::from_utf8_lossy(&output.stderr)
@@ -386,4 +415,103 @@ pub fn play_wav(
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| AudioError::Processing(error.to_string()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn piper_input_reaches_eof_before_waiting_for_output() {
+        let directory = std::env::temp_dir().join(request_stem("piper-eof-test"));
+        fs::create_dir_all(&directory).expect("fixture directory");
+        let executable = directory.join("piper-fixture");
+        let model = directory.join("voice.onnx");
+        fs::write(&model, b"fixture").expect("fixture model");
+        fs::write(
+            &executable,
+            br#"#!/bin/sh
+output=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output_file' ]; then output="$2"; shift 2; else shift; fi
+done
+payload=$(dd bs=1 2>/dev/null)
+[ "$payload" = 'Hello from test' ] || exit 9
+printf RIFF > "$output"
+"#,
+        )
+        .expect("fixture executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("fixture permissions");
+
+        let wav = tokio::time::timeout(
+            Duration::from_secs(5),
+            synthesize_piper(
+                &executable,
+                &model,
+                None,
+                &directory,
+                "Hello from test",
+                100,
+            ),
+        )
+        .await
+        .expect("Piper fixture must receive EOF")
+        .expect("Piper fixture synthesis");
+        assert_eq!(fs::read(wav).expect("fixture WAV"), b"RIFF");
+        fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Whisper and Piper assets"]
+    async fn installed_voice_assets_round_trip_speech() {
+        let root = PathBuf::from(
+            std::env::var("PERSONAL_AGENT_VOICE_SMOKE_ROOT")
+                .expect("set PERSONAL_AGENT_VOICE_SMOKE_ROOT"),
+        );
+        let status = discover_native_voice(&root, "", "", "", "");
+        let working = root.join("runtime-smoke");
+        let wav = synthesize_piper(
+            status
+                .piper_executable
+                .as_deref()
+                .expect("Piper executable"),
+            status.piper_model.as_deref().expect("Piper model"),
+            status
+                .piper_model
+                .as_ref()
+                .map(|model| model.with_extension("onnx.json"))
+                .as_deref(),
+            &working,
+            "Personal Agent voice test",
+            100,
+        )
+        .await
+        .expect("Piper synthesis");
+        let transcript = transcribe_wav(
+            status
+                .whisper_executable
+                .as_deref()
+                .expect("Whisper executable"),
+            status.whisper_model.as_deref().expect("Whisper model"),
+            &working,
+            &wav,
+            "en",
+        )
+        .await
+        .expect("Whisper transcription");
+        assert!(
+            transcript
+                .text
+                .to_ascii_lowercase()
+                .contains("personal agent"),
+            "unexpected transcript: {}",
+            transcript.text
+        );
+        fs::remove_dir_all(working).expect("remove smoke output");
+    }
 }

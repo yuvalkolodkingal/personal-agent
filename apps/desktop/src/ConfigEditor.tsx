@@ -149,16 +149,19 @@ type Props = {
   config: AppConfig; catalog: RuntimeCatalog; voice: VoiceStatus; autostart: boolean | null;
   onAutostart: () => void; onConfig: (config: AppConfig) => void; onVoice: (voice: VoiceStatus) => void;
   onCatalog: (catalog: RuntimeCatalog) => void;
+  initialSection?: string;
 };
 
-export function ConfigEditor({ config, catalog, voice, autostart, onAutostart, onConfig, onVoice, onCatalog }: Props) {
+export function ConfigEditor({ config, catalog, voice, autostart, onAutostart, onConfig, onVoice, onCatalog, initialSection = "voice" }: Props) {
   const [draft, setDraft] = useState<AppConfig>(() => structuredClone(config));
   const [section, setSection] = useState("voice");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [testingVoice, setTestingVoice] = useState(false);
   const [preview, setPreview] = useState("Systems ready. How can I help?");
   useEffect(() => setDraft(structuredClone(config)), [config]);
+  useEffect(() => setSection(initialSection), [initialSection]);
 
   const update = (path: string[], value: unknown) => {
     if (section === "opencode" && path.length === 0) { setDraft((current) => ({ ...current, opencode: value as Record<string, unknown> })); return; }
@@ -174,6 +177,14 @@ export function ConfigEditor({ config, catalog, voice, autostart, onAutostart, o
     try { const status = await invoke<VoiceStatus>("voice_install", { component: "all" }); onVoice(status); setMessage("Offline Whisper speech recognition and Piper voice are ready."); }
     catch (caught) { setMessage(String(caught)); } finally { setInstalling(false); }
   };
+  const testVoice = async () => {
+    setTestingVoice(true); setMessage("Running a private Piper → Whisper round-trip…");
+    try {
+      const result = await invoke<{ transcript: string; synthesis_ms: number; recognition_ms: number }>("voice_self_test");
+      setMessage(`Voice pipeline passed in ${result.synthesis_ms + result.recognition_ms} ms. Heard: “${result.transcript}”`);
+    } catch (caught) { setMessage(String(caught)); }
+    finally { setTestingVoice(false); }
+  };
   const setDefaultModel = (model: RuntimeCapability) => {
     setDraft((current) => ({ ...current, runtime: { ...current.runtime, default_provider: model.provider_id, default_model: model.model_id } }));
     setMessage(`${model.provider_id}/${model.model_id} selected. Save changes to make it the default.`);
@@ -187,9 +198,9 @@ export function ConfigEditor({ config, catalog, voice, autostart, onAutostart, o
     </aside>
     <section className="settings-content"><header><div><span className="eyebrow">PERSONALIZE YOUR AGENT</span><h2>{title(section)}</h2><p>{section === "providers" ? "Connect accounts and choose which intelligence powers your agent." : section === "voice" ? "Shape how your agent listens, speaks, and responds." : "Changes remain local until you save them."}</p></div><button aria-label="Save all changes" className="primary save-settings" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save changes"}</button></header>
       {section === "providers" && <ProviderConnections catalog={catalog} directory={draft.runtime.working_directory} onCatalog={onCatalog} onMessage={setMessage} onDefaultModel={setDefaultModel} />}
-      {allConfigSections.includes(section as typeof allConfigSections[number]) && <>{section === "voice" && <div className="voice-studio"><div className="voice-preview-orb"><i /><b>J</b></div><div><span className="eyebrow">VOICE PREVIEW</span><h3>{draft.voice.tts_voice}</h3><p>{voice.stt_ready && voice.tts_ready ? "Local speech recognition and synthesis are ready." : "Install the native voice bundle to use private offline speech."}</p><div><input aria-label="Voice preview text" value={preview} onChange={(event) => setPreview(event.target.value)} /><button className="primary" disabled={!voice.tts_ready || !preview.trim()} onClick={() => void invoke("voice_speak", { text: preview }).catch((caught) => setMessage(String(caught)))}>▶ Preview voice</button><button onClick={() => void invoke("voice_stop")}>Stop</button></div></div><div className="voice-readiness"><span className={voice.stt_ready ? "ready" : ""}>STT <b>{voice.stt_ready ? "READY" : "MISSING"}</b></span><span className={voice.tts_ready ? "ready" : ""}>TTS <b>{voice.tts_ready ? "READY" : "MISSING"}</b></span></div></div>}<SectionFields section={section} value={(draft as unknown as JsonObject)[section] as JsonObject} update={update} /></>}
+      {allConfigSections.includes(section as typeof allConfigSections[number]) && <>{section === "voice" && <div className="voice-studio"><div className="voice-preview-orb"><i /><b>J</b></div><div><span className="eyebrow">VOICE PREVIEW</span><h3>{draft.voice.tts_voice}</h3><p>{voice.stt_ready && voice.tts_ready ? "Local speech recognition and synthesis are ready." : "Install the native voice bundle to use private offline speech."}</p><div><input aria-label="Voice preview text" value={preview} onChange={(event) => setPreview(event.target.value)} /><button className="primary" disabled={!voice.tts_ready || !preview.trim()} onClick={() => void invoke("voice_speak", { text: preview }).catch((caught) => setMessage(String(caught)))}>▶ Preview voice</button><button onClick={() => void invoke("voice_stop")}>Stop</button><button disabled={testingVoice || !voice.stt_ready || !voice.tts_ready} onClick={() => void testVoice()}>{testingVoice ? "Testing…" : "Test STT + TTS"}</button></div></div><div className="voice-readiness"><span className={voice.stt_ready ? "ready" : ""}>STT <b>{voice.stt_ready ? "READY" : "MISSING"}</b></span><span className={voice.tts_ready ? "ready" : ""}>TTS <b>{voice.tts_ready ? "READY" : "MISSING"}</b></span></div></div>}<SectionFields section={section} value={(draft as unknown as JsonObject)[section] as JsonObject} update={update} /></>}
       {section === "advanced" && <div className="settings-grid"><JsonField name="complete application configuration" value={draft} onChange={(next) => setDraft(next as AppConfig)} /></div>}
-      {section === "system" && <div className="settings-grid"><label className="setting-row setting-toggle"><span><strong>Start at login</strong><small>Launch quietly for instant voice access</small></span><input aria-label="Toggle start at login" type="checkbox" disabled={autostart === null} checked={autostart ?? false} onChange={onAutostart} /></label><div className="setting-row"><span><strong>Native voice bundle</strong><small>{voice.details.join(" ")}</small></span><button className="primary" disabled={installing || (voice.stt_ready && voice.tts_ready)} onClick={installVoice}>{installing ? "Installing…" : voice.stt_ready && voice.tts_ready ? "Installed" : "Install STT + TTS"}</button></div></div>}
+      {section === "system" && <div className="settings-grid"><label className="setting-row setting-toggle"><span><strong>Start at login</strong><small>Launch quietly for instant voice access</small></span><input aria-label="Toggle start at login" type="checkbox" disabled={autostart === null} checked={autostart ?? false} onChange={onAutostart} /></label><div className="setting-row"><span><strong>Global summon shortcut</strong><small>Show and focus JARVIS from anywhere</small></span><kbd>Super + J</kbd></div><div className="setting-row"><span><strong>Native voice bundle</strong><small>{voice.details.join(" ")}</small></span><button className="primary" disabled={installing || (voice.stt_ready && voice.tts_ready)} onClick={installVoice}>{installing ? "Installing…" : voice.stt_ready && voice.tts_ready ? "Installed" : "Install STT + TTS"}</button></div></div>}
       {message && <p className="settings-message" role="status">{message}<button aria-label="Dismiss message" onClick={() => setMessage("")}>×</button></p>}
     </section>
   </div>;

@@ -2,6 +2,7 @@ use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
     NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper, transcribe_pcm,
+    transcribe_wav,
 };
 use personal_agent_core::{CONFIG_SCHEMA, PersonalAgentConfig, parse_config};
 use personal_agent_platform::{OsSecretStore, SecretReference, SecretStore};
@@ -204,71 +205,87 @@ pub(crate) async fn chat_send(
         .map_err(|error| error.to_string())?;
     let config = config_snapshot(&state)?;
     let directory = canonical_directory(&config, directory.as_deref())?;
+    let requested_model = model.filter(|value| !value.trim().is_empty()).or_else(|| {
+        (!config.runtime.default_model.trim().is_empty()).then(|| {
+            if config.runtime.default_model.contains('/') {
+                config.runtime.default_model.clone()
+            } else {
+                format!(
+                    "{}/{}",
+                    config.runtime.default_provider, config.runtime.default_model
+                )
+            }
+        })
+    });
+    let requested_agent = agent.filter(|value| !value.trim().is_empty()).or_else(|| {
+        (!config.runtime.default_agent.trim().is_empty())
+            .then(|| config.runtime.default_agent.clone())
+    });
+    let requested_effort = effort.filter(|value| !value.trim().is_empty());
     let existing = state.active_session.lock().await.clone();
     let mut runtime = state.runtime.lock().await;
     let session_id = if let Some(active) = existing.filter(|active| active.directory == directory) {
         active.id
     } else {
-        let selected_model = model.filter(|value| !value.trim().is_empty()).or_else(|| {
-            (!config.runtime.default_model.is_empty()).then(|| {
-                if config.runtime.default_model.contains('/') {
-                    config.runtime.default_model.clone()
-                } else {
-                    format!(
-                        "{}/{}",
-                        config.runtime.default_provider, config.runtime.default_model
-                    )
-                }
-            })
-        });
         runtime
             .begin_session(SessionOptions {
-                model: selected_model,
-                effort: effort.filter(|value| !value.trim().is_empty()),
-                agent: agent
-                    .filter(|value| !value.trim().is_empty())
-                    .or_else(|| Some(config.runtime.default_agent.clone())),
+                model: requested_model.clone(),
+                effort: requested_effort.clone(),
+                agent: requested_agent.clone(),
                 working_directory: directory.clone(),
                 environment: BTreeMap::default(),
             })
             .await
             .map_err(|error| error.to_string())?
     };
-    let receiver = runtime
-        .submit_with_attachments(&session_id, &text, attachments.unwrap_or_default())
+    let submission = runtime
+        .submit_with_attachments(
+            &session_id,
+            &text,
+            attachments.unwrap_or_default(),
+            requested_model.as_deref(),
+            requested_agent.as_deref(),
+            requested_effort.as_deref(),
+        )
         .await
         .map_err(|error| error.to_string())?;
+    let runtime_api = runtime.api_client().map_err(|error| error.to_string())?;
+    state
+        .turn_clients
+        .write()
+        .map_err(|_| "turn client lock is poisoned".to_owned())?
+        .insert(session_id.clone(), runtime_api.clone());
     drop(runtime);
     *state.active_session.lock().await = Some(ActiveSession {
         id: session_id.clone(),
         directory: directory.clone(),
     });
 
+    let prompt_message_id = submission.message_id;
     let session_for_task = session_id.clone();
+    let prompt_message_for_task = prompt_message_id.clone();
     let directory_for_task = directory.display().to_string();
-    let mut receiver = receiver;
+    let mut receiver = submission.events;
     tauri::async_runtime::spawn(async move {
         let mut response = String::new();
         let started = Instant::now();
         let mut outcome = "completed";
         let mut failure: Option<String> = None;
+        let mut status_poll = tokio::time::interval(Duration::from_secs(5));
+        status_poll.tick().await;
         loop {
-            let next = tokio::time::timeout(Duration::from_secs(60), receiver.recv()).await;
-            let event = match next {
-                Ok(Some(event)) => event,
-                Ok(None) => {
-                    outcome = "failed";
-                    failure = Some(
-                        "The OpenCode event stream ended before the turn completed.".to_owned(),
-                    );
-                    break;
-                }
-                Err(_) => {
-                    let state = app.state::<DesktopState>();
-                    let status = state
-                        .runtime
-                        .lock()
-                        .await
+            let event = tokio::select! {
+                event = receiver.recv() => if let Some(event) = event {
+                    event
+                } else {
+                        outcome = "failed";
+                        failure = Some(
+                            "The OpenCode event stream ended before the turn completed.".to_owned(),
+                        );
+                        break;
+                },
+                _ = status_poll.tick() => {
+                    let status = runtime_api
                         .request_json(
                             reqwest::Method::GET,
                             "/session/status",
@@ -276,16 +293,14 @@ pub(crate) async fn chat_send(
                             None,
                         )
                         .await;
-                    let session_status = status
+                    if status
                         .as_ref()
-                        .ok()
-                        .and_then(|value| value.get(&session_for_task))
-                        .and_then(|value| value.get("type"))
-                        .and_then(Value::as_str);
-                    if session_status == Some("idle") {
+                        .is_ok_and(|value| session_is_terminal(value, &session_for_task))
+                    {
                         break;
                     }
                     if started.elapsed() >= Duration::from_mins(30) {
+                        let state = app.state::<DesktopState>();
                         let _ = state
                             .runtime
                             .lock()
@@ -352,6 +367,22 @@ pub(crate) async fn chat_send(
                 break;
             }
         }
+        if outcome == "completed" {
+            let route = format!("/session/{session_for_task}/message");
+            if let Ok(messages) = runtime_api
+                .request_json(
+                    reqwest::Method::GET,
+                    &route,
+                    &[("directory", directory_for_task)],
+                    None,
+                )
+                .await
+                && let Some(final_text) =
+                    assistant_text_for_parent(&messages, &prompt_message_for_task)
+            {
+                response = final_text;
+            }
+        }
         let _ = app.emit(
             "runtime-turn-complete",
             json!({
@@ -366,9 +397,90 @@ pub(crate) async fn chat_send(
     });
     Ok(json!({
         "session_id": session_id,
+        "message_id": prompt_message_id,
         "directory": directory,
         "projection": projection,
     }))
+}
+
+fn session_is_terminal(statuses: &Value, session_id: &str) -> bool {
+    statuses
+        .get(session_id)
+        .is_none_or(|status| status.get("type").and_then(Value::as_str) == Some("idle"))
+}
+
+fn assistant_text_for_parent(messages: &Value, prompt_message_id: &str) -> Option<String> {
+    messages.as_array()?.iter().rev().find_map(|message| {
+        if message.pointer("/info/role").and_then(Value::as_str) != Some("assistant")
+            || message.pointer("/info/parentID").and_then(Value::as_str) != Some(prompt_message_id)
+        {
+            return None;
+        }
+        let text = message
+            .get("parts")?
+            .as_array()?
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        (!text.trim().is_empty()).then_some(text)
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn chat_turn_status(
+    session_id: String,
+    prompt_message_id: String,
+    directory: Option<String>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    if !valid_session_id(&session_id)
+        || !prompt_message_id.starts_with("msg_")
+        || prompt_message_id.len() > 128
+        || !prompt_message_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("turn identifier is invalid".to_owned());
+    }
+    let config = config_snapshot(&state)?;
+    let directory = canonical_directory(&config, directory.as_deref())?;
+    let runtime_api = state
+        .turn_clients
+        .read()
+        .map_err(|_| "turn client lock is poisoned".to_owned())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "turn recovery client is unavailable".to_owned())?;
+    let route = format!("/session/{session_id}/message");
+    let messages = runtime_api
+        .request_json(
+            reqwest::Method::GET,
+            &route,
+            &[("directory", directory.display().to_string())],
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let assistant = messages.as_array().and_then(|items| {
+        items.iter().rev().find(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/parentID").and_then(Value::as_str)
+                    == Some(prompt_message_id.as_str())
+        })
+    });
+    let completed = assistant.is_some_and(|message| {
+        message.pointer("/info/time/completed").is_some()
+            || message.pointer("/info/finish").is_some()
+    });
+    let text = assistant_text_for_parent(&messages, &prompt_message_id).unwrap_or_default();
+    let error = assistant.and_then(|message| {
+        message
+            .pointer("/info/error/data/message")
+            .or_else(|| message.pointer("/info/error/message"))
+            .and_then(Value::as_str)
+    });
+    Ok(json!({"completed": completed, "text": text, "error": error}))
 }
 
 fn valid_session_id(value: &str) -> bool {
@@ -1158,6 +1270,54 @@ pub(crate) async fn voice_speak(
     Ok(json!({"spoken": true}))
 }
 
+#[tauri::command]
+pub(crate) async fn voice_self_test(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let config = config_snapshot(&state)?;
+    let status = voice_status_for(&state, &config);
+    let whisper = status
+        .whisper_executable
+        .ok_or_else(|| status.details.join(" "))?;
+    let whisper_model = status
+        .whisper_model
+        .ok_or_else(|| status.details.join(" "))?;
+    let piper = status
+        .piper_executable
+        .ok_or_else(|| status.details.join(" "))?;
+    let piper_model = status.piper_model.ok_or_else(|| status.details.join(" "))?;
+    let working = state.app_data.join("voice/runtime");
+    let started = Instant::now();
+    let wav = synthesize_piper(
+        &piper,
+        &piper_model,
+        Some(&piper_model.with_extension("onnx.json")),
+        &working,
+        "Personal Agent voice test",
+        config.voice.speech_rate_percent,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let synthesis_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let recognition_started = Instant::now();
+    let result = transcribe_wav(
+        &whisper,
+        &whisper_model,
+        &working,
+        &wav,
+        &config.voice.language,
+    )
+    .await;
+    let _ = std::fs::remove_file(&wav);
+    let transcript = result.map_err(|error| error.to_string())?;
+    Ok(json!({
+        "ok": true,
+        "transcript": transcript.text,
+        "synthesis_ms": synthesis_ms,
+        "recognition_ms": u64::try_from(recognition_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }))
+}
+
 async fn voice_stop_inner(state: &DesktopState) {
     if let Some(mut playback) = state.voice_playback.lock().await.take() {
         let _ = playback.child.kill().await;
@@ -1388,4 +1548,39 @@ pub(crate) async fn voice_install(
     app.emit("voice-install-complete", &status)
         .map_err(|error| error.to_string())?;
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_or_idle_session_status_is_terminal() {
+        assert!(session_is_terminal(&json!({}), "ses_test"));
+        assert!(session_is_terminal(
+            &json!({"ses_test": {"type": "idle"}}),
+            "ses_test"
+        ));
+        assert!(!session_is_terminal(
+            &json!({"ses_test": {"type": "busy"}}),
+            "ses_test"
+        ));
+    }
+
+    #[test]
+    fn assistant_text_for_parent_joins_only_matching_text_parts() {
+        let messages = json!([
+            {"info": {"id": "msg_user", "role": "user"}, "parts": [{"type": "text", "text": "hi"}]},
+            {"info": {"role": "assistant", "parentID": "msg_user"}, "parts": [
+                {"type": "step-start"},
+                {"type": "text", "text": "Hello"},
+                {"type": "text", "text": " there."}
+            ]}
+        ]);
+        assert_eq!(
+            assistant_text_for_parent(&messages, "msg_user").as_deref(),
+            Some("Hello there.")
+        );
+        assert_eq!(assistant_text_for_parent(&messages, "msg_other"), None);
+    }
 }

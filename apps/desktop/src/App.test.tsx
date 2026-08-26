@@ -15,7 +15,7 @@ const baseInvoke = (command: string) => {
   if (command === "bootstrap") return Promise.reject(new Error("fixture uses safe UI defaults"));
   if (command === "diagnostics") return Promise.resolve({ product: "Personal Agent", version: "0.1.0", platform: "test", arch: "test", opencode: { pinned: "1.18.23", topology: "authenticated-loopback-sidecar" }, capabilities: [] });
   if (command === "autostart_status") return Promise.resolve(false);
-  if (command === "chat_send") return Promise.resolve({ session_id: "ses_test", projection });
+  if (command === "chat_send") return Promise.resolve({ session_id: "ses_test", message_id: "msg_test", projection });
   return Promise.resolve({});
 };
 
@@ -24,7 +24,7 @@ describe("desktop workspace", () => {
     listeners.clear(); invoke.mockReset(); invoke.mockImplementation(baseInvoke); listen.mockReset();
     listen.mockImplementation((name: string, callback: (event: { payload: unknown }) => void) => { listeners.set(name, callback); return Promise.resolve(() => listeners.delete(name)); });
   });
-  afterEach(cleanup);
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
   it("shows explicit private microphone state and disables capture until native STT is ready", () => {
     render(<App />);
@@ -43,6 +43,8 @@ describe("desktop workspace", () => {
     }
     fireEvent.click(settingsNavigation.getByRole("button", { name: "Opencode" }));
     expect(screen.getByText(/Full OpenCode-compatible JSON/)).toBeInTheDocument();
+    fireEvent.click(settingsNavigation.getByRole("button", { name: "System" }));
+    expect(screen.getByText("Super + J")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save all changes" })).toBeEnabled();
   });
 
@@ -54,6 +56,34 @@ describe("desktop workspace", () => {
     }
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(screen.getByRole("dialog", { name: "COMMAND PALETTE" })).toBeInTheDocument();
+  });
+
+  it("selects multiple sessions and deletes them with one confirmation", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap") return Promise.resolve({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: { stt_ready: false, tts_ready: false, playback_ready: false, details: [] },
+        catalog: { sessions: { available: true, data: [
+          { id: "ses_first", title: "First session" },
+          { id: "ses_second", title: "Second session" },
+        ] } },
+      });
+      return baseInvoke(command);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select session ses_first" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select session ses_second" }));
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("session_action", expect.objectContaining({ action: "delete", sessionId: "ses_first", confirmed: true }));
+      expect(invoke).toHaveBeenCalledWith("session_action", expect.objectContaining({ action: "delete", sessionId: "ses_second", confirmed: true }));
+    });
+    expect(window.confirm).toHaveBeenCalledWith("Delete 2 selected sessions permanently?");
   });
 
   it("renders unknown additive runtime events by exact type and origin", async () => {
@@ -74,6 +104,30 @@ describe("desktop workspace", () => {
     expect(screen.getByText("Inspect this project")).toBeInTheDocument();
   });
 
+  it("sends the selected provider model on every chat request", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap") return Promise.resolve({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: { stt_ready: false, tts_ready: false, playback_ready: false, details: [] },
+        catalog: {
+          models: { available: true, data: [{ provider_id: "openai", model_id: "gpt-5", local: false, reasoning: true, tool_calls: true, input_modalities: ["text"], output_modalities: ["text"] }] },
+        },
+      });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    const selector = await screen.findByRole("combobox", { name: "Model" });
+    fireEvent.change(selector, { target: { value: "openai/gpt-5" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), { target: { value: "Use this model" } });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("chat_send", expect.objectContaining({
+      text: "Use this model",
+      model: "openai/gpt-5",
+    })));
+  });
+
   it("always resolves a failed native turn instead of remaining in thinking", async () => {
     render(<App />);
     await waitFor(() => expect(listeners.has("runtime-turn-complete")).toBe(true));
@@ -84,6 +138,42 @@ describe("desktop workspace", () => {
     expect((await screen.findAllByText("Provider sign-in is required.")).length).toBeGreaterThan(0);
     expect(screen.getByText("Stopped / failed")).toBeInTheDocument();
     expect(screen.queryByText("Connecting to model")).not.toBeInTheDocument();
+  });
+
+  it("recovers a completed reply when the native completion event is missed", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "chat_turn_status") return Promise.resolve({ completed: true, text: "Recovered answer.", error: null });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), { target: { value: "Recover this turn" } });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    expect(await screen.findByText("Recovered answer.")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("chat_turn_status", expect.objectContaining({
+      sessionId: "ses_test",
+      promptMessageId: "msg_test",
+    }));
+    expect(screen.queryByText("Connecting to model")).not.toBeInTheDocument();
+  });
+
+  it("runs the private STT and TTS round-trip from Voice settings", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap") return Promise.resolve({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: { stt_ready: true, tts_ready: true, playback_ready: true, details: [] },
+        catalog: {},
+      });
+      if (command === "voice_self_test") return Promise.resolve({ transcript: "Personal Agent voice test", synthesis_ms: 120, recognition_ms: 380 });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start voice capture" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test STT + TTS" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("voice_self_test"));
+    expect(await screen.findByText(/Voice pipeline passed in 500 ms/)).toBeInTheDocument();
   });
 
   it("starts the provider-advertised OpenCode OAuth flow inside settings", async () => {
@@ -104,8 +194,8 @@ describe("desktop workspace", () => {
     });
     render(<App />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Start voice capture" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("button", { name: "Providers & models" }));
+    fireEvent.click(screen.getByRole("button", { name: /Connect provider/ }));
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeInTheDocument();
     expect(await screen.findByText("ChatGPT Plus / Pro")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Continue with browser" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("provider_oauth_authorize", {

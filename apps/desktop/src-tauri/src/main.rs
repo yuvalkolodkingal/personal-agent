@@ -7,7 +7,10 @@ use personal_agent_core::{
 };
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
-use personal_agent_runtime::{AgentRuntime, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth};
+use personal_agent_runtime::{
+    AgentRuntime, OpenCodeApiClient, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth,
+};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
@@ -16,11 +19,13 @@ use tauri::path::BaseDirectory;
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tracing_subscriber::util::SubscriberInitExt;
 
 struct DesktopState {
     profile: Mutex<ProfileState>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
+    turn_clients: RwLock<BTreeMap<String, OpenCodeApiClient>>,
     config: RwLock<PersonalAgentConfig>,
     config_path: PathBuf,
     sidecar_executable: PathBuf,
@@ -346,8 +351,40 @@ fn clean_shutdown(app: &tauri::AppHandle) {
     tracing::info!("desktop host stopped");
 }
 
+#[cfg(target_os = "linux")]
+fn install_media_permission_handler(app: &tauri::App) -> tauri::Result<()> {
+    use webkit2gtk::{
+        PermissionRequestExt, UserMediaPermissionRequest, UserMediaPermissionRequestExt,
+        WebViewExt, glib::prelude::Cast,
+    };
+
+    if let Some(window) = app.get_webview_window("main") {
+        window.with_webview(|platform| {
+            platform.inner().connect_permission_request(|_, request| {
+                if let Some(media) = request.downcast_ref::<UserMediaPermissionRequest>() {
+                    if media.is_for_audio_device() && !media.is_for_video_device() {
+                        request.allow();
+                    } else {
+                        request.deny();
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_media_permission_handler(_: &tauri::App) -> tauri::Result<()> {
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // Tauri setup keeps lifecycle ordering explicit in one entrypoint.
 fn main() {
+    let summon_shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyJ);
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, arguments, _working_directory| {
             tracing::info!(argument_count = arguments.len(), "secondary launch redirected");
@@ -357,6 +394,15 @@ fn main() {
             tauri_plugin_autostart::Builder::new()
                 .app_name("Personal Agent")
                 .arg("--autostart")
+                .build(),
+        )
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if shortcut == &summon_shortcut && event.state() == ShortcutState::Pressed {
+                        show_main_window(app);
+                    }
+                })
                 .build(),
         )
         .on_window_event(|window, event| {
@@ -402,6 +448,7 @@ fn main() {
             app.manage(DesktopState {
                 profile: Mutex::new(profile),
                 runtime: tokio::sync::Mutex::new(sidecar),
+                turn_clients: RwLock::new(BTreeMap::new()),
                 config: RwLock::new(config.config),
                 config_path,
                 sidecar_executable,
@@ -413,6 +460,13 @@ fn main() {
                 app_data,
                 _log_guard: log_guard,
             });
+            install_media_permission_handler(app)?;
+            if let Err(error) = app
+                .global_shortcut()
+                .register(Shortcut::new(Some(Modifiers::SUPER), Code::KeyJ))
+            {
+                tracing::warn!(%error, "Super+J global shortcut could not be registered");
+            }
             install_tray(app)?;
 
             let handle = app.handle().clone();
@@ -441,6 +495,7 @@ fn main() {
             api::save_config,
             api::runtime_catalog,
             api::chat_send,
+            api::chat_turn_status,
             api::session_action,
             api::runtime_resource,
             api::runtime_operation,
@@ -454,6 +509,7 @@ fn main() {
             api::microphone_state,
             api::voice_transcribe,
             api::voice_speak,
+            api::voice_self_test,
             api::voice_stop,
             api::voice_install,
             migration_dry_run,

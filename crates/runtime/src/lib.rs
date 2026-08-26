@@ -8,7 +8,7 @@ use personal_agent_policy::{DataZone, Effect, Idempotency, Risk, ToolDescriptor}
 use personal_agent_tools::{ToolCall, ToolError, ToolGateway, ToolImplementation};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -493,6 +493,72 @@ pub struct OpenCodeSidecar {
     tool_bridge: Option<NativeToolBridge>,
 }
 
+/// Cloneable, authenticated handle for read-only sidecar requests.
+///
+/// Keeping this handle separate lets long-lived turn observers reconcile
+/// session state without waiting for the mutable runtime lifecycle lock.
+#[derive(Clone)]
+pub struct OpenCodeApiClient {
+    endpoint: Url,
+    client: reqwest::Client,
+}
+
+/// A submitted prompt and its private event receiver.
+pub struct PromptSubmission {
+    /// Stable user message identifier used to correlate the final assistant reply.
+    pub message_id: String,
+    /// Sanitized native runtime events for progressive UI updates.
+    pub events: mpsc::Receiver<EventEnvelope>,
+}
+
+impl OpenCodeApiClient {
+    /// Call one reviewed `OpenCode` operation without exposing credentials to
+    /// the renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the route is invalid, the request fails, or the
+    /// response is not JSON.
+    pub async fn request_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        if !path.starts_with('/') || path.contains("..") || path.contains(['?', '#']) {
+            return Err(RuntimeError::Rejected(
+                "runtime API path is not canonical".into(),
+            ));
+        }
+        let url = self
+            .endpoint
+            .join(path.trim_start_matches('/'))
+            .map_err(|_| RuntimeError::Rejected("runtime API URL is invalid".into()))?;
+        let mut request = self.client.request(method, url).query(query);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(2_000)
+                .collect::<String>();
+            return Err(RuntimeError::Rejected(format!(
+                "OpenCode API returned HTTP {status}: {detail}"
+            )));
+        }
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| RuntimeError::Rejected("OpenCode API returned invalid JSON".into()))
+    }
+}
+
 impl OpenCodeSidecar {
     #[must_use]
     pub fn new(config: OpenCodeConfig) -> Self {
@@ -595,6 +661,20 @@ impl OpenCodeSidecar {
             .map_err(Into::into)
     }
 
+    /// Create a cloneable authenticated API handle that is independent of the
+    /// sidecar lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sidecar is not running or its HTTP client
+    /// cannot be created.
+    pub fn api_client(&self) -> Result<OpenCodeApiClient, RuntimeError> {
+        Ok(OpenCodeApiClient {
+            endpoint: self.endpoint.clone().ok_or(RuntimeError::NotRunning)?,
+            client: self.raw_client()?,
+        })
+    }
+
     /// Call one reviewed `OpenCode` operation without disclosing the loopback
     /// endpoint or per-run credential to the renderer.
     ///
@@ -609,36 +689,9 @@ impl OpenCodeSidecar {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, RuntimeError> {
-        if !path.starts_with('/') || path.contains("..") || path.contains(['?', '#']) {
-            return Err(RuntimeError::Rejected(
-                "runtime API path is not canonical".into(),
-            ));
-        }
-        let endpoint = self.endpoint.as_ref().ok_or(RuntimeError::NotRunning)?;
-        let url = endpoint
-            .join(path.trim_start_matches('/'))
-            .map_err(|_| RuntimeError::Rejected("runtime API URL is invalid".into()))?;
-        let mut request = self.raw_client()?.request(method, url).query(query);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if !status.is_success() {
-            let detail = String::from_utf8_lossy(&bytes)
-                .chars()
-                .take(2_000)
-                .collect::<String>();
-            return Err(RuntimeError::Rejected(format!(
-                "OpenCode API returned HTTP {status}: {detail}"
-            )));
-        }
-        if bytes.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| RuntimeError::Rejected("OpenCode API returned invalid JSON".into()))
+        self.api_client()?
+            .request_json(method, path, query, body)
+            .await
     }
 
     /// Read the complete `OpenCode` Desktop catalog through the native boundary.
@@ -917,7 +970,10 @@ impl OpenCodeSidecar {
         session_id: &str,
         prompt: &str,
         attachments: Vec<Value>,
-    ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
+        model: Option<&str>,
+        agent: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<PromptSubmission, RuntimeError> {
         if prompt.trim().is_empty() {
             return Err(RuntimeError::Rejected("prompt must not be blank".into()));
         }
@@ -970,21 +1026,7 @@ impl OpenCodeSidecar {
             ("messageID".to_owned(), Value::String(message_id.clone())),
             ("parts".to_owned(), Value::Array(parts)),
         ]);
-        if let (Some(provider_id), Some(model_id)) = (
-            session.pointer("/model/providerID").and_then(Value::as_str),
-            session.pointer("/model/id").and_then(Value::as_str),
-        ) {
-            prompt_body.insert(
-                "model".to_owned(),
-                serde_json::json!({"providerID": provider_id, "modelID": model_id}),
-            );
-        }
-        if let Some(agent) = session.get("agent").and_then(Value::as_str) {
-            prompt_body.insert("agent".to_owned(), Value::String(agent.to_owned()));
-        }
-        if let Some(variant) = session.pointer("/model/variant").and_then(Value::as_str) {
-            prompt_body.insert("variant".to_owned(), Value::String(variant.to_owned()));
-        }
+        apply_prompt_selection(&mut prompt_body, &session, model, agent, effort)?;
         let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
             Value::Object(prompt_body),
             "session prompt body",
@@ -1013,7 +1055,10 @@ impl OpenCodeSidecar {
             session_id,
             2,
         ));
-        Ok(rx)
+        Ok(PromptSubmission {
+            message_id,
+            events: rx,
+        })
     }
 }
 
@@ -1116,26 +1161,39 @@ impl AgentRuntime for OpenCodeSidecar {
         &mut self,
         working_directory: Option<&Path>,
     ) -> Result<Vec<ModelCapability>, RuntimeError> {
-        let mut request = self.generated_client()?.provider_list();
         let directory = working_directory
             .map(std::fs::canonicalize)
             .transpose()?
             .map(|path| path.display().to_string());
-        if let Some(directory) = directory.as_deref() {
-            request = request.directory(directory);
-        }
-        let response = request
-            .send()
+        let query = directory
+            .map(|directory| vec![("directory", directory)])
+            .unwrap_or_default();
+        // Provider metadata evolves additively between OpenCode releases. Read
+        // it as reviewed JSON so unknown provider fields cannot break the
+        // desktop model selector through strict generated-response decoding.
+        let value = self
+            .request_json(reqwest::Method::GET, "/provider", &query, None)
             .await
             .map_err(|_| api_failure("model discovery"))?;
-        let value = serde_json::to_value(response.into_inner())
-            .map_err(|_| api_failure("model response decoding"))?;
+        let connected = value
+            .get("connected")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
         let providers = value
             .get("all")
             .and_then(Value::as_array)
             .ok_or_else(|| api_failure("provider response shape"))?;
         Ok(providers
             .iter()
+            .filter(|provider| {
+                provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|provider_id| connected.contains(provider_id))
+            })
             .flat_map(|provider| {
                 let provider_id = provider
                     .get("id")
@@ -1333,8 +1391,10 @@ impl AgentRuntime for OpenCodeSidecar {
                 "structured plan submission is not supported by the pinned runtime API".into(),
             ));
         }
-        self.submit_with_attachments(session_id, prompt, Vec::new())
-            .await
+        Ok(self
+            .submit_with_attachments(session_id, prompt, Vec::new(), None, None, None)
+            .await?
+            .events)
     }
     async fn answer(
         &mut self,
@@ -1400,6 +1460,56 @@ impl AgentRuntime for OpenCodeSidecar {
 
 fn api_failure(operation: &str) -> RuntimeError {
     RuntimeError::Rejected(format!("OpenCode {operation} failed"))
+}
+
+fn apply_prompt_selection(
+    body: &mut Map<String, Value>,
+    session: &Value,
+    model: Option<&str>,
+    agent: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let requested_model = model
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let (provider_id, model_id) = value.split_once('/').ok_or_else(|| {
+                RuntimeError::Rejected("model must use provider/model syntax".into())
+            })?;
+            if provider_id.is_empty() || model_id.is_empty() {
+                return Err(RuntimeError::Rejected(
+                    "model must use non-empty provider/model syntax".into(),
+                ));
+            }
+            Ok((provider_id, model_id))
+        })
+        .transpose()?;
+    let session_model = || {
+        Some((
+            session
+                .pointer("/model/providerID")
+                .and_then(Value::as_str)?,
+            session.pointer("/model/id").and_then(Value::as_str)?,
+        ))
+    };
+    if let Some((provider_id, model_id)) = requested_model.or_else(session_model) {
+        body.insert(
+            "model".to_owned(),
+            serde_json::json!({"providerID": provider_id, "modelID": model_id}),
+        );
+    }
+    if let Some(agent) = agent
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| session.get("agent").and_then(Value::as_str))
+    {
+        body.insert("agent".to_owned(), Value::String(agent.to_owned()));
+    }
+    if let Some(variant) = effort
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| session.pointer("/model/variant").and_then(Value::as_str))
+    {
+        body.insert("variant".to_owned(), Value::String(variant.to_owned()));
+    }
+    Ok(())
 }
 
 fn generated_body<T>(value: Value, operation: &str) -> Result<T, RuntimeError>
@@ -1980,6 +2090,29 @@ impl AgentRuntime for FakeRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prompt_selection_overrides_an_existing_session_model() {
+        let mut body = Map::new();
+        let session = json!({
+            "model": {"providerID": "old-provider", "id": "old-model", "variant": "low"},
+            "agent": "old-agent"
+        });
+        apply_prompt_selection(
+            &mut body,
+            &session,
+            Some("openai/gpt-5"),
+            Some("build"),
+            Some("high"),
+        )
+        .expect("prompt selection");
+        assert_eq!(
+            body["model"],
+            json!({"providerID": "openai", "modelID": "gpt-5"})
+        );
+        assert_eq!(body["agent"], "build");
+        assert_eq!(body["variant"], "high");
+    }
 
     async fn spawn_openai_compatible_fixture(metadata_path: &std::path::Path) -> (Child, u16) {
         let port = OpenCodeSidecar::reserve_loopback_port().expect("fixture port");

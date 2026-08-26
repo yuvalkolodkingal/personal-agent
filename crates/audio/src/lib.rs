@@ -4,7 +4,7 @@ mod native;
 
 pub use native::{
     NativeVoiceConfig, NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper,
-    transcribe_pcm,
+    transcribe_pcm, transcribe_wav,
 };
 
 use async_trait::async_trait;
