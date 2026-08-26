@@ -86,6 +86,38 @@ describe("desktop workspace", () => {
     expect(window.confirm).toHaveBeenCalledWith("Delete 2 selected sessions permanently?");
   });
 
+  it("keeps only recent sessions visible until older history is requested", async () => {
+    const sessionHistory = Array.from({ length: 25 }, (_, index) => ({
+      id: `ses_${String(index + 1).padStart(2, "0")}`,
+      title: `Session ${String(index + 1).padStart(2, "0")}`,
+      time: { updated: index + 1 },
+    }));
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap") return Promise.resolve({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: { stt_ready: false, tts_ready: false, playback_ready: false, details: [] },
+        catalog: { sessions: { available: true, data: sessionHistory } },
+      });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    expect(await screen.findByText("Session 25")).toBeInTheDocument();
+    expect(screen.getByText("Showing 12 of 25")).toBeInTheDocument();
+    expect(screen.queryByText("Session 13")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /New session/ })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 12 older" }));
+    expect(screen.getByText("Session 13")).toBeInTheDocument();
+    expect(screen.getByText("Showing 24 of 25")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 older" }));
+    expect(screen.getByRole("button", { name: "Hide older" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Hide older" }));
+    expect(screen.getByText("Showing 12 of 25")).toBeInTheDocument();
+    expect(screen.queryByText("Session 13")).not.toBeInTheDocument();
+  });
+
   it("renders unknown additive runtime events by exact type and origin", async () => {
     render(<App />);
     await waitFor(() => expect(listeners.has("runtime-event")).toBe(true));
