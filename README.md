@@ -35,5 +35,20 @@ For a native desktop build, fetch the verified sidecar first and run
 `doctor`, `config print-default`, `config check PATH`, and metadata-only legacy
 discovery with `migration dry-run CONFIG_ROOT DATA_ROOT [OPENCODE_AUTH]`.
 
+### English neural voice
+
+The Balanced voice profile uses a persistent local worker: Moonshine Medium
+Streaming performs incremental English recognition on CPU and Qwen3-TTS 0.6B
+CustomVoice synthesizes the built-in `Ryan` voice on CUDA. The worker protocol
+is owned by the Tauri host; model output never enters the renderer as commands.
+Whisper `base` and Piper Lessac remain private compatibility fallbacks when a
+neural model cannot load. Voice settings can install the isolated Python 3.12
+runtime and verified model profile without changing the system Python.
+
+Capture exposes explicit `loading_model`, `listening`, `endpointing`, and
+`transcribing` states, live partial text, adaptive silence endpointing, and
+barge-in. Barge-in invalidates in-flight synthesis as well as stopping current
+playback, so late audio cannot begin after the user interrupts it.
+
 See [SPEC.md](SPEC.md), [ROADMAP.md](ROADMAP.md), and
 [docs/architecture/system.md](docs/architecture/system.md).

@@ -1,11 +1,13 @@
 //! Replaceable, privacy-aware audio pipeline and deterministic endpointing primitives.
 
 mod native;
+mod neural;
 
 pub use native::{
     NativeVoiceConfig, NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper,
-    transcribe_pcm, transcribe_wav,
+    transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
+pub use neural::NeuralVoiceRuntime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

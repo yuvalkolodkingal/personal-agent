@@ -12,6 +12,7 @@ use personal_agent_runtime::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -32,6 +33,11 @@ struct DesktopState {
     safety_plugin: PathBuf,
     active_session: tokio::sync::Mutex<Option<ActiveSession>>,
     voice_playback: tokio::sync::Mutex<Option<VoicePlayback>>,
+    voice_runtime: tokio::sync::Mutex<Option<personal_agent_audio::NeuralVoiceRuntime>>,
+    voice_runtime_script: PathBuf,
+    voice_runtime_pid: AtomicU32,
+    voice_synthesis_active: AtomicBool,
+    voice_generation: AtomicU64,
     lifecycle: Mutex<Option<LifecycleMarker>>,
     migration_review: Mutex<Option<MigrationReview>>,
     app_data: PathBuf,
@@ -47,6 +53,7 @@ struct ActiveSession {
 struct VoicePlayback {
     child: tokio::process::Child,
     wav: PathBuf,
+    generation: u64,
 }
 
 struct MigrationReview {
@@ -438,6 +445,9 @@ fn main() {
             let safety_plugin = app
                 .path()
                 .resolve("opencode-plugin/index.ts", BaseDirectory::Resource)?;
+            let voice_runtime_script = app
+                .path()
+                .resolve("voice-runtime/voice-runtime.py", BaseDirectory::Resource)?;
             let sidecar_executable = sidecar_path()?;
             let sidecar = runtime_from_parts(
                 sidecar_executable.clone(),
@@ -455,6 +465,11 @@ fn main() {
                 safety_plugin,
                 active_session: tokio::sync::Mutex::new(None),
                 voice_playback: tokio::sync::Mutex::new(None),
+                voice_runtime: tokio::sync::Mutex::new(None),
+                voice_runtime_script,
+                voice_runtime_pid: AtomicU32::new(0),
+                voice_synthesis_active: AtomicBool::new(false),
+                voice_generation: AtomicU64::new(0),
                 lifecycle: Mutex::new(Some(lifecycle)),
                 migration_review: Mutex::new(None),
                 app_data,
@@ -508,6 +523,11 @@ fn main() {
             api::voice_status,
             api::microphone_state,
             api::voice_transcribe,
+            api::voice_stream_start,
+            api::voice_stream_chunk,
+            api::voice_stream_stop,
+            api::voice_stream_cancel,
+            api::voice_turn_complete,
             api::voice_speak,
             api::voice_self_test,
             api::voice_stop,

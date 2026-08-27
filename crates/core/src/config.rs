@@ -87,11 +87,11 @@ fn voice_language() -> String {
 }
 
 fn whisper_model() -> String {
-    "base".to_owned()
+    "medium-streaming".to_owned()
 }
 
 fn default_voice() -> String {
-    "en_US-lessac-medium".to_owned()
+    "Ryan".to_owned()
 }
 
 fn working_directory() -> String {
@@ -386,12 +386,18 @@ pub struct VoiceConfig {
     pub stt_model_path: String,
     #[serde(default = "default_tts_backend")]
     pub tts_backend: String,
+    #[serde(default = "default_tts_model")]
+    pub tts_model: String,
     #[serde(default = "default_voice")]
     pub tts_voice: String,
     #[serde(default)]
     pub tts_executable: String,
     #[serde(default)]
     pub tts_model_path: String,
+    #[serde(default)]
+    pub tts_reference_audio: String,
+    #[serde(default)]
+    pub tts_reference_text: String,
     #[serde(default = "percent_100")]
     pub speech_rate_percent: u16,
     #[serde(default = "percent_100")]
@@ -456,10 +462,13 @@ fn default_voice_mode() -> String {
     "push-to-talk".to_owned()
 }
 fn default_stt_backend() -> String {
-    "whisper.cpp".to_owned()
+    "moonshine".to_owned()
 }
 fn default_tts_backend() -> String {
-    "piper".to_owned()
+    "qwen3-tts".to_owned()
+}
+fn default_tts_model() -> String {
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_owned()
 }
 fn default_ducking() -> u16 {
     30
@@ -494,9 +503,12 @@ impl Default for VoiceConfig {
             stt_executable: String::new(),
             stt_model_path: String::new(),
             tts_backend: default_tts_backend(),
+            tts_model: default_tts_model(),
             tts_voice: default_voice(),
             tts_executable: String::new(),
             tts_model_path: String::new(),
+            tts_reference_audio: String::new(),
+            tts_reference_text: String::new(),
             speech_rate_percent: 100,
             volume_percent: 100,
             input_gain_percent: 100,
@@ -799,6 +811,8 @@ pub enum ConfigError {
     VoiceRange,
     #[error("voice VAD stop threshold must be lower than the start threshold")]
     VoiceVad,
+    #[error("this release supports English voice input and output only")]
+    VoiceLanguage,
     #[error("privacy.transcript_retention_days must be between 0 and 3650")]
     Retention,
     #[error("runtime.working_directory must not be blank")]
@@ -944,6 +958,9 @@ fn validate(config: &PersonalAgentConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Retention);
     }
     let voice = &config.voice;
+    if voice.language != "en" || voice.response_language != "en" {
+        return Err(ConfigError::VoiceLanguage);
+    }
     if voice.wake_threshold_milli > 1_000
         || voice.vad_start_milli > 1_000
         || voice.vad_stop_milli > 1_000

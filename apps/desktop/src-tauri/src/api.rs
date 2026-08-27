@@ -1,8 +1,8 @@
 use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
-    NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper, transcribe_pcm,
-    transcribe_wav,
+    NativeVoiceStatus, NeuralVoiceRuntime, discover_native_voice, play_wav, synthesize_piper,
+    transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 use personal_agent_core::{CONFIG_SCHEMA, PersonalAgentConfig, parse_config};
 use personal_agent_platform::{OsSecretStore, SecretReference, SecretStore};
@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
@@ -44,11 +45,53 @@ fn canonical_directory(
 fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> NativeVoiceStatus {
     discover_native_voice(
         &state.app_data.join("voice"),
+        &config.voice.stt_backend,
+        &config.voice.tts_backend,
         &config.voice.stt_executable,
         &config.voice.stt_model_path,
         &config.voice.tts_executable,
         &config.voice.tts_model_path,
     )
+}
+
+async fn neural_voice_request(
+    state: &DesktopState,
+    command: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let config = config_snapshot(state)?;
+    let status = voice_status_for(state, &config);
+    let python = status
+        .neural_python
+        .ok_or_else(|| "The neural voice runtime is not installed. Open Voice settings and install Balanced voice.".to_owned())?;
+    let mut runtime = state.voice_runtime.lock().await;
+    if runtime.is_none() {
+        let worker = NeuralVoiceRuntime::start(
+            &python,
+            &state.voice_runtime_script,
+            &state.app_data.join("voice/neural"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        state
+            .voice_runtime_pid
+            .store(worker.process_id().unwrap_or(0), Ordering::SeqCst);
+        *runtime = Some(worker);
+    }
+    let result = runtime
+        .as_mut()
+        .expect("voice runtime was initialized")
+        .request(command, payload, timeout)
+        .await;
+    if result.is_err() {
+        if let Some(worker) = runtime.as_mut() {
+            worker.terminate();
+        }
+        *runtime = None;
+        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+    }
+    result.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1208,6 +1251,25 @@ pub(crate) async fn voice_transcribe(
     }
     let config = config_snapshot(&state)?;
     let status = voice_status_for(&state, &config);
+    if status.active_stt_backend == "moonshine" {
+        let working = state.app_data.join("voice/runtime");
+        std::fs::create_dir_all(&working).map_err(|error| error.to_string())?;
+        let wav = working.join(format!("stt-neural-{}.wav", uuid::Uuid::new_v4()));
+        write_pcm_wav(&wav, &samples, sample_rate_hz).map_err(|error| error.to_string())?;
+        let result = neural_voice_request(
+            &state,
+            "stt_transcribe",
+            json!({"wav": &wav, "vocabulary": &config.voice.vocabulary}),
+            Duration::from_secs(90),
+        )
+        .await;
+        let _ = std::fs::remove_file(&wav);
+        if let Ok(value) = result {
+            return Ok(value);
+        }
+        // A model-load or inference failure falls back to the installed,
+        // private Whisper engine for this turn instead of losing the speech.
+    }
     let executable = status
         .whisper_executable
         .ok_or_else(|| status.details.join(" "))?;
@@ -1228,37 +1290,203 @@ pub(crate) async fn voice_transcribe(
 }
 
 #[tauri::command]
+pub(crate) async fn voice_stream_start(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let config = config_snapshot(&state)?;
+    let status = voice_status_for(&state, &config);
+    if status.active_stt_backend != "moonshine" {
+        return Ok(json!({"streaming": false, "backend": status.active_stt_backend}));
+    }
+    let result = neural_voice_request(
+        &state,
+        "stt_start",
+        json!({"language": "en", "vocabulary": &config.voice.vocabulary}),
+        Duration::from_secs(120),
+    )
+    .await?;
+    Ok(json!({"streaming": true, "backend": "moonshine", "result": result}))
+}
+
+#[tauri::command]
+pub(crate) async fn voice_stream_chunk(
+    samples: Vec<f32>,
+    sample_rate_hz: u32,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    if samples.is_empty() || samples.len() > 32_000 || sample_rate_hz != 16_000 {
+        return Err(
+            "voice stream chunks must contain at most two seconds of 16 kHz mono audio".to_owned(),
+        );
+    }
+    neural_voice_request(
+        &state,
+        "stt_chunk",
+        json!({"samples": samples, "sample_rate_hz": sample_rate_hz}),
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn voice_stream_stop(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    neural_voice_request(&state, "stt_stop", json!({}), Duration::from_secs(45)).await
+}
+
+#[tauri::command]
+pub(crate) async fn voice_stream_cancel(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    neural_voice_request(&state, "stt_cancel", json!({}), Duration::from_secs(10)).await
+}
+
+#[tauri::command]
+pub(crate) async fn voice_turn_complete(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let config = config_snapshot(&state)?;
+    let status = voice_status_for(&state, &config);
+    if status.active_stt_backend != "moonshine" || !status.smart_turn_ready {
+        return Err(
+            "Smart Turn endpointing is not installed; using the silence endpoint fallback"
+                .to_owned(),
+        );
+    }
+    neural_voice_request(
+        &state,
+        "turn_complete",
+        json!({"threshold": 0.5}),
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+#[tauri::command]
 pub(crate) async fn voice_speak(
     text: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
     if text.trim().is_empty() || text.len() > 65_536 {
         return Err("speech text must contain 1 to 65536 bytes".to_owned());
     }
-    voice_stop_inner(&state).await;
+    voice_stop_inner(&state, Some(&app), false).await;
+    let generation = state
+        .voice_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
     let config = config_snapshot(&state)?;
     if config.voice.quiet_mode {
         return Ok(json!({"spoken": false, "reason": "quiet mode"}));
     }
     let status = voice_status_for(&state, &config);
-    let executable = status
-        .piper_executable
-        .ok_or_else(|| status.details.join(" "))?;
-    let model = status.piper_model.ok_or_else(|| status.details.join(" "))?;
     let player = status
         .playback_command
         .ok_or_else(|| status.details.join(" "))?;
-    let model_config = model.with_extension("onnx.json");
-    let wav = synthesize_piper(
-        &executable,
-        &model,
-        Some(&model_config),
-        &state.app_data.join("voice/runtime"),
-        &text,
-        config.voice.speech_rate_percent,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let mut engine = "piper";
+    let wav =
+        if status.active_tts_backend == "qwen3-tts" {
+            let output = state
+                .app_data
+                .join("voice/runtime")
+                .join(format!("tts-qwen-{}.wav", uuid::Uuid::new_v4()));
+            let _ = app.emit(
+                "voice-state",
+                json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+            );
+            let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
+                && !config
+                    .voice
+                    .tts_model
+                    .to_ascii_lowercase()
+                    .contains("customvoice")
+            {
+                "base"
+            } else {
+                "custom"
+            };
+            state.voice_synthesis_active.store(true, Ordering::SeqCst);
+            let neural = neural_voice_request(
+                &state,
+                "tts_synthesize",
+                json!({
+                    "text": &text,
+                    "output": &output,
+                    "voice": &config.voice.tts_voice,
+                    "model_kind": model_kind,
+                    "reference_audio": &config.voice.tts_reference_audio,
+                    "reference_text": &config.voice.tts_reference_text,
+                }),
+                Duration::from_secs(180),
+            )
+            .await;
+            state.voice_synthesis_active.store(false, Ordering::SeqCst);
+            match neural {
+                Ok(value) => {
+                    engine = "qwen3-tts";
+                    PathBuf::from(
+                        value
+                            .get("wav")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "Qwen3-TTS returned no audio file".to_owned())?,
+                    )
+                }
+                Err(error) => {
+                    if state.voice_generation.load(Ordering::SeqCst) != generation {
+                        let _ = std::fs::remove_file(&output);
+                        return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                    }
+                    tracing::warn!(%error, "Qwen3-TTS failed; using private Piper fallback");
+                    let _ = app.emit(
+                        "voice-state",
+                        json!({"state": "recovering", "detail": error, "fallback": "piper"}),
+                    );
+                    let executable = status.piper_executable.as_ref().ok_or_else(|| {
+                        format!("Qwen3-TTS failed and Piper is unavailable: {error}")
+                    })?;
+                    let model = status.piper_model.as_ref().ok_or_else(|| {
+                        format!("Qwen3-TTS failed and Piper is unavailable: {error}")
+                    })?;
+                    synthesize_piper(
+                        executable,
+                        model,
+                        Some(&model.with_extension("onnx.json")),
+                        &state.app_data.join("voice/runtime"),
+                        &text,
+                        config.voice.speech_rate_percent,
+                    )
+                    .await
+                    .map_err(|fallback| {
+                        format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
+                    })?
+                }
+            }
+        } else {
+            let executable = status
+                .piper_executable
+                .as_ref()
+                .ok_or_else(|| status.details.join(" "))?;
+            let model = status
+                .piper_model
+                .as_ref()
+                .ok_or_else(|| status.details.join(" "))?;
+            synthesize_piper(
+                executable,
+                model,
+                Some(&model.with_extension("onnx.json")),
+                &state.app_data.join("voice/runtime"),
+                &text,
+                config.voice.speech_rate_percent,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        };
+    if state.voice_generation.load(Ordering::SeqCst) != generation {
+        let _ = std::fs::remove_file(&wav);
+        return Ok(json!({"spoken": false, "reason": "interrupted"}));
+    }
     let child = play_wav(
         &player,
         &wav,
@@ -1266,8 +1494,44 @@ pub(crate) async fn voice_speak(
         config.voice.volume_percent,
     )
     .map_err(|error| error.to_string())?;
-    *state.voice_playback.lock().await = Some(VoicePlayback { child, wav });
-    Ok(json!({"spoken": true}))
+    *state.voice_playback.lock().await = Some(VoicePlayback {
+        child,
+        wav,
+        generation,
+    });
+    let _ = app.emit(
+        "voice-state",
+        json!({"state": "speaking", "engine": engine, "generation": generation}),
+    );
+    let monitor_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let monitor_state = monitor_app.state::<DesktopState>();
+            let completed = {
+                let mut playback = monitor_state.voice_playback.lock().await;
+                playback.as_mut().is_some_and(|item| {
+                    item.generation == generation && item.child.try_wait().ok().flatten().is_some()
+                })
+            };
+            if !completed {
+                if monitor_state.voice_generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
+                continue;
+            }
+            let finished = monitor_state.voice_playback.lock().await.take();
+            if let Some(item) = finished.filter(|item| item.generation == generation) {
+                let _ = std::fs::remove_file(item.wav);
+            }
+            let _ = monitor_app.emit(
+                "voice-state",
+                json!({"state": "idle", "generation": generation}),
+            );
+            break;
+        }
+    });
+    Ok(json!({"spoken": true, "engine": engine, "generation": generation}))
 }
 
 #[tauri::command]
@@ -1276,59 +1540,132 @@ pub(crate) async fn voice_self_test(
 ) -> Result<Value, String> {
     let config = config_snapshot(&state)?;
     let status = voice_status_for(&state, &config);
-    let whisper = status
-        .whisper_executable
-        .ok_or_else(|| status.details.join(" "))?;
-    let whisper_model = status
-        .whisper_model
-        .ok_or_else(|| status.details.join(" "))?;
-    let piper = status
-        .piper_executable
-        .ok_or_else(|| status.details.join(" "))?;
-    let piper_model = status.piper_model.ok_or_else(|| status.details.join(" "))?;
     let working = state.app_data.join("voice/runtime");
+    std::fs::create_dir_all(&working).map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let wav = synthesize_piper(
-        &piper,
-        &piper_model,
-        Some(&piper_model.with_extension("onnx.json")),
-        &working,
-        "Personal Agent voice test",
-        config.voice.speech_rate_percent,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let wav = if status.active_tts_backend == "qwen3-tts" {
+        let output = working.join(format!("self-test-qwen-{}.wav", uuid::Uuid::new_v4()));
+        let value = neural_voice_request(
+            &state,
+            "tts_synthesize",
+            json!({
+                "text": "Personal Agent voice test",
+                "output": output,
+                "voice": config.voice.tts_voice,
+                "model_kind": "custom",
+            }),
+            Duration::from_secs(180),
+        )
+        .await?;
+        PathBuf::from(
+            value
+                .get("wav")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Qwen3-TTS returned no test audio".to_owned())?,
+        )
+    } else {
+        let piper = status
+            .piper_executable
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        let piper_model = status
+            .piper_model
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        synthesize_piper(
+            piper,
+            piper_model,
+            Some(&piper_model.with_extension("onnx.json")),
+            &working,
+            "Personal Agent voice test",
+            config.voice.speech_rate_percent,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    };
     let synthesis_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let recognition_started = Instant::now();
-    let result = transcribe_wav(
-        &whisper,
-        &whisper_model,
-        &working,
-        &wav,
-        &config.voice.language,
-    )
-    .await;
+    let result = if status.active_stt_backend == "moonshine" {
+        neural_voice_request(
+            &state,
+            "stt_transcribe",
+            json!({"wav": &wav, "vocabulary": &config.voice.vocabulary}),
+            Duration::from_secs(90),
+        )
+        .await
+        .and_then(|value| {
+            value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "Moonshine returned no test transcript".to_owned())
+        })
+    } else {
+        let whisper = status
+            .whisper_executable
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        let whisper_model = status
+            .whisper_model
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        transcribe_wav(
+            whisper,
+            whisper_model,
+            &working,
+            &wav,
+            &config.voice.language,
+        )
+        .await
+        .map(|transcript| transcript.text)
+        .map_err(|error| error.to_string())
+    };
     let _ = std::fs::remove_file(&wav);
-    let transcript = result.map_err(|error| error.to_string())?;
+    let transcript = result?;
     Ok(json!({
         "ok": true,
-        "transcript": transcript.text,
+        "transcript": transcript,
         "synthesis_ms": synthesis_ms,
         "recognition_ms": u64::try_from(recognition_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "stt_backend": status.active_stt_backend,
+        "tts_backend": status.active_tts_backend,
     }))
 }
 
-async fn voice_stop_inner(state: &DesktopState) {
+async fn voice_stop_inner(
+    state: &DesktopState,
+    app: Option<&tauri::AppHandle>,
+    interrupt_synthesis: bool,
+) {
+    state.voice_generation.fetch_add(1, Ordering::SeqCst);
+    if interrupt_synthesis && state.voice_synthesis_active.swap(false, Ordering::SeqCst) {
+        let process_id = state.voice_runtime_pid.swap(0, Ordering::SeqCst);
+        if process_id != 0 {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &process_id.to_string()])
+                    .status()
+                    .await;
+            }
+        }
+    }
     if let Some(mut playback) = state.voice_playback.lock().await.take() {
         let _ = playback.child.kill().await;
         let _ = playback.child.wait().await;
         let _ = std::fs::remove_file(playback.wav);
     }
+    if let Some(app) = app {
+        let _ = app.emit("voice-state", json!({"state": "idle", "interrupted": true}));
+    }
 }
 
 #[tauri::command]
-pub(crate) async fn voice_stop(state: tauri::State<'_, DesktopState>) -> Result<Value, String> {
-    voice_stop_inner(&state).await;
+pub(crate) async fn voice_stop(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    voice_stop_inner(&state, Some(&app), true).await;
     Ok(json!({"stopped": true}))
 }
 
@@ -1511,6 +1848,113 @@ async fn install_piper_voice(root: &Path, app: &tauri::AppHandle) -> Result<(), 
     .await
 }
 
+async fn run_voice_installer(
+    app: &tauri::AppHandle,
+    phase: &str,
+    mut command: Command,
+    timeout: Duration,
+) -> Result<(), String> {
+    let _ = app.emit("voice-install-progress", json!({"phase": phase}));
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| format!("{phase} timed out"))?
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr)
+        .chars()
+        .rev()
+        .take(2_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    Err(format!("{phase} failed: {detail}"))
+}
+
+async fn install_neural_voice(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
+    if (std::env::consts::OS, std::env::consts::ARCH) != ("linux", "x86_64") {
+        return Err("automatic neural voice installation currently supports Linux x86_64; compatibility voice remains available".to_owned());
+    }
+    let neural = root.join("neural");
+    let venv = neural.join("venv");
+    std::fs::create_dir_all(&neural).map_err(|error| error.to_string())?;
+    let mut create = Command::new("uv");
+    create.args(["venv", "--python", "3.12"]).arg(&venv);
+    run_voice_installer(
+        app,
+        "Creating isolated Python 3.12 voice runtime",
+        create,
+        Duration::from_secs(300),
+    )
+    .await?;
+    let python = venv.join("bin/python");
+    let mut install = Command::new("uv");
+    install
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .args([
+            "moonshine-voice==0.1.5",
+            "soundfile==0.14.0",
+            "qwen-tts==0.1.1",
+        ]);
+    run_voice_installer(
+        app,
+        "Installing Moonshine and Qwen runtimes",
+        install,
+        Duration::from_secs(1_200),
+    )
+    .await?;
+    let moonshine_root = neural.join("models/moonshine");
+    let marker = neural.join("moonshine.json");
+    let moonshine_code = r#"import json, pathlib, sys
+from moonshine_voice import ModelArch, get_model_for_language
+path, arch = get_model_for_language('en', ModelArch.MEDIUM_STREAMING, cache_root=sys.argv[1])
+pathlib.Path(sys.argv[2]).write_text(json.dumps({'model_path': path, 'model_arch': int(arch)}), encoding='utf-8')"#;
+    let mut moonshine = Command::new(&python);
+    moonshine
+        .args(["-c", moonshine_code])
+        .arg(&moonshine_root)
+        .arg(&marker);
+    run_voice_installer(
+        app,
+        "Downloading Moonshine Medium Streaming English",
+        moonshine,
+        Duration::from_secs(1_200),
+    )
+    .await?;
+    let smart_turn_code = r#"from huggingface_hub import hf_hub_download
+import sys
+hf_hub_download(repo_id='pipecat-ai/smart-turn-v3', filename='smart-turn-v3.2-cpu.onnx', local_dir=sys.argv[1])"#;
+    let mut smart_turn = Command::new(&python);
+    smart_turn
+        .args(["-c", smart_turn_code])
+        .arg(neural.join("models"));
+    run_voice_installer(
+        app,
+        "Downloading Smart Turn v3.2 endpointing",
+        smart_turn,
+        Duration::from_secs(300),
+    )
+    .await?;
+    let qwen_path = neural.join("models/qwen3-tts-0.6b-customvoice");
+    let qwen_code = r#"from huggingface_hub import snapshot_download
+import sys
+snapshot_download(repo_id='Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir=sys.argv[1])"#;
+    let mut qwen = Command::new(&python);
+    qwen.args(["-c", qwen_code]).arg(&qwen_path);
+    run_voice_installer(
+        app,
+        "Downloading Qwen3-TTS 0.6B English voice",
+        qwen,
+        Duration::from_secs(1_800),
+    )
+    .await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn voice_install(
     component: String,
@@ -1519,6 +1963,7 @@ pub(crate) async fn voice_install(
 ) -> Result<NativeVoiceStatus, String> {
     let root = state.app_data.join("voice");
     match component.as_str() {
+        "balanced" | "neural" => install_neural_voice(&root, &app).await?,
         "whisper" => install_whisper_engine(&root, &app).await?,
         "whisper-model" => {
             download_voice_asset(
@@ -1540,6 +1985,7 @@ pub(crate) async fn voice_install(
             .await?;
             install_piper_engine(&root, &app).await?;
             install_piper_voice(&root, &app).await?;
+            install_neural_voice(&root, &app).await?;
         }
         _ => return Err("unknown voice component".to_owned()),
     }

@@ -27,7 +27,9 @@
     "active": true,
     "externalBin": ["binaries/opencode"],
     "resources": {
-      "../../../packages/opencode-plugin/src/index.ts": "opencode-plugin/index.ts"
+      "../../../packages/opencode-plugin/src/index.ts": "opencode-plugin/index.ts",
+      "../../../scripts/voice-runtime.py": "voice-runtime/voice-runtime.py",
+      "../../../scripts/smart_turn.py": "voice-runtime/smart_turn.py"
     },
     "icon": [
       "icons/32x32.png",
