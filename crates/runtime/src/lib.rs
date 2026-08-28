@@ -127,6 +127,49 @@ pub struct SessionOptions {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Per-turn model selection and trusted native system context.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PromptOptions<'a> {
+    pub model: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub system: Option<&'a str>,
+}
+
+fn prompt_parts(prompt: &str, attachments: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+    if prompt.trim().is_empty() {
+        return Err(RuntimeError::Rejected("prompt must not be blank".into()));
+    }
+    let mut parts = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for attachment in attachments {
+        let object = attachment
+            .as_object()
+            .ok_or_else(|| RuntimeError::Rejected("prompt attachment must be an object".into()))?;
+        let mime = object.get("mime").and_then(Value::as_str).unwrap_or("");
+        let url = object.get("url").and_then(Value::as_str).unwrap_or("");
+        let filename = object
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment");
+        if object.get("type").and_then(Value::as_str) != Some("file")
+            || mime.is_empty()
+            || mime.len() > 255
+            || filename.is_empty()
+            || filename.len() > 512
+            || !url.starts_with("data:")
+            || url.len() > 36 * 1024 * 1024
+        {
+            return Err(RuntimeError::Rejected(
+                "prompt attachment is invalid or exceeds the 25 MiB limit".into(),
+            ));
+        }
+        parts.push(serde_json::json!({
+            "type": "file", "mime": mime, "filename": filename, "url": url,
+        }));
+    }
+    Ok(parts)
+}
+
 /// Permission or clarification answer returned to the runtime.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAnswer {
@@ -970,75 +1013,65 @@ impl OpenCodeSidecar {
         session_id: &str,
         prompt: &str,
         attachments: Vec<Value>,
-        model: Option<&str>,
-        agent: Option<&str>,
-        effort: Option<&str>,
+        options: PromptOptions<'_>,
     ) -> Result<PromptSubmission, RuntimeError> {
-        if prompt.trim().is_empty() {
-            return Err(RuntimeError::Rejected("prompt must not be blank".into()));
-        }
-        let mut parts = vec![serde_json::json!({"type": "text", "text": prompt})];
-        for attachment in attachments {
-            let object = attachment.as_object().ok_or_else(|| {
-                RuntimeError::Rejected("prompt attachment must be an object".into())
-            })?;
-            let mime = object.get("mime").and_then(Value::as_str).unwrap_or("");
-            let url = object.get("url").and_then(Value::as_str).unwrap_or("");
-            let filename = object
-                .get("filename")
-                .and_then(Value::as_str)
-                .unwrap_or("attachment");
-            if object.get("type").and_then(Value::as_str) != Some("file")
-                || mime.is_empty()
-                || mime.len() > 255
-                || filename.is_empty()
-                || filename.len() > 512
-                || !url.starts_with("data:")
-                || url.len() > 36 * 1024 * 1024
-            {
-                return Err(RuntimeError::Rejected(
-                    "prompt attachment is invalid or exceeds the 25 MiB limit".into(),
-                ));
-            }
-            parts.push(serde_json::json!({
-                "type": "file", "mime": mime, "filename": filename, "url": url,
-            }));
-        }
+        let parts = prompt_parts(prompt, attachments)?;
         let directory = self.registered_session_directory(session_id)?;
         let client = self.generated_client()?.clone();
-        let event_response = client
-            .event_subscribe()
-            .directory(&directory)
-            .send()
-            .await
-            .map_err(|_| api_failure("session event subscription"))?;
-        let session = client
-            .session_get()
-            .session_id(session_id)
-            .directory(&directory)
-            .send()
-            .await
-            .map_err(|_| api_failure("session prompt context"))?;
+        // Validate the session before opening the long-lived event stream. A
+        // deleted/stale active session must fail or be replaced immediately,
+        // instead of leaving the renderer waiting behind an idle SSE request.
+        let session = tokio::time::timeout(
+            Duration::from_secs(15),
+            client
+                .session_get()
+                .session_id(session_id)
+                .directory(&directory)
+                .send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode session lookup timed out".into()))?
+        .map_err(|_| api_failure("session prompt context"))?;
         let session = serde_json::to_value(session.into_inner())
             .map_err(|_| api_failure("session prompt context response"))?;
+        let event_response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.event_subscribe().directory(&directory).send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode event subscription timed out".into()))?
+        .map_err(|_| api_failure("session event subscription"))?;
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let mut prompt_body = serde_json::Map::from_iter([
             ("messageID".to_owned(), Value::String(message_id.clone())),
             ("parts".to_owned(), Value::Array(parts)),
         ]);
-        apply_prompt_selection(&mut prompt_body, &session, model, agent, effort)?;
+        apply_prompt_selection(
+            &mut prompt_body,
+            &session,
+            options.model,
+            options.agent,
+            options.effort,
+        )?;
+        if let Some(system) = options.system.filter(|value| !value.trim().is_empty()) {
+            prompt_body.insert("system".to_owned(), Value::String(system.to_owned()));
+        }
         let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
             Value::Object(prompt_body),
             "session prompt body",
         )?;
-        client
-            .session_prompt_async()
-            .session_id(session_id)
-            .directory(&directory)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| api_failure("session prompt"))?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .session_prompt_async()
+                .session_id(session_id)
+                .directory(&directory)
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode prompt submission timed out".into()))?
+        .map_err(|_| api_failure("session prompt"))?;
         let (tx, rx) = mpsc::channel(128);
         tx.send(runtime_event(
             1,
@@ -1392,7 +1425,7 @@ impl AgentRuntime for OpenCodeSidecar {
             ));
         }
         Ok(self
-            .submit_with_attachments(session_id, prompt, Vec::new(), None, None, None)
+            .submit_with_attachments(session_id, prompt, Vec::new(), PromptOptions::default())
             .await?
             .events)
     }

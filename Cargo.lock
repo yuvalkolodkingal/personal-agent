@@ -2983,6 +2983,7 @@ dependencies = [
 name = "personal-agent-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "personal-agent-agent",
  "personal-agent-audio",
  "personal-agent-contracts",

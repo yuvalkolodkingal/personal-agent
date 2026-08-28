@@ -24,6 +24,7 @@ pub use conversation::{
     ControlState, ConversationContext, ConversationError, ConversationState, InputModality,
     ListeningMode, MessageDispatch, MicrophonePrivacy, ModelSelection, StopEffects,
 };
+pub use personal_agent_memory::{Memory, MemoryStore, MemoryTier, MemoryTrust, RecallResult};
 pub use release::{
     ExportDisposition, PersonalDataDisposition, ReleaseArtifact, ReleaseChannel, ReleaseError,
     SignedReleaseManifest, UninstallPlan, UpdateState, UpdateTransaction,
@@ -191,6 +192,25 @@ impl ProfileState {
     #[must_use]
     pub fn projection(&self) -> &AppProjection {
         &self.projection
+    }
+
+    /// Load the encrypted durable memory index for this profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encrypted storage or serialization failure.
+    pub fn memory_snapshot(&self) -> Result<Option<MemoryStore>, CoreError> {
+        Ok(self.store.memory_snapshot(&self.profile_id)?)
+    }
+
+    /// Persist the complete encrypted durable memory index for this profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encrypted storage or serialization failure.
+    pub fn save_memory_snapshot(&mut self, memory: &MemoryStore) -> Result<(), CoreError> {
+        self.store.save_memory_snapshot(&self.profile_id, memory)?;
+        Ok(())
     }
 
     /// Persist a typed user message and return the resulting projection.
@@ -530,6 +550,30 @@ mod tests {
         assert!(reopened.projection().runtime_healthy);
         assert_eq!(reopened.projection().unclean_shutdowns, 1);
         assert!(reopened.projection().recovered_unclean_run);
+    }
+
+    #[test]
+    fn profile_memory_snapshot_survives_reopen() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("memory-profile.db");
+        let secrets = FakeSecretStore::default();
+        let remembered = Memory::explicit_user(
+            "project root is /srv/personal-agent",
+            MemoryTier::Project,
+            "test-event",
+        );
+        {
+            let mut state = ProfileState::open(&database, "default", &secrets).expect("open");
+            let mut memory = MemoryStore::default();
+            memory.upsert(remembered.clone(), None).expect("insert");
+            state.save_memory_snapshot(&memory).expect("save memory");
+        }
+        let reopened = ProfileState::open(&database, "default", &secrets).expect("reopen");
+        let memory = reopened
+            .memory_snapshot()
+            .expect("load memory")
+            .expect("snapshot");
+        assert_eq!(memory.get(remembered.id), Some(&remembered));
     }
 
     #[test]

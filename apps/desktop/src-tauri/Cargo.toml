@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chrono.workspace = true
 personal-agent-audio = { path = "../../../crates/audio", version = "=0.1.0" }
 personal-agent-agent = { path = "../../../crates/agent", version = "=0.1.0" }
 personal-agent-contracts = { path = "../../../crates/contracts", version = "=0.1.0" }

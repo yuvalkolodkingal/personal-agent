@@ -3,14 +3,14 @@
 mod api;
 
 use personal_agent_core::{
-    AppProjection, PersonalAgentConfig, ProfileState, load_or_initialize_config,
+    AppProjection, MemoryStore, PersonalAgentConfig, ProfileState, load_or_initialize_config,
 };
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
 use personal_agent_runtime::{
     AgentRuntime, OpenCodeApiClient, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Mutex, RwLock};
@@ -25,6 +25,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 struct DesktopState {
     profile: Mutex<ProfileState>,
+    memory: Mutex<MemoryStore>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
     turn_clients: RwLock<BTreeMap<String, OpenCodeApiClient>>,
     config: RwLock<PersonalAgentConfig>,
@@ -32,6 +33,7 @@ struct DesktopState {
     sidecar_executable: PathBuf,
     safety_plugin: PathBuf,
     active_session: tokio::sync::Mutex<Option<ActiveSession>>,
+    pending_memory_sessions: tokio::sync::Mutex<BTreeSet<String>>,
     voice_playback: tokio::sync::Mutex<Option<VoicePlayback>>,
     voice_runtime: tokio::sync::Mutex<Option<personal_agent_audio::NeuralVoiceRuntime>>,
     voice_runtime_script: PathBuf,
@@ -441,6 +443,7 @@ fn main() {
             let database = app_data.join("profiles/default.db");
             let mut profile = ProfileState::open(&database, "default", &OsSecretStore)?;
             profile.record_lifecycle_start(previous_unclean_run)?;
+            let memory = profile.memory_snapshot()?.unwrap_or_default();
 
             let safety_plugin = app
                 .path()
@@ -457,6 +460,7 @@ fn main() {
             );
             app.manage(DesktopState {
                 profile: Mutex::new(profile),
+                memory: Mutex::new(memory),
                 runtime: tokio::sync::Mutex::new(sidecar),
                 turn_clients: RwLock::new(BTreeMap::new()),
                 config: RwLock::new(config.config),
@@ -464,6 +468,7 @@ fn main() {
                 sidecar_executable,
                 safety_plugin,
                 active_session: tokio::sync::Mutex::new(None),
+                pending_memory_sessions: tokio::sync::Mutex::new(BTreeSet::new()),
                 voice_playback: tokio::sync::Mutex::new(None),
                 voice_runtime: tokio::sync::Mutex::new(None),
                 voice_runtime_script,
