@@ -158,10 +158,19 @@ fn init_logging(
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main")
-        && let Err(error) = window.show().and_then(|()| window.set_focus())
-    {
-        tracing::warn!(%error, "main window could not be shown");
+    if let Some(window) = app.get_webview_window("main") {
+        // A minimized window is reliably recoverable on Wayland. Calling show alone on a
+        // previously hidden WebKit window can leave the process alive without remapping a
+        // surface, so restore every relevant bit of window state before requesting focus.
+        let result = window
+            .show()
+            .and_then(|()| window.unminimize())
+            .and_then(|()| window.set_focus());
+        if let Err(error) = result {
+            tracing::warn!(%error, "main window could not be restored");
+        }
+    } else {
+        tracing::warn!("main window is unavailable");
     }
 }
 
@@ -419,8 +428,10 @@ fn main() {
                 && let WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
-                if let Err(error) = window.hide() {
-                    tracing::warn!(%error, "main window could not be hidden");
+                // Keep a mapped Wayland surface so tray, second-launch and Super+J restores
+                // cannot strand the application as a background-only process.
+                if let Err(error) = window.minimize() {
+                    tracing::warn!(%error, "main window could not be minimized");
                 }
             }
         })

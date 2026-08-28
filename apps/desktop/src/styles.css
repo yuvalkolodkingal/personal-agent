@@ -3823,6 +3823,7 @@ body {
 }
 .voice-presets,
 .voice-engine-table,
+.voice-wake-panel,
 .voice-latency {
   border: 1px solid var(--line);
   border-radius: 11px;
@@ -3948,6 +3949,56 @@ body {
   border-color: rgba(91, 201, 143, 0.3);
   color: var(--good);
 }
+.voice-wake-panel {
+  min-height: 86px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.3fr) minmax(190px, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 13px 14px;
+}
+.voice-wake-panel > div {
+  display: grid;
+  gap: 5px;
+}
+.voice-wake-panel strong {
+  color: #cfd8e7;
+  font-size: 11px;
+}
+.voice-wake-panel small {
+  max-width: 520px;
+  color: #73819d;
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+.voice-wake-panel > label:not(.wake-toggle) {
+  display: grid;
+  gap: 6px;
+  color: #73819d;
+  font: 500 8px/1 "Noto Sans Mono", monospace;
+}
+.voice-wake-panel > label > input[type="text"],
+.voice-wake-panel > label:not(.wake-toggle) input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #0a0f1b;
+  color: #cfd8e7;
+  padding: 8px 9px;
+  font-size: 9px;
+}
+.wake-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--good);
+  font: 600 7px/1 "Noto Sans Mono", monospace;
+}
+.wake-toggle input {
+  width: 38px;
+  height: 21px;
+  accent-color: var(--accent);
+}
 .voice-latency {
   padding: 12px 14px;
 }
@@ -4011,6 +4062,13 @@ body {
   .voice-engine-table > header span:nth-of-type(2),
   .voice-engine-table > div span:nth-of-type(2) {
     display: none;
+  }
+  .voice-wake-panel {
+    grid-template-columns: 1fr auto;
+  }
+  .voice-wake-panel > label:not(.wake-toggle) {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }
 

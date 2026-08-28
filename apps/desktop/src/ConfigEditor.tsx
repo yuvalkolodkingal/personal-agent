@@ -1057,6 +1057,47 @@ export function ConfigEditor({
                     </i>
                   </div>
                 </section>
+                <section className="voice-wake-panel">
+                  <div>
+                    <span className="eyebrow">HANDS-FREE WAKE</span>
+                    <strong>Open wake recognition</strong>
+                    <small>
+                      Continuously listens for configured phrases with the
+                      local STT engine. Speech after the wake phrase becomes
+                      the command automatically.
+                    </small>
+                  </div>
+                  <label>
+                    <span>Wake phrases</span>
+                    <input
+                      aria-label="Wake phrases"
+                      value={draft.voice.wake_phrases.join(", ")}
+                      onChange={(event) =>
+                        update(
+                          ["wake_phrases"],
+                          event.target.value
+                            .split(",")
+                            .map((phrase) => phrase.trim())
+                            .filter(Boolean),
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="wake-toggle">
+                    <span>
+                      {draft.voice.wake_enabled ? "ARMED ON SAVE" : "OFF"}
+                    </span>
+                    <input
+                      aria-label="Enable open wake recognition"
+                      type="checkbox"
+                      checked={draft.voice.wake_enabled}
+                      disabled={!voice.stt_ready}
+                      onChange={(event) =>
+                        update(["wake_enabled"], event.target.checked)
+                      }
+                    />
+                  </label>
+                </section>
                 <section className="voice-latency">
                   <header>
                     <strong>REALTIME TURN TIMELINE</strong>

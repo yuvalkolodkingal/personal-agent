@@ -85,7 +85,7 @@ const featureAudit: FeatureAuditItem[] = [
     area: "English voice conversation",
     status: "implemented",
     detail:
-      "Moonshine STT, Smart Turn endpointing and Qwen3-TTS, with Whisper/Piper compatibility fallbacks.",
+      "Moonshine STT, local phrase wake recognition, Smart Turn endpointing and Qwen3-TTS, with Whisper/Piper compatibility fallbacks.",
   },
   {
     area: "Encrypted persistent memory",
@@ -164,9 +164,23 @@ const voiceStates: Record<
   armed: {
     glyph: "◈",
     label: "Wake word armed",
-    hint: "Only “Hey Jarvis” is being matched",
+    hint: "Local speech is listening only for “Hey Jarvis”",
     color: "#5bc98f",
     stoppable: false,
+  },
+  arming: {
+    glyph: "◌",
+    label: "Arming wake recognition",
+    hint: "Opening the private local microphone path",
+    color: "#e9b25b",
+    stoppable: false,
+  },
+  wake_detected: {
+    glyph: "◆",
+    label: "Wake phrase detected",
+    hint: "JARVIS is opening a full speech turn",
+    color: "#56d9e8",
+    stoppable: true,
   },
   loading_model: {
     glyph: "↻",
@@ -883,6 +897,8 @@ function ChatView({
     },
     onProjection,
     setComposer,
+    voiceStatus.stt_ready,
+    busy || playbackState !== "idle",
   );
   const activeStt = voiceStatus.stt_ready
     ? voiceStatus.active_stt_backend || config.voice.stt_backend
@@ -897,19 +913,25 @@ function ChatView({
         ? "Preparing voice…"
         : playbackState === "recovering"
           ? "Loading fallback voice…"
-          : voice.state === "loading_model"
-            ? "Loading Moonshine…"
-            : voice.state === "requesting"
-              ? "Opening microphone…"
-              : voice.state === "listening"
-                ? "Listening…"
-                : voice.state === "endpointing"
-                  ? "Finishing your turn…"
-                  : voice.state === "transcribing"
-                    ? "Finalizing transcript…"
-                    : voice.state === "error"
-                      ? "Voice needs attention"
-                      : "Tap to talk";
+          : voice.state === "arming"
+            ? "Arming Hey Jarvis…"
+            : voice.state === "armed"
+              ? "Say Hey Jarvis"
+              : voice.state === "wake_detected"
+                ? "Wake phrase detected"
+                : voice.state === "loading_model"
+                  ? "Loading Moonshine…"
+                  : voice.state === "requesting"
+                    ? "Opening microphone…"
+                    : voice.state === "listening"
+                      ? "Listening…"
+                      : voice.state === "endpointing"
+                        ? "Finishing your turn…"
+                        : voice.state === "transcribing"
+                          ? "Finalizing transcript…"
+                          : voice.state === "error"
+                            ? "Voice needs attention"
+                            : "Tap to talk";
   const capturing = [
     "loading_model",
     "requesting",
@@ -1566,7 +1588,14 @@ function ChatView({
               </button>
               <h2>Ready when you are.</h2>
               <p>
-                Say <strong>“Hey Jarvis”</strong>, hold{" "}
+                {config.voice.wake_enabled && voiceStatus.stt_ready ? (
+                  <>
+                    Say <strong>“Hey Jarvis”</strong>,{" "}
+                  </>
+                ) : (
+                  <>Enable wake recognition in Voice settings, or </>
+                )}
+                hold{" "}
                 <kbd>{config.voice.push_to_talk_hotkey || "Space"}</kbd> to
                 talk, or just type. Everything runs on this machine unless you
                 connect a remote provider.
