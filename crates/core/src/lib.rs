@@ -24,7 +24,10 @@ pub use conversation::{
     ControlState, ConversationContext, ConversationError, ConversationState, InputModality,
     ListeningMode, MessageDispatch, MicrophonePrivacy, ModelSelection, StopEffects,
 };
-pub use personal_agent_memory::{Memory, MemoryStore, MemoryTier, MemoryTrust, RecallResult};
+pub use personal_agent_memory::{
+    FeatureHashEmbedder, Memory, MemoryNamespace, MemoryStore, MemoryTier, MemoryTrust,
+    PersistentMemory, ProjectNode, ProjectRelation, RecallResult, StylePreference, TextEmbedder,
+};
 pub use release::{
     ExportDisposition, PersonalDataDisposition, ReleaseArtifact, ReleaseChannel, ReleaseError,
     SignedReleaseManifest, UninstallPlan, UpdateState, UpdateTransaction,
@@ -210,6 +213,32 @@ impl ProfileState {
     /// Returns an encrypted storage or serialization failure.
     pub fn save_memory_snapshot(&mut self, memory: &MemoryStore) -> Result<(), CoreError> {
         self.store.save_memory_snapshot(&self.profile_id, memory)?;
+        Ok(())
+    }
+
+    /// Load the complete encrypted namespaced memory system for this profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encrypted storage or serialization failure.
+    pub fn persistent_memory_snapshot(&self) -> Result<Option<PersistentMemory>, CoreError> {
+        Ok(self.store.persistent_memory_snapshot(&self.profile_id)?)
+    }
+
+    /// Persist the complete encrypted namespaced memory system and its legacy
+    /// fact/vector view atomically per snapshot kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encrypted storage or serialization failure.
+    pub fn save_persistent_memory_snapshot(
+        &mut self,
+        memory: &PersistentMemory,
+    ) -> Result<(), CoreError> {
+        self.store
+            .save_persistent_memory_snapshot(&self.profile_id, memory)?;
+        self.store
+            .save_memory_snapshot(&self.profile_id, &memory.store)?;
         Ok(())
     }
 
@@ -574,6 +603,39 @@ mod tests {
             .expect("load memory")
             .expect("snapshot");
         assert_eq!(memory.get(remembered.id), Some(&remembered));
+    }
+
+    #[test]
+    fn profile_persistent_memory_system_survives_reopen() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("persistent-memory-profile.db");
+        let secrets = FakeSecretStore::default();
+        let style = StylePreference {
+            id: uuid::Uuid::now_v7(),
+            namespace: MemoryNamespace::Profile("default".into()),
+            description: "Use direct answers".into(),
+            examples: vec!["Lead with the result.".into()],
+            source_event_ids: vec!["test-event".into()],
+            confidence: 1.0,
+            reviewed: true,
+        };
+        {
+            let mut state = ProfileState::open(&database, "default", &secrets).expect("open");
+            let mut memory = PersistentMemory::default();
+            memory.propose_style(style.clone()).expect("style");
+            state
+                .save_persistent_memory_snapshot(&memory)
+                .expect("save memory system");
+        }
+        let reopened = ProfileState::open(&database, "default", &secrets).expect("reopen");
+        let memory = reopened
+            .persistent_memory_snapshot()
+            .expect("load memory system")
+            .expect("snapshot");
+        assert_eq!(
+            memory.style_for(&MemoryNamespace::Profile("default".into())),
+            vec![&style]
+        );
     }
 
     #[test]

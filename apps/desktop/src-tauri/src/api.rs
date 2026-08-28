@@ -5,7 +5,8 @@ use personal_agent_audio::{
     transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 use personal_agent_core::{
-    CONFIG_SCHEMA, Memory, MemoryTier, MemoryTrust, PersonalAgentConfig, parse_config,
+    CONFIG_SCHEMA, FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust,
+    PersonalAgentConfig, ProjectNode, ProjectRelation, StylePreference, TextEmbedder, parse_config,
 };
 use personal_agent_platform::{OsSecretStore, SecretReference, SecretStore};
 use personal_agent_runtime::{AgentRuntime, PromptOptions, RuntimeAnswer, SessionOptions};
@@ -81,14 +82,18 @@ fn store_explicit_memory(
         .memory
         .lock()
         .map_err(|_| "memory store lock is poisoned".to_owned())?;
+    let embedding = FeatureHashEmbedder::new(store.store.embedding_model.dimensions)
+        .embed(content)
+        .map_err(|error| error.to_string())?;
     store
-        .upsert(memory.clone(), None)
+        .store
+        .upsert(memory.clone(), Some(embedding))
         .map_err(|error| error.to_string())?;
     state
         .profile
         .lock()
         .map_err(|_| "profile state lock is poisoned".to_owned())?
-        .save_memory_snapshot(&store)
+        .save_persistent_memory_snapshot(&store)
         .map_err(|error| error.to_string())?;
     Ok(memory)
 }
@@ -103,13 +108,17 @@ fn memory_system_context(
         .lock()
         .map_err(|_| "memory store lock is poisoned".to_owned())?;
     let limit = limit.max(1);
+    let query_embedding = FeatureHashEmbedder::new(store.store.embedding_model.dimensions)
+        .embed(query)
+        .map_err(|error| error.to_string())?;
     let mut memories = store
-        .recall(query, None, limit, chrono::Utc::now())
+        .store
+        .recall(query, Some(&query_embedding), limit, chrono::Utc::now())
         .into_iter()
         .map(|result| result.memory)
         .collect::<Vec<_>>();
     if memories.len() < limit {
-        let mut recent = store.export();
+        let mut recent = store.store.export();
         recent.sort_by_key(|memory| memory.created_at);
         recent.reverse();
         for memory in recent {
@@ -145,7 +154,94 @@ fn memory_system_context(
             );
         }
     }
+    let styles = store.style_for(&MemoryNamespace::Profile("default".into()));
+    if !styles.is_empty() {
+        context.push_str("\nReviewed user writing preferences:\n");
+        for preference in styles.into_iter().take(12) {
+            let _ = writeln!(context, "- {}", preference.description);
+            for example in preference.examples.iter().take(3) {
+                let _ = writeln!(context, "  Example: {example}");
+            }
+        }
+    }
+    let project_nodes = store.project_nodes();
+    if !project_nodes.is_empty() {
+        context.push_str("\nKnown project context:\n");
+        for node in project_nodes.into_iter().take(24) {
+            let namespace = match &node.namespace {
+                MemoryNamespace::Project(project) => project.as_str(),
+                _ => "shared",
+            };
+            let attributes = node
+                .attributes
+                .iter()
+                .take(6)
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                context,
+                "- [{namespace}; {}] {}{}",
+                node.kind,
+                node.name,
+                if attributes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({attributes})")
+                }
+            );
+        }
+        for relation in store.project_relations().iter().take(24) {
+            let _ = writeln!(
+                context,
+                "- relation: {} --{}--> {}",
+                relation.from, relation.relation, relation.to
+            );
+        }
+    }
     Ok(context)
+}
+
+fn append_memory_catalog(
+    object: &mut serde_json::Map<String, Value>,
+    state: &DesktopState,
+) -> Result<(), String> {
+    let memory = state
+        .memory
+        .lock()
+        .map_err(|_| "memory store lock is poisoned".to_owned())?;
+    object.insert(
+        "memories".to_owned(),
+        json!({"available": true, "data": memory.store.export()}),
+    );
+    object.insert(
+        "memory_styles".to_owned(),
+        json!({"available": true, "data": memory.style_preferences()}),
+    );
+    object.insert(
+        "memory_projects".to_owned(),
+        json!({
+            "available": true,
+            "data": {
+                "nodes": memory.project_nodes(),
+                "relations": memory.project_relations(),
+            }
+        }),
+    );
+    Ok(())
+}
+
+fn persist_memory_system(state: &DesktopState) -> Result<(), String> {
+    let memory = state
+        .memory
+        .lock()
+        .map_err(|_| "memory store lock is poisoned".to_owned())?;
+    state
+        .profile
+        .lock()
+        .map_err(|_| "profile state lock is poisoned".to_owned())?
+        .save_persistent_memory_snapshot(&memory)
+        .map_err(|error| error.to_string())
 }
 
 fn canonical_directory(
@@ -244,15 +340,7 @@ pub(crate) async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<V
             "models".to_owned(),
             json!({"available": true, "data": models}),
         );
-        let memories = state
-            .memory
-            .lock()
-            .map_err(|_| "memory store lock is poisoned".to_owned())?
-            .export();
-        object.insert(
-            "memories".to_owned(),
-            json!({"available": true, "data": memories}),
-        );
+        append_memory_catalog(object, &state)?;
     }
     drop(runtime);
     let schema: Value = serde_json::from_str(CONFIG_SCHEMA)
@@ -348,15 +436,7 @@ pub(crate) async fn runtime_catalog(
             "models".to_owned(),
             json!({"available": true, "data": models}),
         );
-        let memories = state
-            .memory
-            .lock()
-            .map_err(|_| "memory store lock is poisoned".to_owned())?
-            .export();
-        object.insert(
-            "memories".to_owned(),
-            json!({"available": true, "data": memories}),
-        );
+        append_memory_catalog(object, &state)?;
     }
     Ok(catalog)
 }
@@ -1151,10 +1231,13 @@ pub(crate) fn domain_action(
                 .lock()
                 .map_err(|_| "memory store lock is poisoned".to_owned())?;
             match action.as_str() {
-                "approve" => memory.approve(id).map_err(|error| error.to_string())?,
-                "reject" => memory.reject(id).map_err(|error| error.to_string())?,
+                "approve" => memory
+                    .store
+                    .approve(id)
+                    .map_err(|error| error.to_string())?,
+                "reject" => memory.store.reject(id).map_err(|error| error.to_string())?,
                 "delete" => {
-                    let _ = memory.delete(id).map_err(|error| error.to_string())?;
+                    let _ = memory.store.delete(id).map_err(|error| error.to_string())?;
                 }
                 _ => unreachable!(),
             }
@@ -1162,7 +1245,7 @@ pub(crate) fn domain_action(
                 .profile
                 .lock()
                 .map_err(|_| "profile state lock is poisoned".to_owned())?
-                .save_memory_snapshot(&memory)
+                .save_persistent_memory_snapshot(&memory)
                 .map_err(|error| error.to_string())?;
             drop(memory);
             let event_type = match action.as_str() {
@@ -1172,6 +1255,166 @@ pub(crate) fn domain_action(
                 _ => unreachable!(),
             };
             persist_domain_event(&state, event_type, &payload)
+        }
+        ("memory", "style_create") => {
+            let description = payload
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "style description is required".to_owned())?;
+            let examples = payload
+                .get("examples")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .take(12)
+                .collect::<Vec<_>>();
+            let style = StylePreference {
+                id: uuid::Uuid::now_v7(),
+                namespace: MemoryNamespace::Profile("default".into()),
+                description: description.into(),
+                examples,
+                source_event_ids: vec![format!("desktop-ui:{}", uuid::Uuid::now_v7())],
+                confidence: 1.0,
+                reviewed: true,
+            };
+            state
+                .memory
+                .lock()
+                .map_err(|_| "memory store lock is poisoned".to_owned())?
+                .propose_style(style.clone())
+                .map_err(|error| error.to_string())?;
+            persist_memory_system(&state)?;
+            persist_domain_event(&state, "memory.style_saved", &json!(style))
+        }
+        ("memory", "style_review") => {
+            let id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "style ID is required".to_owned())?
+                .parse::<uuid::Uuid>()
+                .map_err(|_| "style ID is invalid".to_owned())?;
+            let accept = payload
+                .get("accept")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            state
+                .memory
+                .lock()
+                .map_err(|_| "memory store lock is poisoned".to_owned())?
+                .review_style(id, accept)
+                .map_err(|error| error.to_string())?;
+            persist_memory_system(&state)?;
+            persist_domain_event(
+                &state,
+                if accept {
+                    "memory.style_approved"
+                } else {
+                    "memory.style_rejected"
+                },
+                &payload,
+            )
+        }
+        ("memory", "project_node_create") => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "project memory name is required".to_owned())?;
+            let project = payload
+                .get("project")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("default");
+            let kind = payload
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("project")
+                .trim();
+            let attributes = payload
+                .get("attributes")
+                .and_then(Value::as_object)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.into()))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let node = ProjectNode {
+                id: uuid::Uuid::now_v7(),
+                namespace: MemoryNamespace::Project(project.into()),
+                kind: kind.into(),
+                name: name.into(),
+                attributes,
+                source_event_ids: vec![format!("desktop-ui:{}", uuid::Uuid::now_v7())],
+            };
+            state
+                .memory
+                .lock()
+                .map_err(|_| "memory store lock is poisoned".to_owned())?
+                .upsert_project_node(node.clone())
+                .map_err(|error| error.to_string())?;
+            persist_memory_system(&state)?;
+            persist_domain_event(&state, "memory.project_node_saved", &json!(node))
+        }
+        ("memory", "project_relation_create") => {
+            let parse_id = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{key} is required"))?
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| format!("{key} is invalid"))
+            };
+            let relation = ProjectRelation {
+                from: parse_id("from")?,
+                relation: payload
+                    .get("relation")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "relation is required".to_owned())?
+                    .into(),
+                to: parse_id("to")?,
+                source_event_ids: vec![format!("desktop-ui:{}", uuid::Uuid::now_v7())],
+            };
+            state
+                .memory
+                .lock()
+                .map_err(|_| "memory store lock is poisoned".to_owned())?
+                .link_project_nodes(relation.clone())
+                .map_err(|error| error.to_string())?;
+            persist_memory_system(&state)?;
+            persist_domain_event(&state, "memory.project_relation_saved", &json!(relation))
+        }
+        ("memory", "link_conflict") => {
+            let parse_id = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{key} is required"))?
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| format!("{key} is invalid"))
+            };
+            state
+                .memory
+                .lock()
+                .map_err(|_| "memory store lock is poisoned".to_owned())?
+                .store
+                .link_conflict(parse_id("left")?, parse_id("right")?)
+                .map_err(|error| error.to_string())?;
+            persist_memory_system(&state)?;
+            persist_domain_event(&state, "memory.conflict_linked", &payload)
         }
         ("automation", "create") => {
             let name = payload

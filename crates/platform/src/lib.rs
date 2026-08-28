@@ -1,5 +1,7 @@
 //! Honest cross-platform capability reporting.
 
+pub mod desktop;
+
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};

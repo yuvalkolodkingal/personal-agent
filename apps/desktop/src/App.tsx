@@ -9,6 +9,11 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ConfigEditor } from "./ConfigEditor";
+import { ConnectorManager } from "./ConnectorManager";
+import { ScreenContext } from "./ScreenContext";
+import { McpManagerHost } from "./McpManagerHost";
+import { LocalExecutionPanel } from "./LocalExecutionPanel";
+import { MemorySystemsPanel } from "./MemorySystemsPanel";
 import type {
   AppConfig,
   Bootstrap,
@@ -19,7 +24,17 @@ import type {
   VoiceStatus,
 } from "./types";
 import { eventPayload } from "./types";
-import { useVoiceCapture } from "./useVoiceCapture";
+import {
+  DictationClient,
+  InAppDictationBuffer,
+  transcriptEvent,
+  type DeterministicCommand,
+  type DictationMode,
+} from "./dictation";
+import {
+  useVoiceCapture,
+  type VoiceTranscriptMeta,
+} from "./useVoiceCapture";
 
 const navigation = [
   "Chat",
@@ -88,10 +103,22 @@ const featureAudit: FeatureAuditItem[] = [
       "Moonshine STT, local phrase wake recognition, Smart Turn endpointing and Qwen3-TTS, with Whisper/Piper compatibility fallbacks.",
   },
   {
-    area: "Encrypted persistent memory",
-    status: "implemented",
+    area: "Screen context",
+    status: "partial",
     detail:
-      "Explicit saves, conversational follow-up capture, recall injection, provenance, review and deletion.",
+      "The Browser workspace exposes live active-window context, permission truth and ephemeral pixel capture. Full semantic trees still depend on an OS-native bridge.",
+  },
+  {
+    area: "Desktop visual control",
+    status: "partial",
+    detail:
+      "Generation-bound actions, approvals and postcondition verification are wired. Windows and macOS require signed native helpers; Linux support varies by compositor and installed tools.",
+  },
+  {
+    area: "Encrypted persistent memory",
+    status: "partial",
+    detail:
+      "Encrypted facts, local feature-hash embeddings, hybrid recall, provenance, review and deletion are wired. Writing-style, project-graph and conflict workflows exist in the library but not the desktop snapshot/UI.",
   },
   {
     area: "Sessions and history",
@@ -109,13 +136,13 @@ const featureAudit: FeatureAuditItem[] = [
     area: "Browser workspace",
     status: "partial",
     detail:
-      "Browser policy and safety controls exist; an interactive embedded browser controller is not wired.",
+      "The desktop can start an isolated WebDriver profile, navigate, inspect DOM text and use generation-bound click/type handles. Browser drivers remain an external prerequisite and the browser is not embedded.",
   },
   {
-    area: "Projects and terminal",
+    area: "Projects, terminal and local execution",
     status: "partial",
     detail:
-      "OpenCode files, search, VCS and PTY resources are inspectable; a full persistent terminal surface is not wired.",
+      "Workspace-scoped process and hardened Docker execution APIs are implemented alongside OpenCode file/VCS resources. No dedicated execution UI or true persistent PTY is wired.",
   },
   {
     area: "Artifacts",
@@ -130,10 +157,10 @@ const featureAudit: FeatureAuditItem[] = [
       "The scheduler engine is implemented and tested; desktop-created schedules are not yet executed by a resident runner.",
   },
   {
-    area: "Integrations and skills",
+    area: "App integrations and skills",
     status: "partial",
     detail:
-      "Provider OAuth, MCP and agent catalogs are visible; a connector marketplace and lifecycle controls are not wired.",
+      "GitHub, Gmail, Calendar, Slack, Microsoft Graph and custom REST connections have a GUI, keychain tokens, read-only grants, health and execution boundaries. Provider OAuth/refresh and service-specific workflows remain incomplete.",
   },
   {
     area: "Usage, notifications and updates",
@@ -660,9 +687,32 @@ function ChatView({
   const [turnSeconds, setTurnSeconds] = useState(0);
   const [playbackState, setPlaybackState] = useState("idle");
   const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(null);
+  const [voiceInputMode, setVoiceInputMode] = useState<
+    "agent" | "dictation"
+  >("agent");
+  const [dictationMode, setDictationMode] =
+    useState<DictationMode>("natural");
+  const [voiceMuted, setVoiceMuted] = useState(false);
   const messageListRef = useRef<HTMLDivElement>(null);
   const pushToTalkPressed = useRef(false);
   const completionHandled = useRef(false);
+  const sendInFlight = useRef(false);
+  const busyRef = useRef(busy);
+  const composerRef = useRef(composer);
+  const voiceInputModeRef = useRef(voiceInputMode);
+  const dictationModeRef = useRef(dictationMode);
+  const dictationClient = useRef(new DictationClient());
+  const dictationBuffer = useRef(new InAppDictationBuffer());
+  const dictationQueue = useRef<Promise<void>>(Promise.resolve());
+  const dictationGeneration = useRef(0);
+  const voiceActionsRef = useRef<{ cancel: () => void }>({
+    cancel: () => undefined,
+  });
+  const stopTurnRef = useRef<() => Promise<void>>(async () => undefined);
+  composerRef.current = composer;
+  busyRef.current = busy;
+  voiceInputModeRef.current = voiceInputMode;
+  dictationModeRef.current = dictationMode;
   useEffect(() => {
     let compactRail = window.innerWidth <= 1050;
     let compactInspector = window.innerWidth <= 1320;
@@ -786,6 +836,7 @@ function ChatView({
         ),
       );
       setBusy(false);
+      sendInFlight.current = false;
       setPendingTurn(null);
       setTurnStage(failed ? "Needs attention" : "Ready");
       if (payload.error) setError(payload.error);
@@ -801,7 +852,8 @@ function ChatView({
   const send = useCallback(
     async (raw: string, fromVoice = false) => {
       const text = raw.trim();
-      if (!text || busy) return;
+      if (!text || busy || sendInFlight.current) return;
+      sendInFlight.current = true;
       completionHandled.current = false;
       setPendingTurn(null);
       setBusy(true);
@@ -813,7 +865,11 @@ function ChatView({
         { id: crypto.randomUUID(), role: "user", text },
         { id: "streaming", role: "assistant", text: "", streaming: true },
       ]);
+      composerRef.current = "";
+      dictationBuffer.current.sync("");
       setComposer("");
+      if (voiceInputModeRef.current === "dictation")
+        void dictationClient.current.reset(dictationModeRef.current);
       try {
         if (text.startsWith("/") && activeSession) {
           const [command, ...args] = text.slice(1).split(/\s+/);
@@ -836,6 +892,7 @@ function ChatView({
           );
           completionHandled.current = true;
           setBusy(false);
+          sendInFlight.current = false;
         } else {
           const speak = fromVoice || config.voice.speak_typed_responses;
           const response = await invoke<{
@@ -872,6 +929,7 @@ function ChatView({
         );
         setError(String(caught));
         setBusy(false);
+        sendInFlight.current = false;
       }
     },
     [
@@ -889,17 +947,185 @@ function ChatView({
     ],
   );
 
+  const chooseVoiceInputMode = useCallback(
+    (next: "agent" | "dictation", mode = dictationModeRef.current) => {
+      dictationGeneration.current += 1;
+      voiceActionsRef.current.cancel();
+      setVoiceInputMode(next);
+      voiceInputModeRef.current = next;
+      if (next === "dictation") {
+        setDictationMode(mode);
+        dictationModeRef.current = mode;
+        dictationBuffer.current.sync(composerRef.current);
+      } else {
+        const restored = dictationBuffer.current.cancelProvisional();
+        composerRef.current = restored;
+        setComposer(restored);
+      }
+      dictationQueue.current = dictationQueue.current
+        .catch(() => undefined)
+        .then(() => dictationClient.current.reset(mode));
+    },
+    [],
+  );
+
+  const ingestDictation = useCallback(
+    (text: string, finalResult: boolean, meta: VoiceTranscriptMeta) => {
+      const generation = dictationGeneration.current;
+      dictationQueue.current = dictationQueue.current
+        .catch(() => undefined)
+        .then(async () => {
+          if (
+            voiceInputModeRef.current !== "dictation" ||
+            generation !== dictationGeneration.current
+          )
+            return;
+          const update = await dictationClient.current.ingest(
+            transcriptEvent(
+              text,
+              finalResult,
+              meta.audioEndMs,
+              () => performance.now(),
+            ),
+          );
+          if (
+            voiceInputModeRef.current !== "dictation" ||
+            generation !== dictationGeneration.current
+          )
+            return;
+          const next = dictationBuffer.current.apply(update.operations);
+          composerRef.current = next;
+          setComposer(next);
+          setDictationMode(update.mode);
+          dictationModeRef.current = update.mode;
+          if (update.operations.length)
+            await dictationClient.current.apply(update.operations);
+        })
+        .catch((caught) => setError(`Dictation failed: ${String(caught)}`));
+    },
+    [],
+  );
+
+  const handleLocalVoiceCommand = useCallback(
+    async (command: DeterministicCommand): Promise<boolean> => {
+      switch (command.kind) {
+        case "stop":
+          voiceActionsRef.current.cancel();
+          await invoke("voice_stop").catch(() => undefined);
+          if (busyRef.current) await stopTurnRef.current();
+          return true;
+        case "mute":
+        case "sleep":
+          voiceActionsRef.current.cancel();
+          setVoiceMuted(true);
+          return true;
+        case "unmute":
+        case "wake":
+          setVoiceMuted(false);
+          return true;
+        case "start_dictation":
+          chooseVoiceInputMode("dictation");
+          return true;
+        case "stop_dictation": {
+          const restored = dictationBuffer.current.cancelProvisional();
+          composerRef.current = restored;
+          setComposer(restored);
+          chooseVoiceInputMode("agent");
+          return true;
+        }
+        case "set_dictation_mode":
+          chooseVoiceInputMode("dictation", command.mode);
+          return true;
+        case "launch_application":
+          try {
+            await invoke("desktop_execute", {
+              request: {
+                request_id: crypto.randomUUID(),
+                action: {
+                  action: "launch",
+                  application: {
+                    stable_id: command.name,
+                    arguments: [],
+                  },
+                },
+                authorization: {
+                  user_present: true,
+                  approved_effects: ["launch_application"],
+                  sensitive_text_approved: false,
+                },
+                postconditions: [{ postcondition: "generation_advanced" }],
+              },
+            });
+          } catch (caught) {
+            setError(`Could not launch ${command.name}: ${String(caught)}`);
+          }
+          return true;
+        case "focus_application":
+          // Focus requires a generation-bound window handle; let the agent inspect first.
+          return false;
+      }
+    },
+    [chooseVoiceInputMode],
+  );
+
+  const handleFinalVoiceTranscript = useCallback(
+    async (transcript: string, meta: VoiceTranscriptMeta) => {
+      const inputMode = voiceInputModeRef.current;
+      try {
+        const route = await dictationClient.current.route(
+          transcript,
+          inputMode === "dictation" ? "dictation" : "auto",
+        );
+        if (route.route === "commands") {
+          if (inputMode === "dictation") {
+            const restored = dictationBuffer.current.cancelProvisional();
+            composerRef.current = restored;
+            setComposer(restored);
+          }
+          let handled = true;
+          for (const command of route.commands)
+            handled = (await handleLocalVoiceCommand(command)) && handled;
+          if (!handled) await send(transcript, true);
+          return;
+        }
+        if (inputMode === "dictation") {
+          ingestDictation(transcript, true, meta);
+          return;
+        }
+        await send(
+          route.route === "agent_goal" ? route.prompt : route.text,
+          true,
+        );
+      } catch (caught) {
+        if (inputMode === "dictation") ingestDictation(transcript, true, meta);
+        else await send(transcript, true);
+        setError(`Voice routing recovered from: ${String(caught)}`);
+      }
+    },
+    [handleLocalVoiceCommand, ingestDictation, send],
+  );
+
+  const handlePartialVoiceTranscript = useCallback(
+    (partial: string, meta: VoiceTranscriptMeta) => {
+      if (voiceInputModeRef.current === "dictation")
+        ingestDictation(partial, false, meta);
+      else {
+        composerRef.current = partial;
+        setComposer(partial);
+      }
+    },
+    [ingestDictation],
+  );
+
   const voice = useVoiceCapture(
     config,
-    (transcript) => {
-      setComposer(transcript);
-      void send(transcript, true);
-    },
+    (transcript, meta) => void handleFinalVoiceTranscript(transcript, meta),
     onProjection,
-    setComposer,
+    handlePartialVoiceTranscript,
     voiceStatus.stt_ready,
-    busy || playbackState !== "idle",
+    busy || playbackState !== "idle" || voiceMuted,
   );
+  voiceActionsRef.current.cancel = voice.cancel;
   const activeStt = voiceStatus.stt_ready
     ? voiceStatus.active_stt_backend || config.voice.stt_backend
     : "missing";
@@ -1244,12 +1470,14 @@ function ChatView({
       completionHandled.current = true;
       setPendingTurn(null);
       setBusy(false);
+      sendInFlight.current = false;
       setTurnStage("Stopped");
       setError("");
     } catch (caught) {
       setError(String(caught));
     }
   };
+  stopTurnRef.current = stopTurn;
 
   useEffect(() => {
     const stopCurrentActivity = () => {
@@ -1691,7 +1919,10 @@ function ChatView({
         </div>
         {voice.partialTranscript && capturing && (
           <div className="live-transcript-dock" role="status">
-            <span>PARTIAL</span>
+            <span>
+              {voiceInputMode === "dictation" ? "DICTATION" : "AGENT"} ·
+              PARTIAL
+            </span>
             <p>{voice.partialTranscript}</p>
             <i />
           </div>
@@ -1742,12 +1973,41 @@ function ChatView({
               onChange={(event) => void addFiles(event.target.files)}
             />
           </label>
+          <div className="voice-input-mode" role="group" aria-label="Voice input mode">
+            <button
+              type="button"
+              className={voiceInputMode === "agent" ? "active" : ""}
+              aria-pressed={voiceInputMode === "agent"}
+              onClick={() => chooseVoiceInputMode("agent")}
+              title="Speak to the agent and send automatically"
+            >
+              Agent
+            </button>
+            <button
+              type="button"
+              className={voiceInputMode === "dictation" ? "active" : ""}
+              aria-pressed={voiceInputMode === "dictation"}
+              onClick={() => chooseVoiceInputMode("dictation")}
+              title="Dictate into the composer for review"
+            >
+              Dictation
+            </button>
+          </div>
           <textarea
             aria-label="Message JARVIS"
             rows={1}
             value={composer}
-            placeholder="Message JARVIS…  (/ for commands, @ for files)"
-            onChange={(event) => setComposer(event.target.value)}
+            placeholder={
+              voiceInputMode === "dictation"
+                ? `Dictate in ${dictationMode} mode, review, then Send…`
+                : "Message JARVIS…  (/ for commands, @ for files)"
+            }
+            onChange={(event) => {
+              const value = event.target.value;
+              composerRef.current = value;
+              dictationBuffer.current.sync(value);
+              setComposer(value);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
@@ -1798,11 +2058,21 @@ function ChatView({
           </span>
           <span>STT {activeStt.toUpperCase()}</span>
           <span>TTS {activeTts.toUpperCase()}</span>
+          <span className={voiceInputMode === "dictation" ? "live" : ""}>
+            INPUT {voiceInputMode.toUpperCase()}
+            {voiceInputMode === "dictation"
+              ? ` · ${dictationMode.toUpperCase()}`
+              : ""}
+          </span>
+          {voiceMuted && <span>MUTED / SLEEPING</span>}
           <span className={`voice-runtime-state ${playbackState}`}>
             {playbackState === "speaking"
               ? "SPEAKING"
               : voice.state.replaceAll("_", " ").toUpperCase()}
           </span>
+          {voiceMuted && (
+            <button onClick={() => setVoiceMuted(false)}>Wake voice</button>
+          )}
           <button onClick={() => void invoke("voice_stop")}>Stop audio</button>
         </footer>
       </section>
@@ -2118,6 +2388,12 @@ function DomainView({
   };
   const spec = map[destination]!;
   const memories = resourceData<Json[]>(catalog, "memories", []);
+  const memoryStyles = resourceData<Json[]>(catalog, "memory_styles", []);
+  const memoryProjects = resourceData<{ nodes?: Json[]; relations?: Json[] }>(
+    catalog,
+    "memory_projects",
+    {},
+  );
   const items = destination === "Memory" ? [] : records(history, spec.prefix);
   const refresh = async () => {
     const bootstrap = await invoke<Bootstrap>("bootstrap");
@@ -2251,6 +2527,14 @@ function DomainView({
           <button className="primary">Create</button>
           {error && <p className="field-error">{error}</p>}
         </form>
+        {destination === "Memory" && (
+          <MemorySystemsPanel
+            memories={memories}
+            styles={memoryStyles}
+            projects={memoryProjects}
+            onChanged={refresh}
+          />
+        )}
       </section>
       <aside className="page-side">
         <div className="card-label">
@@ -2503,6 +2787,9 @@ function ProjectView({
             over its authenticated PTY channel; active sessions and controls
             remain visible here.
           </p>
+          <LocalExecutionPanel
+            workingDirectory={config.runtime.working_directory}
+          />
         </div>
       )}
       {tab === "worktrees" && (
@@ -2537,43 +2824,21 @@ function ProjectView({
 
 function IntegrationsView({
   catalog,
-  config,
-  onCatalog,
 }: {
   catalog: RuntimeCatalog;
   config: AppConfig;
   onCatalog: (catalog: RuntimeCatalog) => void;
 }) {
-  const [error, setError] = useState("");
   const providers = asArray(resourceData(catalog, "providers", []));
-  const mcp = asArray(resourceData(catalog, "mcp", []));
-  const toggle = async (name: string, connect: boolean) => {
-    try {
-      await invoke("runtime_operation", {
-        kind: connect ? "mcp_connect" : "mcp_disconnect",
-        identifier: name,
-        sessionId: null,
-        directory: config.runtime.working_directory,
-        payload: {},
-        confirmed: false,
-      });
-      onCatalog(
-        await invoke("runtime_catalog", {
-          directory: config.runtime.working_directory,
-        }),
-      );
-    } catch (caught) {
-      setError(String(caught));
-    }
-  };
   return (
     <section className="catalog-page">
       <SectionHeader
         eyebrow="EXTENSIONS"
         title="Providers, MCP servers and integrations"
       />
-      {error && <p className="error-banner">{error}</p>}
-      <div className="catalog-columns">
+      <ConnectorManager />
+      <McpManagerHost />
+      <div className="catalog-columns integrations-providers">
         <div>
           <h3>Providers</h3>
           {providers.length ? (
@@ -2593,31 +2858,6 @@ function IntegrationsView({
               detail={
                 catalog.providers?.reason ?? "Connect a provider in Settings."
               }
-            />
-          )}
-        </div>
-        <div>
-          <h3>MCP servers</h3>
-          {mcp.length ? (
-            mcp.map((item) => {
-              const name = String(item.name ?? item.id);
-              const connected = ["connected", "ready"].includes(
-                String(item.status).toLowerCase(),
-              );
-              return (
-                <article key={name}>
-                  <strong>{name}</strong>
-                  <small>{String(item.status ?? "disconnected")}</small>
-                  <button onClick={() => void toggle(name, !connected)}>
-                    {connected ? "Disconnect" : "Connect"}
-                  </button>
-                </article>
-              );
-            })
-          ) : (
-            <Empty
-              title="No MCP servers configured"
-              detail="Add MCP configuration under Settings → OpenCode."
             />
           )}
         </div>
@@ -2698,33 +2938,64 @@ function HistoryView({ history }: { history: EventEnvelope[] }) {
 }
 function BrowserView({ config }: { config: AppConfig }) {
   const browser = config.browser as Json;
+  const [address, setAddress] = useState("https://example.com");
+  const [browserName, setBrowserName] = useState("firefox");
+  const [snapshot, setSnapshot] = useState<Json | null>(null);
+  const [opened, setOpened] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const run = async (operation: "open" | "navigate" | "snapshot" | "close" | "takeover") => {
+    setBusy(true);
+    setError("");
+    try {
+      if (operation === "open") {
+        setSnapshot(await invoke<Json>("browser_open", { browserName, profileId: `desktop-${crypto.randomUUID()}` }));
+        setOpened(true);
+      } else if (operation === "navigate") {
+        setSnapshot(await invoke<Json>("browser_navigate", { url: address }));
+      } else if (operation === "close") {
+        await invoke("browser_close");
+        setOpened(false);
+        setSnapshot(null);
+      } else {
+        const result = await invoke<Json>("browser_action", { operation, handle: null, text: null });
+        if (operation === "snapshot") setSnapshot(result);
+      }
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const nodeAction = async (operation: "click" | "type", handle: unknown) => {
+    const text = operation === "type" ? window.prompt("Text to type") : null;
+    if (operation === "type" && text === null) return;
+    setBusy(true);
+    setError("");
+    try {
+      setSnapshot(await invoke<Json>("browser_action", { operation, handle, text }));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const handles = snapshot && Array.isArray(snapshot.handles) ? snapshot.handles : [];
   return (
     <section className="browser-page">
       <SectionHeader
         eyebrow="ISOLATED BROWSER"
         title="Browser automation boundaries"
       />
+      {error && <p className="error-banner">{error}</p>}
       <div className="browser-frame">
         <div className="browser-address">
           <span>◎</span>
-          <input
-            readOnly
-            value={
-              browser.enabled
-                ? "Isolated browser enabled"
-                : "Browser disabled in configuration"
-            }
-          />
-          <button disabled={!browser.enabled}>Open profile</button>
+          <select aria-label="Browser engine" value={browserName} onChange={(event) => setBrowserName(event.target.value)} disabled={opened}><option value="firefox">Firefox</option><option value="chrome">Chrome</option><option value="MicrosoftEdge">Edge</option><option value="safari">Safari</option></select>
+          <input value={address} onChange={(event) => setAddress(event.target.value)} placeholder="https://…" />
+          {!opened ? <button disabled={!browser.enabled || busy} onClick={() => void run("open")}>{busy ? "Opening…" : "Open isolated profile"}</button> : <><button disabled={busy} onClick={() => void run("navigate")}>Go</button><button disabled={busy} onClick={() => void run("snapshot")}>Refresh DOM</button><button disabled={busy} onClick={() => void run("takeover")}>Take over</button><button disabled={busy} onClick={() => void run("close")}>Close</button></>}
         </div>
-        <Empty
-          title={
-            browser.enabled
-              ? "Browser profile is ready for an agent session"
-              : "Browser automation is off"
-          }
-          detail="Enable it in Settings. Isolated profiles, quarantined downloads, domain controls, and personal-profile opt-in are enforced by configuration."
-        />
+        {snapshot ? <div className="browser-snapshot"><header><div><strong>{String(snapshot.title ?? "Untitled page")}</strong><small>{String(snapshot.url ?? address)}</small></div><span>generation {String(snapshot.generation ?? "?")}</span></header><pre>{String(snapshot.text ?? "")}</pre><div className="browser-handle-list">{handles.map((handle, index) => <article key={index}><span>Interactive element {index + 1}</span><button onClick={() => void nodeAction("click", handle)}>Click</button><button onClick={() => void nodeAction("type", handle)}>Type</button></article>)}</div></div> : <Empty title={browser.enabled ? "Open an isolated browser profile" : "Browser automation is off"} detail="Enable it in Settings. The app starts an installed WebDriver, uses DOM-first handles, and invalidates every handle after the page changes." />}
       </div>
       <div className="policy-cards">
         {Object.entries(browser).map(([name, value]) => (
@@ -2738,6 +3009,7 @@ function BrowserView({ config }: { config: AppConfig }) {
           </article>
         ))}
       </div>
+      <ScreenContext />
     </section>
   );
 }

@@ -50,5 +50,24 @@ Capture exposes explicit `loading_model`, `listening`, `endpointing`, and
 barge-in. Barge-in invalidates in-flight synthesis as well as stopping current
 playback, so late audio cannot begin after the user interrupts it.
 
+### Native capability workspaces
+
+The desktop UI includes bounded, permission-aware workspaces for screen
+context and control, isolated WebDriver browsing, workspace and Docker command
+execution, persistent memory, and service integrations. Unsupported operating
+system capabilities are shown as degraded with a concrete reason; they do not
+silently fall back to unrestricted input or filesystem access.
+
+### GUI MCP manager
+
+The MCP workspace manages local stdio and remote HTTP/SSE servers without
+editing configuration files. It supports manual definitions, imports and
+exports, per-tool permissions, enable/disable/restart, health and logs, test
+calls with argument-bound confirmation, update/rollback, uninstall and purge.
+Remote servers that require OAuth open their validated authorization flow from
+the Connect button. Definitions persist with mode `0600`, secrets stay in the
+operating-system keychain, and executable calls pass through the same native
+policy gateway as other tools.
+
 See [SPEC.md](SPEC.md), [ROADMAP.md](ROADMAP.md), and
 [docs/architecture/system.md](docs/architecture/system.md).

@@ -415,6 +415,34 @@ impl EventStore {
     ) -> Result<Option<personal_agent_memory::MemoryStore>, StorageError> {
         load_snapshot(&self.connection, "memory-index", profile_id)
     }
+
+    /// Atomically persist the complete namespaced memory system.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn save_persistent_memory_snapshot(
+        &mut self,
+        profile_id: &str,
+        snapshot: &personal_agent_memory::PersistentMemory,
+    ) -> Result<(), StorageError> {
+        save_snapshot(
+            &mut self.connection,
+            "memory-system-v2",
+            profile_id,
+            snapshot,
+        )
+    }
+
+    /// Load the complete namespaced memory system; absence is `Ok(None)`.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn persistent_memory_snapshot(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<personal_agent_memory::PersistentMemory>, StorageError> {
+        load_snapshot(&self.connection, "memory-system-v2", profile_id)
+    }
 }
 
 fn save_snapshot<T: serde::Serialize>(

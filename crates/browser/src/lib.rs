@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use url::Url;
 
+mod webdriver;
+
+pub use webdriver::{WebDriverBrowser, WebDriverConfig, WebDriverProcess};
+
 /// Opaque node handle valid only for one page generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeHandle {

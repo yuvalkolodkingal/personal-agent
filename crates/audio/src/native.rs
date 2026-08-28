@@ -12,6 +12,7 @@ use tokio::process::{Child, Command};
 
 /// Resolved local voice engines and models. Missing components remain explicit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // Readiness probes are independent hardware/runtime facts.
 pub struct NativeVoiceStatus {
     pub stt_ready: bool,
     pub tts_ready: bool,
@@ -53,6 +54,7 @@ pub struct NativeVoiceConfig {
 
 /// Locate bundled/downloaded engines, honoring validated explicit overrides.
 #[must_use]
+#[allow(clippy::too_many_lines)] // A single probe preserves the explicit fallback order.
 pub fn discover_native_voice(
     voice_root: &Path,
     stt_backend: &str,
@@ -258,6 +260,11 @@ fn request_stem(prefix: &str) -> String {
 }
 
 #[allow(clippy::cast_possible_truncation)] // Samples are explicitly clamped to the i16 range.
+/// Write normalized mono samples as a PCM WAV file for local inference engines.
+///
+/// # Errors
+///
+/// Returns an [`AudioError`] for invalid samples or a file-system write failure.
 pub fn write_pcm_wav(path: &Path, samples: &[f32], sample_rate_hz: u32) -> Result<(), AudioError> {
     if samples.is_empty() || !(8_000..=192_000).contains(&sample_rate_hz) {
         return Err(AudioError::Processing(

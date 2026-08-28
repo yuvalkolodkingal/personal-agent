@@ -7,14 +7,24 @@ license.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
+image.workspace = true
 personal-agent-audio = { path = "../../../crates/audio", version = "=0.1.0" }
 personal-agent-agent = { path = "../../../crates/agent", version = "=0.1.0" }
+personal-agent-browser = { path = "../../../crates/browser", version = "=0.1.0" }
+personal-agent-connectors = { path = "../../../crates/connectors", version = "=0.1.0" }
+personal-agent-context = { path = "../../../crates/context", version = "=0.1.0" }
 personal-agent-contracts = { path = "../../../crates/contracts", version = "=0.1.0" }
 personal-agent-core = { path = "../../../crates/core", version = "=0.1.0" }
 personal-agent-migration = { path = "../../../crates/migration", version = "=0.1.0" }
+personal-agent-local-execution = { path = "../../../crates/local-execution", version = "=0.1.0" }
+personal-agent-mcp-manager = { path = "../../../crates/mcp-manager", version = "=0.1.0" }
 personal-agent-platform = { path = "../../../crates/platform", version = "=0.1.0" }
 personal-agent-runtime = { path = "../../../crates/runtime", version = "=0.1.0" }
+personal-agent-policy = { path = "../../../crates/policy", version = "=0.1.0" }
+personal-agent-tools = { path = "../../../crates/tools", version = "=0.1.0" }
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -24,11 +34,13 @@ tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-global-shortcut.workspace = true
 tauri-plugin-single-instance.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

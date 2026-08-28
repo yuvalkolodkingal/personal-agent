@@ -43,6 +43,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `bs58 0.5.1` — MIT/Apache-2.0 — `pkg:cargo/bs58@0.5.1`
 - `bumpalo 3.20.3` — MIT OR Apache-2.0 — `pkg:cargo/bumpalo@3.20.3`
 - `bytemuck 1.25.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/bytemuck@1.25.2`
+- `byteorder-lite 0.1.0` — Unlicense OR MIT — `pkg:cargo/byteorder-lite@0.1.0`
 - `byteorder 1.5.0` — Unlicense OR MIT — `pkg:cargo/byteorder@1.5.0`
 - `bytes 1.12.1` — MIT — `pkg:cargo/bytes@1.12.1`
 - `cairo-rs 0.18.5` — MIT — `pkg:cargo/cairo-rs@0.18.5`
@@ -202,6 +203,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `ident_case 1.0.1` — MIT/Apache-2.0 — `pkg:cargo/ident_case@1.0.1`
 - `idna 1.1.0` — MIT OR Apache-2.0 — `pkg:cargo/idna@1.1.0`
 - `idna_adapter 1.2.2` — Apache-2.0 OR MIT — `pkg:cargo/idna_adapter@1.2.2`
+- `image 0.25.9` — MIT OR Apache-2.0 — `pkg:cargo/image@0.25.9`
 - `indexmap 1.9.3` — Apache-2.0 OR MIT — `pkg:cargo/indexmap@1.9.3`
 - `indexmap 2.14.0` — Apache-2.0 OR MIT — `pkg:cargo/indexmap@2.14.0`
 - `infer 0.19.0` — MIT — `pkg:cargo/infer@0.19.0`
@@ -244,6 +246,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `mime 0.3.17` — MIT OR Apache-2.0 — `pkg:cargo/mime@0.3.17`
 - `miniz_oxide 0.8.9` — MIT OR Zlib OR Apache-2.0 — `pkg:cargo/miniz_oxide@0.8.9`
 - `mio 1.2.2` — MIT — `pkg:cargo/mio@1.2.2`
+- `moxcms 0.7.11` — BSD-3-Clause OR Apache-2.0 — `pkg:cargo/moxcms@0.7.11`
 - `muda 0.19.3` — Apache-2.0 OR MIT — `pkg:cargo/muda@0.19.3`
 - `multimap 0.10.1` — MIT OR Apache-2.0 — `pkg:cargo/multimap@0.10.1`
 - `ndk-sys 0.6.0+11769913` — MIT OR Apache-2.0 — `pkg:cargo/ndk-sys@0.6.0+11769913`
@@ -332,6 +335,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `protoc-bin-vendored-macos-x86_64 3.2.0` — MIT — `pkg:cargo/protoc-bin-vendored-macos-x86_64@3.2.0`
 - `protoc-bin-vendored-win32 3.2.0` — MIT — `pkg:cargo/protoc-bin-vendored-win32@3.2.0`
 - `protoc-bin-vendored 3.2.0` — MIT — `pkg:cargo/protoc-bin-vendored@3.2.0`
+- `pxfm 0.1.30` — BSD-3-Clause OR Apache-2.0 — `pkg:cargo/pxfm@0.1.30`
 - `quick-xml 0.41.0` — MIT — `pkg:cargo/quick-xml@0.41.0`
 - `quote 1.0.47` — MIT OR Apache-2.0 — `pkg:cargo/quote@1.0.47`
 - `r-efi 5.3.0` — MIT OR Apache-2.0 OR LGPL-2.1-or-later — `pkg:cargo/r-efi@5.3.0`

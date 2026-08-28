@@ -500,6 +500,18 @@
           "expression": "Unlicense OR MIT"
         }
       ],
+      "name": "byteorder-lite",
+      "purl": "pkg:cargo/byteorder-lite@0.1.0",
+      "type": "library",
+      "version": "0.1.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
       "name": "byteorder",
       "purl": "pkg:cargo/byteorder@1.5.0",
       "type": "library",
@@ -2405,6 +2417,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "image",
+      "purl": "pkg:cargo/image@0.25.9",
+      "type": "library",
+      "version": "0.25.9"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "Apache-2.0 OR MIT"
         }
       ],
@@ -2904,6 +2928,18 @@
       "purl": "pkg:cargo/mio@1.2.2",
       "type": "library",
       "version": "1.2.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR Apache-2.0"
+        }
+      ],
+      "name": "moxcms",
+      "purl": "pkg:cargo/moxcms@0.7.11",
+      "type": "library",
+      "version": "0.7.11"
     },
     {
       "group": "crates.io",
@@ -3960,6 +3996,18 @@
       "purl": "pkg:cargo/protoc-bin-vendored@3.2.0",
       "type": "library",
       "version": "3.2.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR Apache-2.0"
+        }
+      ],
+      "name": "pxfm",
+      "purl": "pkg:cargo/pxfm@0.1.30",
+      "type": "library",
+      "version": "0.1.30"
     },
     {
       "group": "crates.io",
@@ -7250,7 +7298,7 @@
       "version": "0.1.0"
     }
   },
-  "serialNumber": "urn:uuid:b448d270-d9c1-5f58-be4f-c9fe1903020c",
+  "serialNumber": "urn:uuid:dc35df7c-47ee-55d3-afee-0bb834ebde26",
   "specVersion": "1.6",
   "version": 1
 }

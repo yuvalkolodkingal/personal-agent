@@ -19,6 +19,12 @@ export type WakePhraseMatch = {
   remainder: string;
 };
 
+export type VoiceTranscriptMeta = {
+  final: boolean;
+  source: "capture" | "wake";
+  audioEndMs?: number;
+};
+
 function normalizedWords(value: string) {
   return value
     .toLocaleLowerCase("en-US")
@@ -33,7 +39,12 @@ export function matchWakePhrase(
   transcript: string,
   phrases: string[],
 ): WakePhraseMatch | null {
-  const words = normalizedWords(transcript);
+  const words = Array.from(transcript.matchAll(/[a-z0-9']+/gi)).map(
+    (match) => ({
+      normalized: match[0].toLocaleLowerCase("en-US"),
+      end: (match.index ?? 0) + match[0].length,
+    }),
+  );
   const candidates = phrases
     .map((phrase) => ({ phrase, words: normalizedWords(phrase) }))
     .filter((candidate) => candidate.words.length)
@@ -46,12 +57,16 @@ export function matchWakePhrase(
     ) {
       if (
         candidate.words.every(
-          (word, offset) => words[start + offset] === word,
+          (word, offset) => words[start + offset]?.normalized === word,
         )
       ) {
+        const end = words[start + candidate.words.length - 1]?.end ?? 0;
         return {
           phrase: candidate.phrase,
-          remainder: words.slice(start + candidate.words.length).join(" "),
+          remainder: transcript
+            .slice(end)
+            .replace(/^[\s,.:;!?—–-]+/, "")
+            .trim(),
         };
       }
     }
@@ -91,9 +106,9 @@ function mergeChunks(chunks: Float32Array[]) {
 
 export function useVoiceCapture(
   config: AppConfig,
-  onTranscript: (text: string) => void,
+  onTranscript: (text: string, meta: VoiceTranscriptMeta) => void,
   onProjection: (projection: Projection) => void,
-  onPartialTranscript?: (text: string) => void,
+  onPartialTranscript?: (text: string, meta: VoiceTranscriptMeta) => void,
   wakeReady = true,
   wakeSuspended = false,
 ) {
@@ -144,10 +159,14 @@ export function useVoiceCapture(
   }, []);
 
   const publishPartial = useCallback(
-    (text: string) => {
+    (
+      text: string,
+      meta: VoiceTranscriptMeta = { final: false, source: "capture" },
+      notify = true,
+    ) => {
       latestPartial.current = text;
       setPartialTranscript(text);
-      onPartialTranscript?.(text);
+      if (notify) onPartialTranscript?.(text, meta);
     },
     [onPartialTranscript],
   );
@@ -322,11 +341,18 @@ export function useVoiceCapture(
             )
               return;
             lastWakeDetectedAt.current = detectedAt;
-            publishPartial(match.phrase);
+            publishPartial(
+              match.phrase,
+              { final: false, source: "wake" },
+              false,
+            );
             stopWakeCapture();
             transition("wake_detected");
             if (match.remainder) {
-              onTranscriptRef.current(match.remainder);
+              onTranscriptRef.current(match.remainder, {
+                final: true,
+                source: "wake",
+              });
               transition("idle");
             } else {
               await startRef.current();
@@ -376,6 +402,7 @@ export function useVoiceCapture(
     (audio: Float32Array, sampleRate: number) => {
       if (!neuralStreaming.current || !audio.length) return;
       const samples = downsample(audio, sampleRate);
+      const audioEndMs = performance.now();
       streamQueue.current = streamQueue.current
         .then(async () => {
           if (streamFailure.current) return;
@@ -383,7 +410,12 @@ export function useVoiceCapture(
             samples,
             sampleRateHz: 16_000,
           });
-          if (result.text?.trim()) publishPartial(result.text.trim());
+          if (result.text?.trim())
+            publishPartial(result.text.trim(), {
+              final: false,
+              source: "capture",
+              audioEndMs,
+            });
         })
         .catch((caught) => {
           streamFailure.current = String(caught);
@@ -417,6 +449,7 @@ export function useVoiceCapture(
         streamingSamples.current = 0;
       }
       const merged = mergeChunks(chunks.current);
+      const audioEndMs = performance.now();
       chunks.current = [];
       stream.current = null;
       context.current = null;
@@ -450,8 +483,16 @@ export function useVoiceCapture(
           throw new Error(
             "No speech was detected. Check the selected microphone and input level.",
           );
-        publishPartial(transcript.text.trim());
-        onTranscript(transcript.text.trim());
+        publishPartial(
+          transcript.text.trim(),
+          { final: true, source: "capture", audioEndMs },
+          false,
+        );
+        onTranscript(transcript.text.trim(), {
+          final: true,
+          source: "capture",
+          audioEndMs,
+        });
         transition("idle");
       } catch (caught) {
         setError(
@@ -542,7 +583,7 @@ export function useVoiceCapture(
     turnCheckInFlight.current = false;
     turnDeferrals.current = 0;
     noiseFloor.current = 0.005;
-    publishPartial("");
+    publishPartial("", { final: false, source: "capture" }, false);
     setError("");
     transition("loading_model");
     try {

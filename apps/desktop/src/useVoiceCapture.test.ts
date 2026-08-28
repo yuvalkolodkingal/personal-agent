@@ -10,7 +10,7 @@ describe("wake phrase matching", () => {
       ]),
     ).toEqual({
       phrase: "hey jarvis",
-      remainder: "what's on my calendar",
+      remainder: "What's on my calendar?",
     });
   });
 
@@ -23,5 +23,14 @@ describe("wake phrase matching", () => {
 
   it("does not trigger on partial words", () => {
     expect(matchWakePhrase("Ask Jarvison to help", ["jarvis"])).toBeNull();
+  });
+
+  it("preserves proper names and punctuation after the wake phrase", () => {
+    expect(
+      matchWakePhrase("Hey Jarvis, email Yuval about GitHub.", ["hey jarvis"]),
+    ).toEqual({
+      phrase: "hey jarvis",
+      remainder: "email Yuval about GitHub.",
+    });
   });
 });

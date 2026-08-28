@@ -398,6 +398,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "byteorder-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2014,6 +2020,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "image"
+version = "0.25.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6506c6c10786659413faa717ceebcb8f70731c0a60cbae39795fdf114519c1a"
+dependencies = [
+ "bytemuck",
+ "byteorder-lite",
+ "moxcms",
+ "num-traits",
+ "png 0.18.1",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2415,6 +2434,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
+dependencies = [
+ "num-traits",
+ "pxfm",
 ]
 
 [[package]]
@@ -2932,9 +2961,39 @@ name = "personal-agent-browser"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "reqwest",
  "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "personal-agent-connectors"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "personal-agent-context"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "personal-agent-platform",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -2983,14 +3042,24 @@ dependencies = [
 name = "personal-agent-desktop"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "image",
  "personal-agent-agent",
  "personal-agent-audio",
+ "personal-agent-browser",
+ "personal-agent-connectors",
+ "personal-agent-context",
  "personal-agent-contracts",
  "personal-agent-core",
+ "personal-agent-local-execution",
+ "personal-agent-mcp-manager",
  "personal-agent-migration",
  "personal-agent-platform",
+ "personal-agent-policy",
  "personal-agent-runtime",
+ "personal-agent-tools",
  "reqwest",
  "secrecy",
  "serde",
@@ -3001,13 +3070,40 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-single-instance",
+ "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webkit2gtk",
+]
+
+[[package]]
+name = "personal-agent-local-execution"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "personal-agent-mcp-manager"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3570,6 +3666,12 @@ name = "protoc-bin-vendored-win32"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
+
+[[package]]
+name = "pxfm"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quick-xml"

@@ -24,6 +24,10 @@ impl NeuralVoiceRuntime {
     }
 
     /// Start the worker and validate its protocol greeting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AudioError`] when the process cannot start or its greeting is invalid.
     pub async fn start(python: &Path, script: &Path, root: &Path) -> Result<Self, AudioError> {
         if !python.is_file() || !script.is_file() {
             return Err(AudioError::Unavailable(
@@ -74,6 +78,10 @@ impl NeuralVoiceRuntime {
     }
 
     /// Send one bounded request. The caller serializes access to this worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AudioError`] for worker I/O, protocol, process, or timeout failures.
     pub async fn request(
         &mut self,
         command: &str,

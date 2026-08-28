@@ -1,9 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod capabilities;
+mod mcp_host;
+mod native_desktop;
 
 use personal_agent_core::{
-    AppProjection, MemoryStore, PersonalAgentConfig, ProfileState, load_or_initialize_config,
+    AppProjection, PersistentMemory, PersonalAgentConfig, ProfileState, load_or_initialize_config,
 };
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
@@ -18,14 +21,14 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::path::BaseDirectory;
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tracing_subscriber::util::SubscriberInitExt;
 
 struct DesktopState {
     profile: Mutex<ProfileState>,
-    memory: Mutex<MemoryStore>,
+    memory: Mutex<PersistentMemory>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
     turn_clients: RwLock<BTreeMap<String, OpenCodeApiClient>>,
     config: RwLock<PersonalAgentConfig>,
@@ -428,11 +431,9 @@ fn main() {
                 && let WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
-                // Keep a mapped Wayland surface so tray, second-launch and Super+J restores
-                // cannot strand the application as a background-only process.
-                if let Err(error) = window.minimize() {
-                    tracing::warn!(%error, "main window could not be minimized");
-                }
+                // The native close control must mean quit. Super+J and the desktop launcher
+                // start the user service again when the user wants to reopen the app.
+                window.app_handle().exit(0);
             }
         })
         .setup(|app| {
@@ -454,7 +455,11 @@ fn main() {
             let database = app_data.join("profiles/default.db");
             let mut profile = ProfileState::open(&database, "default", &OsSecretStore)?;
             profile.record_lifecycle_start(previous_unclean_run)?;
-            let memory = profile.memory_snapshot()?.unwrap_or_default();
+            let memory = if let Some(memory) = profile.persistent_memory_snapshot()? {
+                memory
+            } else {
+                PersistentMemory::from_store(profile.memory_snapshot()?.unwrap_or_default())
+            };
 
             let safety_plugin = app
                 .path()
@@ -469,6 +474,8 @@ fn main() {
                 &app_data,
                 &config.config,
             );
+            app.manage(capabilities::CapabilityState::load(&app_data)?);
+            app.manage(mcp_host::McpHostState::load(&app_data)?);
             app.manage(DesktopState {
                 profile: Mutex::new(profile),
                 memory: Mutex::new(memory),
@@ -513,6 +520,19 @@ fn main() {
                 };
                 tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
                 persist_runtime_health(&state, &health);
+                if health.healthy {
+                    let mcp = handle.state::<mcp_host::McpHostState>();
+                    match mcp_host::restore_enabled_servers(&mcp, &state).await {
+                        Ok(snapshot) => {
+                            if let Err(error) = handle.emit("mcp-manager://changed", snapshot) {
+                                tracing::warn!(%error, "restored MCP snapshot could not be emitted");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "persisted MCP servers could not be synchronized");
+                        }
+                    }
+                }
             });
             Ok(())
         })
@@ -548,6 +568,28 @@ fn main() {
             api::voice_self_test,
             api::voice_stop,
             api::voice_install,
+            capabilities::connector_list,
+            capabilities::connector_create,
+            capabilities::connector_action,
+            capabilities::connector_set_grants,
+            capabilities::connector_execute,
+            capabilities::browser_open,
+            capabilities::browser_navigate,
+            capabilities::browser_action,
+            capabilities::browser_close,
+            capabilities::local_execute,
+            capabilities::docker_execute,
+            capabilities::dictation_ingest,
+            capabilities::dictation_apply,
+            capabilities::voice_route,
+            capabilities::dictation_latency_report,
+            capabilities::dictation_reset,
+            capabilities::desktop_status,
+            capabilities::desktop_set_capture,
+            capabilities::desktop_snapshot,
+            capabilities::desktop_execute,
+            mcp_host::mcp_manager_snapshot,
+            mcp_host::mcp_manager_execute,
             migration_dry_run,
             migration_import,
         ]);

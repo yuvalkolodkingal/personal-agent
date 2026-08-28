@@ -1,8 +1,16 @@
 //! Replaceable, privacy-aware audio pipeline and deterministic endpointing primitives.
 
+mod dictation;
 mod native;
 mod neural;
 
+pub use dictation::{
+    ApplicationPlan, CommandRouter, DeterministicCommand, DictationEngine, DictationError,
+    DictationLatencyMetrics, DictationMode, DictationTarget, DictationToken, DictationUpdate,
+    EditOperation, EditReceipt, EditStrategy, Formatting, LatencyDistribution, LatencyReport,
+    Occurrence, PartialTranscript, RouteContext, TargetCapabilities, TokenStability, VoiceRoute,
+    apply_verified, plan_edit,
+};
 pub use native::{
     NativeVoiceConfig, NativeVoiceStatus, discover_native_voice, play_wav, synthesize_piper,
     transcribe_pcm, transcribe_wav, write_pcm_wav,
