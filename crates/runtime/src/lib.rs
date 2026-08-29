@@ -567,25 +567,176 @@ fn authorize_coding_tool(tool: &str, arguments: &Value, directory: &Path) -> Res
         if command.is_empty() || command.len() > 16 * 1024 || command.contains('\0') {
             return Err("bash command is empty or exceeds the native limit".into());
         }
-        let normalized = command.to_ascii_lowercase();
-        if [
-            "rm -rf",
-            "git reset --hard",
-            "git clean -",
-            "sudo ",
-            "doas ",
-            "mkfs",
-            "shutdown",
-            "reboot",
-            "> /dev/",
-        ]
-        .iter()
-        .any(|forbidden| normalized.contains(forbidden))
-        {
+        if destructive_shell_command(command) {
             return Err("destructive or privileged shell command is blocked natively".into());
         }
     }
     Ok(())
+}
+
+fn destructive_shell_command(command: &str) -> bool {
+    let normalized = normalize_shell_command(command);
+    let words = split_shell_words(&normalized)
+        .unwrap_or_else(|| normalized.split_whitespace().map(str::to_owned).collect());
+
+    if destructive_token_sequence(&words) || redirects_to_raw_block_device(&words) {
+        return true;
+    }
+
+    // Token matching is the primary check. Keep the coarse substring pass as a second net for
+    // malformed shell fragments and syntax that the deliberately small tokenizer does not model.
+    [
+        "rm -rf",
+        "git reset --hard",
+        "git clean -",
+        "sudo ",
+        "doas ",
+        "mkfs",
+        "shutdown",
+        "reboot",
+        "> /dev/",
+    ]
+    .iter()
+    .any(|forbidden| normalized.contains(forbidden))
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    let collapsed = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let argv0_end = collapsed
+        .find(char::is_whitespace)
+        .unwrap_or(collapsed.len());
+    let argv0 = &collapsed[..argv0_end];
+    let bytes = argv0.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes.last() == bytes.first() {
+        format!("{}{}", &argv0[1..argv0.len() - 1], &collapsed[argv0_end..])
+    } else {
+        collapsed
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ShellQuote {
+    Single,
+    Double,
+}
+
+fn split_shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = None;
+    let mut chars = command.chars();
+
+    while let Some(character) = chars.next() {
+        match quote {
+            Some(ShellQuote::Single) => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    word.push(character);
+                }
+            }
+            Some(ShellQuote::Double) => match character {
+                '"' => quote = None,
+                '\\' => word.push(chars.next()?),
+                _ => word.push(character),
+            },
+            None => match character {
+                '\'' => {
+                    quote = Some(ShellQuote::Single);
+                    started = true;
+                }
+                '"' => {
+                    quote = Some(ShellQuote::Double);
+                    started = true;
+                }
+                '\\' => {
+                    word.push(chars.next()?);
+                    started = true;
+                }
+                value if value.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                _ => {
+                    word.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn shell_command_word(word: &str) -> &str {
+    word.trim_matches(|character| matches!(character, '$' | '(' | ')' | '`' | ';'))
+}
+
+fn destructive_token_sequence(words: &[String]) -> bool {
+    let argv0_index = usize::from(
+        words
+            .first()
+            .is_some_and(|word| shell_command_word(word) == "command"),
+    );
+    if let Some(argv0) = words.get(argv0_index).map(|word| shell_command_word(word))
+        && (matches!(argv0, "sudo" | "doas" | "shutdown" | "reboot") || argv0.starts_with("mkfs"))
+    {
+        return true;
+    }
+
+    for (index, word) in words.iter().enumerate() {
+        match shell_command_word(word) {
+            "rm" => {
+                let first_flag = words.get(index + 1).map(|word| shell_command_word(word));
+                let second_flag = words.get(index + 2).map(|word| shell_command_word(word));
+                if matches!(first_flag, Some("-rf" | "-fr"))
+                    || (first_flag == Some("-r") && second_flag == Some("-f"))
+                {
+                    return true;
+                }
+            }
+            "git" => {
+                let operation = words.get(index + 1).map(|word| shell_command_word(word));
+                let option = words.get(index + 2).map(|word| shell_command_word(word));
+                if operation == Some("clean")
+                    || (operation == Some("reset") && option == Some("--hard"))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn redirects_to_raw_block_device(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        let Some(redirection) = word.rfind('>') else {
+            return false;
+        };
+        let inline_target = &word[redirection + 1..];
+        let target = if inline_target.is_empty() {
+            words.get(index + 1).map_or("", String::as_str)
+        } else {
+            inline_target
+        };
+        let target = shell_command_word(target);
+        target.starts_with("/dev/sd") || target.starts_with("/dev/nvme")
+    })
 }
 
 fn validate_patch_paths(workspace: &Path, patch_text: &str) -> Result<(), String> {
@@ -2520,6 +2671,50 @@ impl AgentRuntime for FakeRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn destructive_command_bypass_corpus_is_blocked() {
+        for command in [
+            "rm  -rf /",
+            "\"rm\" -rf /",
+            "command rm -rf /",
+            "$(rm -rf x)",
+            "`rm -rf x`",
+            "rm -fr /",
+            "rm -r -f /",
+            "git reset --hard HEAD",
+            "git clean -fdx",
+            "sudo echo privileged",
+            "command \"doas\" echo privileged",
+            "mkfs.ext4 /dev/sda",
+            "shutdown now",
+            "reboot",
+            "echo zero > /dev/sda",
+            "echo zero 2>\"/dev/nvme0n1\"",
+        ] {
+            assert!(
+                destructive_shell_command(command),
+                "destructive bypass was accepted: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_destructive_command_corpus_is_accepted() {
+        for command in [
+            "rm notes.txt",
+            "git reset HEAD",
+            "git status",
+            "echo /dev/sda",
+            "printf '%s' rm --force",
+            "echo safe > /tmp/output",
+        ] {
+            assert!(
+                !destructive_shell_command(command),
+                "safe command was rejected: {command:?}"
+            );
+        }
+    }
 
     #[test]
     fn prompt_selection_overrides_an_existing_session_model() {
