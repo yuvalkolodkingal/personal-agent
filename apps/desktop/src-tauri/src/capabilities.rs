@@ -34,7 +34,8 @@ use personal_agent_platform::{OsSecretStore, SecretReference, SecretStore};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -89,25 +90,7 @@ impl CapabilityState {
     }
 
     fn save_connectors(&self, connectors: &[ConnectorConfig]) -> Result<(), String> {
-        let parent = self
-            .connectors_path
-            .parent()
-            .ok_or_else(|| "connector configuration has no parent directory".to_owned())?;
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let temporary = self.connectors_path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(connectors).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        fs::rename(temporary, &self.connectors_path).map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&self.connectors_path, fs::Permissions::from_mode(0o600))
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
+        atomic_save_connectors(&self.connectors_path, connectors)
     }
 
     pub(crate) fn mutate_connectors<T>(
@@ -137,6 +120,104 @@ impl CapabilityState {
 
     pub(crate) async fn shutdown_portal(&self) {
         self.portal.disconnect().await;
+    }
+}
+
+fn atomic_save_connectors(path: &Path, connectors: &[ConnectorConfig]) -> Result<(), String> {
+    let rendered = serde_json::to_vec_pretty(connectors).map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "connector configuration has no parent directory".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".connectors-{}.tmp", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&rendered)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_connector_saves_remain_atomic() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("connectors/config.json");
+        let first = vec![ConnectorConfig::built_in(ConnectorKind::GitHub, "first")];
+        let second = vec![ConnectorConfig::built_in(ConnectorKind::Gmail, "second")];
+        let barrier = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let first_path = path.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first_payload = first.clone();
+            let first_save = scope.spawn(move || {
+                first_barrier.wait();
+                atomic_save_connectors(&first_path, &first_payload)
+            });
+
+            let second_path = path.clone();
+            let second_barrier = Arc::clone(&barrier);
+            let second_payload = second.clone();
+            let second_save = scope.spawn(move || {
+                second_barrier.wait();
+                atomic_save_connectors(&second_path, &second_payload)
+            });
+
+            first_save
+                .join()
+                .expect("first save thread")
+                .expect("first save");
+            second_save
+                .join()
+                .expect("second save thread")
+                .expect("second save");
+        });
+
+        let persisted: Vec<ConnectorConfig> =
+            serde_json::from_slice(&fs::read(&path).expect("persisted connector configuration"))
+                .expect("valid connector configuration");
+        assert!(persisted == first || persisted == second);
+        assert!(
+            fs::read_dir(path.parent().expect("connector directory"))
+                .expect("connector directory entries")
+                .all(|entry| !entry
+                    .expect("connector directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("connector configuration metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 }
 
