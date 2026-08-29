@@ -4,11 +4,38 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 type Artifact = { name: string; sha256: string };
-type Manifest = { version: string; artifacts: Record<string, Artifact> };
+type Release = {
+  repository: string;
+  release: string;
+  ready: boolean;
+  artifacts: Record<string, Artifact>;
+};
+type Manifest = {
+  version: string;
+  artifacts: Record<string, Artifact>;
+  fork: Release;
+};
 
 const root = resolve(import.meta.dir, "..");
 const manifest = JSON.parse(readFileSync(resolve(root, "docs/operations/opencode-1.18.23.json"), "utf8")) as Manifest;
 const requestedTarget = process.argv.find((argument) => argument.startsWith("--target="))?.slice("--target=".length);
+const requestedSource = process.env.PERSONAL_AGENT_OPENCODE_SOURCE ?? "upstream";
+if (requestedSource !== "upstream" && requestedSource !== "fork") {
+  throw new Error(`PERSONAL_AGENT_OPENCODE_SOURCE must be upstream or fork, found ${requestedSource}`);
+}
+const release = requestedSource === "fork"
+  ? manifest.fork
+  : {
+      repository: "anomalyco/opencode",
+      release: `https://github.com/anomalyco/opencode/releases/tag/v${manifest.version}`,
+      ready: true,
+      artifacts: manifest.artifacts,
+    };
+if (!release.ready) {
+  throw new Error(
+    `OpenCode fork release is not ready: publish ${release.repository} v${manifest.version}, then record its artifact hashes and set fork.ready=true in docs/operations/opencode-1.18.23.json`,
+  );
+}
 
 const hostTarget = (() => {
   const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
@@ -26,7 +53,7 @@ const artifactKey = (() => {
   return `${platform}-${arch}`;
 })();
 
-const artifact = manifest.artifacts[artifactKey];
+const artifact = release.artifacts[artifactKey];
 if (!artifact) throw new Error(`manifest has no artifact for ${artifactKey}`);
 const windows = target.includes("windows-msvc");
 const destination = resolve(root, "apps/desktop/src-tauri/binaries", `opencode-${target}${windows ? ".exe" : ""}`);
@@ -62,7 +89,7 @@ async function capture(command: string[]): Promise<string> {
 
 try {
   const archive = join(temporary, artifact.name);
-  const url = `https://github.com/anomalyco/opencode/releases/download/v${manifest.version}/${artifact.name}`;
+  const url = `https://github.com/${release.repository}/releases/download/v${manifest.version}/${artifact.name}`;
   const response = await fetch(url, { redirect: "follow" });
   if (!response.ok) throw new Error(`download failed with HTTP ${response.status}: ${url}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
@@ -87,7 +114,7 @@ try {
   if (!windows) chmodSync(destination, 0o755);
   const reportedVersion = await capture([destination, "--version"]);
   if (reportedVersion !== manifest.version) throw new Error(`executable version mismatch: expected ${manifest.version}, found ${reportedVersion}`);
-  console.log(`verified OpenCode ${manifest.version} for ${target}: ${destination}`);
+  console.log(`verified OpenCode ${manifest.version} from ${release.repository} for ${target}: ${destination}`);
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

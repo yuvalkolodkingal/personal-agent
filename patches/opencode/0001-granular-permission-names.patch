@@ -1,0 +1,83 @@
+From 45b003aafc9da3cc781ffacdf01ad414c15f6d20 Mon Sep 17 00:00:00 2001
+From: Personal Agent Maintainers <maintainers@personal-agent.invalid>
+Date: Sun, 30 Aug 2026 00:22:51 +0300
+Subject: [PATCH] fix(opencode): preserve granular write permission names
+
+Upstream-Issue: https://github.com/anomalyco/opencode/issues/8832
+---
+ packages/opencode/src/tool/apply_patch.ts     |  2 +-
+ packages/opencode/src/tool/write.ts           |  2 +-
+ .../opencode/test/tool/apply_patch.test.ts    |  1 +
+ packages/opencode/test/tool/write.test.ts     | 21 +++++++++++++++++++
+ 4 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/packages/opencode/src/tool/apply_patch.ts b/packages/opencode/src/tool/apply_patch.ts
+index f9201be..2824fe2 100644
+--- a/packages/opencode/src/tool/apply_patch.ts
++++ b/packages/opencode/src/tool/apply_patch.ts
+@@ -204,7 +204,7 @@ export const ApplyPatchTool = Tool.define(
+       // Check permissions if needed
+       const relativePaths = fileChanges.map((c) => path.relative(instance.worktree, c.filePath).replaceAll("\\", "/"))
+       yield* ctx.ask({
+-        permission: "edit",
++        permission: "apply_patch",
+         patterns: relativePaths,
+         always: ["*"],
+         metadata: {
+diff --git a/packages/opencode/src/tool/write.ts b/packages/opencode/src/tool/write.ts
+index 37be6d8..2629ef7 100644
+--- a/packages/opencode/src/tool/write.ts
++++ b/packages/opencode/src/tool/write.ts
+@@ -52,7 +52,7 @@ export const WriteTool = Tool.define(
+ 
+           const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, contentNew))
+           yield* ctx.ask({
+-            permission: "edit",
++            permission: "write",
+             patterns: [path.relative(instance.worktree, filepath)],
+             always: ["*"],
+             metadata: {
+diff --git a/packages/opencode/test/tool/apply_patch.test.ts b/packages/opencode/test/tool/apply_patch.test.ts
+index e394d80..556632a 100644
+--- a/packages/opencode/test/tool/apply_patch.test.ts
++++ b/packages/opencode/test/tool/apply_patch.test.ts
+@@ -134,6 +134,7 @@ describe("tool.apply_patch freeform", () => {
+         }
+         expect(result.metadata.diff).toContain("Index:")
+         expect(calls.length).toBe(1)
++        expect(calls[0]?.permission).toBe("apply_patch")
+ 
+         // Verify permission metadata includes files array for UI rendering
+         const permissionCall = calls[0]
+diff --git a/packages/opencode/test/tool/write.test.ts b/packages/opencode/test/tool/write.test.ts
+index 4f897dc..b62494d 100644
+--- a/packages/opencode/test/tool/write.test.ts
++++ b/packages/opencode/test/tool/write.test.ts
+@@ -60,6 +60,27 @@ const run = Effect.fn("WriteToolTest.run")(function* (
+ 
+ describe("tool.write", () => {
+   describe("new file creation", () => {
++    it.instance("asks for permission under the write tool name", () =>
++      Effect.gen(function* () {
++        const test = yield* TestInstance
++        const filepath = path.join(test.directory, "permission-name.txt")
++        const permissions: string[] = []
++
++        yield* run(
++          { filePath: filepath, content: "reviewed" },
++          {
++            ...ctx,
++            ask: (input) =>
++              Effect.sync(() => {
++                permissions.push(input.permission)
++              }),
++          },
++        )
++
++        expect(permissions).toEqual(["write"])
++      }),
++    )
++
+     it.instance("writes content to new file", () =>
+       Effect.gen(function* () {
+         const test = yield* TestInstance

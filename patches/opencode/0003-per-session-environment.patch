@@ -1,0 +1,233 @@
+From ea7b6264fcc0b86eb9e216b7df8bc56580cca8b6 Mon Sep 17 00:00:00 2001
+From: Personal Agent Maintainers <maintainers@personal-agent.invalid>
+Date: Sun, 30 Aug 2026 00:25:50 +0300
+Subject: [PATCH] feat(opencode): accept per-session shell environment
+
+Upstream-Issue: https://github.com/anomalyco/opencode/issues/13661
+---
+ packages/opencode/src/session/environment.ts  | 19 +++++++++++++++
+ packages/opencode/src/session/prompt.ts       |  3 ++-
+ packages/opencode/src/session/session.ts      | 10 ++++++++
+ packages/opencode/src/tool/shell.ts           |  2 ++
+ .../opencode/test/session/session.test.ts     | 14 +++++++++++
+ packages/opencode/test/tool/shell.test.ts     | 24 +++++++++++++++++++
+ 6 files changed, 71 insertions(+), 1 deletion(-)
+ create mode 100644 packages/opencode/src/session/environment.ts
+
+diff --git a/packages/opencode/src/session/environment.ts b/packages/opencode/src/session/environment.ts
+new file mode 100644
+index 0000000..d615626
+--- /dev/null
++++ b/packages/opencode/src/session/environment.ts
+@@ -0,0 +1,19 @@
++import type { SessionID } from "./schema"
++
++const entries = new Map<SessionID, Record<string, string>>()
++
++export const SessionEnvironment = {
++  set(sessionID: SessionID, environment?: Record<string, string>) {
++    if (!environment || Object.keys(environment).length === 0) {
++      entries.delete(sessionID)
++      return
++    }
++    entries.set(sessionID, { ...environment })
++  },
++  get(sessionID: SessionID) {
++    return { ...entries.get(sessionID) }
++  },
++  remove(sessionID: SessionID) {
++    entries.delete(sessionID)
++  },
++}
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 0f85d44..14c7a13 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
+ import { SessionReminders } from "./reminders"
+ import { SessionTools } from "./tools"
+ import { LLMEvent } from "@opencode-ai/llm"
++import { SessionEnvironment } from "./environment"
+ 
+ // @ts-ignore
+ globalThis.AI_SDK_LOG_WARNINGS = false
+@@ -559,7 +560,7 @@ const layer = Layer.effect(
+               const cmd = ChildProcess.make(sh, args, {
+                 cwd,
+                 extendEnv: true,
+-                env: { ...shellEnv.env, TERM: "dumb" },
++                env: { ...SessionEnvironment.get(input.sessionID), ...shellEnv.env, TERM: "dumb" },
+                 stdin: "ignore",
+                 forceKillAfter: "3 seconds",
+               })
+diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
+index a2a91cd..fb10a3e 100644
+--- a/packages/opencode/src/session/session.ts
++++ b/packages/opencode/src/session/session.ts
+@@ -44,6 +44,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
+ import { ProviderV2 } from "@opencode-ai/core/provider"
+ import { ModelV2 } from "@opencode-ai/core/model"
+ import { SessionMessage } from "@opencode-ai/schema/session-message"
++import { SessionEnvironment } from "./environment"
+ 
+ const parentTitlePrefix = "New session - "
+ const childTitlePrefix = "Child session - "
+@@ -266,6 +267,7 @@ export const CreateInput = Schema.optional(
+     metadata: Schema.optional(Metadata),
+     permission: Schema.optional(PermissionV1.Ruleset),
+     workspaceID: Schema.optional(WorkspaceV2.ID),
++    environment: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+   }),
+ )
+ export type CreateInput = Types.DeepMutable<Schema.Schema.Type<typeof CreateInput>>
+@@ -421,6 +423,7 @@ export interface Interface {
+     metadata?: typeof Metadata.Type
+     permission?: PermissionV1.Ruleset
+     workspaceID?: WorkspaceV2.ID
++    environment?: Record<string, string>
+   }) => Effect.Effect<Info>
+   readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
+   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
+@@ -507,6 +510,7 @@ const layer: Layer.Layer<
+       path?: string
+       metadata?: typeof Metadata.Type
+       permission?: PermissionV1.Ruleset
++      environment?: Record<string, string>
+     }) {
+       const ctx = yield* InstanceState.context
+       const result: Info = {
+@@ -530,6 +534,7 @@ const layer: Layer.Layer<
+           updated: Date.now(),
+         },
+       }
++      SessionEnvironment.set(result.id, input.environment)
+       yield* Effect.logInfo("created", result)
+ 
+       yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+@@ -623,6 +628,8 @@ const layer: Layer.Layer<
+         yield* events.remove(sessionID)
+       } catch (error) {
+         yield* Effect.logError("failed to remove session", { sessionID, error })
++      } finally {
++        SessionEnvironment.remove(sessionID)
+       }
+     })
+ 
+@@ -672,6 +679,7 @@ const layer: Layer.Layer<
+       metadata?: typeof Metadata.Type
+       permission?: PermissionV1.Ruleset
+       workspaceID?: WorkspaceV2.ID
++      environment?: Record<string, string>
+     }) {
+       const ctx = yield* InstanceState.context
+       const workspace = yield* InstanceState.workspaceID
+@@ -685,6 +693,7 @@ const layer: Layer.Layer<
+         metadata: input?.metadata,
+         permission: input?.permission,
+         workspaceID: input?.workspaceID ?? workspace,
++        environment: input?.environment ?? (input?.parentID ? SessionEnvironment.get(input.parentID) : undefined),
+       })
+     })
+ 
+@@ -698,6 +707,7 @@ const layer: Layer.Layer<
+         workspaceID: original.workspaceID,
+         title,
+         metadata: structuredClone(original.metadata),
++        environment: SessionEnvironment.get(original.id),
+       })
+       const msgs = yield* messages({ sessionID: input.sessionID })
+       const idMap = new Map<string, MessageID>()
+diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
+index 1e4423e..c6e6e38 100644
+--- a/packages/opencode/src/tool/shell.ts
++++ b/packages/opencode/src/tool/shell.ts
+@@ -21,6 +21,7 @@ import { ChildProcess } from "effect/unstable/process"
+ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+ import { ShellPrompt, type Parameters } from "./shell/prompt"
+ import { BashArity } from "@/permission/arity"
++import { SessionEnvironment } from "@/session/environment"
+ 
+ export { Parameters } from "./shell/prompt"
+ 
+@@ -421,6 +422,7 @@ export const ShellTool = Tool.define(
+       )
+       return {
+         ...process.env,
++        ...SessionEnvironment.get(ctx.sessionID),
+         ...extra.env,
+       }
+     })
+diff --git a/packages/opencode/test/session/session.test.ts b/packages/opencode/test/session/session.test.ts
+index c4301d2..03433c6 100644
+--- a/packages/opencode/test/session/session.test.ts
++++ b/packages/opencode/test/session/session.test.ts
+@@ -16,6 +16,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { InstanceStore } from "@/project/instance-store"
+ import { InstanceBootstrap } from "@/project/bootstrap"
++import { SessionEnvironment } from "@/session/environment"
+ 
+ const it = testEffect(
+   AppNodeBuilder.build(
+@@ -45,6 +46,19 @@ const awaitDeferred = <T>(deferred: Deferred.Deferred<T>, message: string) =>
+ const remove = (id: SessionID) => SessionNs.use.remove(id)
+ 
+ describe("session.created event", () => {
++  it.instance("keeps create-time environment private and scoped to the session lifetime", () =>
++    Effect.gen(function* () {
++      const session = yield* SessionNs.Service
++      const info = yield* session.create({ environment: { PERSONAL_AGENT_SESSION_ENV: "reviewed" } })
++
++      expect(info).not.toHaveProperty("environment")
++      expect(SessionEnvironment.get(info.id)).toEqual({ PERSONAL_AGENT_SESSION_ENV: "reviewed" })
++
++      yield* session.remove(info.id)
++      expect(SessionEnvironment.get(info.id)).toEqual({})
++    }),
++  )
++
+   it.instance("should emit session.created event when session is created", () =>
+     Effect.gen(function* () {
+       const session = yield* SessionNs.Service
+diff --git a/packages/opencode/test/tool/shell.test.ts b/packages/opencode/test/tool/shell.test.ts
+index a970f85..15c844e 100644
+--- a/packages/opencode/test/tool/shell.test.ts
++++ b/packages/opencode/test/tool/shell.test.ts
+@@ -21,6 +21,7 @@ import { testEffect } from "../lib/effect"
+ import { Tool } from "@/tool/tool"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+ import { InstanceStore } from "@/project/instance-store"
++import { SessionEnvironment } from "@/session/environment"
+ 
+ const shellLayer = Layer.mergeAll(
+   LayerNode.compile(
+@@ -181,6 +182,29 @@ const mustTruncate = (result: {
+ }
+ 
+ describe("tool.shell", () => {
++  it.live("includes the environment assigned when its session was created", () =>
++    Effect.acquireUseRelease(
++      Effect.sync(() => SessionEnvironment.set(ctx.sessionID, { PERSONAL_AGENT_SESSION_ENV: "reviewed" })),
++      () =>
++        runIn(
++          projectRoot,
++          Effect.gen(function* () {
++            const name = sh()
++            const command =
++              name === "cmd"
++                ? "echo %PERSONAL_AGENT_SESSION_ENV%"
++                : PS.has(name)
++                  ? "Write-Output $env:PERSONAL_AGENT_SESSION_ENV"
++                  : 'printf %s "$PERSONAL_AGENT_SESSION_ENV"'
++            const result = yield* run({ command })
++            expect(result.metadata.exit).toBe(0)
++            expect(result.metadata.output.trim()).toBe("reviewed")
++          }),
++        ),
++      () => Effect.sync(() => SessionEnvironment.remove(ctx.sessionID)),
++    ),
++  )
++
+   each("basic", () =>
+     runIn(
+       projectRoot,
