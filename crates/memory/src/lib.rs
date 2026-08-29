@@ -1,9 +1,12 @@
 //! Provenance-first memory records and trust transitions.
 
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -216,6 +219,458 @@ pub struct RecallResult {
     pub combined_score: f32,
 }
 
+const RECALL_INDEX_SCHEMA: &str = "
+    PRAGMA temp_store = MEMORY;
+    PRAGMA journal_mode = OFF;
+    PRAGMA synchronous = OFF;
+    CREATE VIRTUAL TABLE recall_fts USING fts5(
+        memory_id UNINDEXED,
+        content,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TABLE recall_metadata (
+        memory_id TEXT PRIMARY KEY NOT NULL,
+        eligible INTEGER NOT NULL,
+        expires_at_millis INTEGER
+    ) WITHOUT ROWID;
+    CREATE TABLE recall_vectors (
+        memory_id TEXT PRIMARY KEY NOT NULL,
+        model_id TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        vector BLOB NOT NULL
+    ) WITHOUT ROWID;
+";
+
+struct RecallIndexState {
+    connection: Option<Connection>,
+    synchronized_count: Option<usize>,
+    #[cfg(test)]
+    rebuild_count: usize,
+    #[cfg(test)]
+    last_candidate_count: usize,
+}
+
+impl Default for RecallIndexState {
+    fn default() -> Self {
+        Self {
+            connection: None,
+            synchronized_count: Some(0),
+            #[cfg(test)]
+            rebuild_count: 0,
+            #[cfg(test)]
+            last_candidate_count: 0,
+        }
+    }
+}
+
+/// Ephemeral SQLite search index. It is deliberately absent from serialized
+/// snapshots and is rebuilt once, lazily, after clone/deserialization.
+struct RecallIndex {
+    state: Mutex<RecallIndexState>,
+}
+
+impl Default for RecallIndex {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RecallIndexState::default()),
+        }
+    }
+}
+
+impl Clone for RecallIndex {
+    fn clone(&self) -> Self {
+        // A clone owns an independent cache so later mutations cannot change
+        // the source store's candidate set.
+        Self::default()
+    }
+}
+
+impl fmt::Debug for RecallIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecallIndex")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RecallIndex {
+    fn eq(&self, _other: &Self) -> bool {
+        // The index is a derived cache, not part of durable memory identity.
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RecallIndexRecord<'a> {
+    id: Uuid,
+    content: &'a str,
+    eligible: bool,
+    expires_at_millis: Option<i64>,
+    vector: Option<&'a [f32]>,
+    model_id: Option<&'a str>,
+}
+
+struct RecallCandidate {
+    id: Uuid,
+    vector: Option<Vec<f32>>,
+    model_id: Option<String>,
+}
+
+type RawRecallCandidate = (String, Option<String>, Option<i64>, Option<Vec<u8>>);
+
+impl RecallIndexState {
+    fn connection(&mut self) -> &mut Connection {
+        self.connection.get_or_insert_with(|| {
+            let connection = Connection::open_in_memory()
+                .expect("bundled SQLite must open the in-memory recall index");
+            connection
+                .execute_batch(RECALL_INDEX_SCHEMA)
+                .expect("bundled SQLite must provide FTS5 for memory recall");
+            connection
+        })
+    }
+}
+
+impl RecallIndex {
+    fn lock(&self) -> MutexGuard<'_, RecallIndexState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn synchronized_count(&self) -> Option<usize> {
+        self.lock().synchronized_count
+    }
+
+    fn mark_dirty(&self) {
+        self.lock().synchronized_count = None;
+    }
+
+    fn upsert(&self, record: &RecallIndexRecord<'_>, synchronized_count: usize) {
+        let mut state = self.lock();
+        let transaction = state
+            .connection()
+            .transaction()
+            .expect("recall-index transaction must start");
+        transaction
+            .execute(
+                "DELETE FROM recall_fts WHERE memory_id = ?1",
+                params![record.id.to_string()],
+            )
+            .expect("stale FTS row must be removable");
+        transaction
+            .execute(
+                "INSERT INTO recall_fts(memory_id, content) VALUES (?1, ?2)",
+                params![record.id.to_string(), record.content],
+            )
+            .expect("memory must be insertable into FTS5");
+        Self::replace_metadata(&transaction, record);
+        Self::replace_vector(&transaction, record);
+        transaction
+            .commit()
+            .expect("recall-index transaction must commit");
+        state.synchronized_count = Some(synchronized_count);
+    }
+
+    fn delete(&self, id: Uuid, synchronized_count: usize) {
+        let mut state = self.lock();
+        let transaction = state
+            .connection()
+            .transaction()
+            .expect("recall-index transaction must start");
+        transaction
+            .execute(
+                "DELETE FROM recall_fts WHERE memory_id = ?1",
+                params![id.to_string()],
+            )
+            .expect("FTS row must be removable");
+        transaction
+            .execute(
+                "DELETE FROM recall_vectors WHERE memory_id = ?1",
+                params![id.to_string()],
+            )
+            .expect("vector row must be removable");
+        transaction
+            .execute(
+                "DELETE FROM recall_metadata WHERE memory_id = ?1",
+                params![id.to_string()],
+            )
+            .expect("recall metadata row must be removable");
+        transaction
+            .commit()
+            .expect("recall-index transaction must commit");
+        state.synchronized_count = Some(synchronized_count);
+    }
+
+    fn rebuild(&self, records: &[RecallIndexRecord<'_>]) {
+        let mut state = self.lock();
+        let transaction = state
+            .connection()
+            .transaction()
+            .expect("recall-index rebuild transaction must start");
+        transaction
+            .execute("DELETE FROM recall_fts", [])
+            .expect("FTS cache must be clearable");
+        transaction
+            .execute("DELETE FROM recall_vectors", [])
+            .expect("vector cache must be clearable");
+        transaction
+            .execute("DELETE FROM recall_metadata", [])
+            .expect("recall metadata cache must be clearable");
+        {
+            let mut insert_fts = transaction
+                .prepare("INSERT INTO recall_fts(memory_id, content) VALUES (?1, ?2)")
+                .expect("FTS insert must prepare");
+            let mut insert_vector = transaction
+                .prepare(
+                    "INSERT INTO recall_vectors(memory_id, model_id, dimensions, vector)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .expect("vector insert must prepare");
+            let mut insert_metadata = transaction
+                .prepare(
+                    "INSERT INTO recall_metadata(memory_id, eligible, expires_at_millis)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .expect("recall metadata insert must prepare");
+            for record in records {
+                insert_fts
+                    .execute(params![record.id.to_string(), record.content])
+                    .expect("memory must be rebuildable into FTS5");
+                insert_metadata
+                    .execute(params![
+                        record.id.to_string(),
+                        i64::from(u8::from(record.eligible)),
+                        record.expires_at_millis,
+                    ])
+                    .expect("recall metadata must be rebuildable");
+                if let (Some(vector), Some(model_id)) = (record.vector, record.model_id) {
+                    insert_vector
+                        .execute(params![
+                            record.id.to_string(),
+                            model_id,
+                            i64::try_from(vector.len()).expect("vector dimensions fit in SQLite"),
+                            encode_vector(vector),
+                        ])
+                        .expect("memory vector must be rebuildable");
+                }
+            }
+        }
+        transaction
+            .commit()
+            .expect("recall-index rebuild transaction must commit");
+        state.synchronized_count = Some(records.len());
+        #[cfg(test)]
+        {
+            state.rebuild_count += 1;
+        }
+    }
+
+    fn replace_vector(transaction: &rusqlite::Transaction<'_>, record: &RecallIndexRecord<'_>) {
+        if let (Some(vector), Some(model_id)) = (record.vector, record.model_id) {
+            transaction
+                .execute(
+                    "INSERT INTO recall_vectors(memory_id, model_id, dimensions, vector)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(memory_id) DO UPDATE SET
+                         model_id = excluded.model_id,
+                         dimensions = excluded.dimensions,
+                         vector = excluded.vector",
+                    params![
+                        record.id.to_string(),
+                        model_id,
+                        i64::try_from(vector.len()).expect("vector dimensions fit in SQLite"),
+                        encode_vector(vector),
+                    ],
+                )
+                .expect("memory vector must be upsertable");
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM recall_vectors WHERE memory_id = ?1",
+                    params![record.id.to_string()],
+                )
+                .expect("obsolete vector row must be removable");
+        }
+    }
+
+    fn replace_metadata(transaction: &rusqlite::Transaction<'_>, record: &RecallIndexRecord<'_>) {
+        transaction
+            .execute(
+                "INSERT INTO recall_metadata(memory_id, eligible, expires_at_millis)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                     eligible = excluded.eligible,
+                     expires_at_millis = excluded.expires_at_millis",
+                params![
+                    record.id.to_string(),
+                    i64::from(u8::from(record.eligible)),
+                    record.expires_at_millis,
+                ],
+            )
+            .expect("recall metadata must be upsertable");
+    }
+
+    fn candidates(
+        &self,
+        query_tokens: &BTreeSet<String>,
+        query_embedding_model_id: &str,
+        candidate_limit: usize,
+        now_millis: i64,
+    ) -> Vec<RecallCandidate> {
+        if candidate_limit == 0 {
+            return Vec::new();
+        }
+        let mut state = self.lock();
+        let candidate_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
+        let raw_candidates = if query_tokens.is_empty() {
+            Self::vector_candidates(
+                state.connection(),
+                query_embedding_model_id,
+                candidate_limit,
+                now_millis,
+            )
+        } else {
+            let match_query = query_tokens
+                .iter()
+                .map(|token| format!("\"{token}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let candidates = Self::fts_candidates(
+                state.connection(),
+                &match_query,
+                candidate_limit,
+                now_millis,
+            );
+            if candidates.is_empty() {
+                // Preserve vector-only recall when no lexical term exists in
+                // the corpus, while keeping this fallback SQL-bounded.
+                Self::vector_candidates(
+                    state.connection(),
+                    query_embedding_model_id,
+                    candidate_limit,
+                    now_millis,
+                )
+            } else {
+                candidates
+            }
+        };
+        let candidates = raw_candidates
+            .into_iter()
+            .filter_map(|(raw_id, model_id, dimensions, vector)| {
+                let vector = match (vector, dimensions) {
+                    (Some(vector), Some(dimensions)) => decode_vector(&vector, dimensions),
+                    _ => None,
+                };
+                Some(RecallCandidate {
+                    id: Uuid::parse_str(&raw_id).ok()?,
+                    vector,
+                    model_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        {
+            state.last_candidate_count = candidates.len();
+        }
+        candidates
+    }
+
+    fn fts_candidates(
+        connection: &Connection,
+        match_query: &str,
+        candidate_limit: i64,
+        now_millis: i64,
+    ) -> Vec<RawRecallCandidate> {
+        let mut statement = connection
+            .prepare(
+                "SELECT recall_fts.memory_id, recall_vectors.model_id,
+                        recall_vectors.dimensions, recall_vectors.vector
+                 FROM recall_fts
+                 JOIN recall_metadata
+                   ON recall_metadata.memory_id = recall_fts.memory_id
+                 LEFT JOIN recall_vectors
+                   ON recall_vectors.memory_id = recall_fts.memory_id
+                 WHERE recall_fts MATCH ?1
+                   AND recall_metadata.eligible = 1
+                   AND (recall_metadata.expires_at_millis IS NULL
+                        OR recall_metadata.expires_at_millis > ?2)
+                 ORDER BY bm25(recall_fts), recall_fts.rowid
+                 LIMIT ?3",
+            )
+            .expect("FTS candidate query must prepare");
+        statement
+            .query_map(params![match_query, now_millis, candidate_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("FTS candidate query must execute")
+            .map(|row| row.expect("FTS candidate row must decode"))
+            .collect()
+    }
+
+    fn vector_candidates(
+        connection: &Connection,
+        query_embedding_model_id: &str,
+        candidate_limit: i64,
+        now_millis: i64,
+    ) -> Vec<RawRecallCandidate> {
+        let mut statement = connection
+            .prepare(
+                "SELECT recall_fts.memory_id, recall_vectors.model_id,
+                        recall_vectors.dimensions, recall_vectors.vector
+                 FROM recall_vectors
+                 JOIN recall_fts ON recall_fts.memory_id = recall_vectors.memory_id
+                 JOIN recall_metadata
+                   ON recall_metadata.memory_id = recall_fts.memory_id
+                 WHERE recall_vectors.model_id = ?1
+                   AND recall_metadata.eligible = 1
+                   AND (recall_metadata.expires_at_millis IS NULL
+                        OR recall_metadata.expires_at_millis > ?2)
+                 ORDER BY recall_fts.rowid
+                 LIMIT ?3",
+            )
+            .expect("flat-vector candidate query must prepare");
+        statement
+            .query_map(
+                params![query_embedding_model_id, now_millis, candidate_limit],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("flat-vector candidate query must execute")
+            .map(|row| row.expect("flat-vector candidate row must decode"))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn rebuild_count(&self) -> usize {
+        self.lock().rebuild_count
+    }
+
+    #[cfg(test)]
+    fn last_candidate_count(&self) -> usize {
+        self.lock().last_candidate_count
+    }
+}
+
+fn encode_vector(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_vector(bytes: &[u8], dimensions: i64) -> Option<Vec<f32>> {
+    let dimensions = usize::try_from(dimensions).ok()?;
+    if bytes.len() != dimensions.checked_mul(size_of::<f32>())? {
+        return None;
+    }
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    Some(chunks.iter().copied().map(f32::from_le_bytes).collect())
+}
+
 /// Inspectable provenance-first memory index. Persistence adapters can serialize
 /// the complete state or materialize it into SQLCipher/FTS5.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +683,8 @@ pub struct MemoryStore {
     #[serde(default)]
     embedding_models: BTreeMap<Uuid, String>,
     rejected: BTreeSet<Uuid>,
+    #[serde(skip, default)]
+    recall_index: RecallIndex,
 }
 
 impl MemoryStore {
@@ -239,6 +696,7 @@ impl MemoryStore {
             embeddings: BTreeMap::new(),
             embedding_models: BTreeMap::new(),
             rejected: BTreeSet::new(),
+            recall_index: RecallIndex::default(),
         }
     }
 
@@ -297,6 +755,8 @@ impl MemoryStore {
         {
             return Err(MemoryError::EmbeddingDimensions);
         }
+        let previous_count = self.memories.len();
+        let index_was_synchronized = self.recall_index.synchronized_count() == Some(previous_count);
         if let Some(vector) = embedding {
             if embedding_model_id.trim().is_empty() {
                 return Err(MemoryError::MissingEmbeddingProvenance);
@@ -306,7 +766,14 @@ impl MemoryStore {
                 .insert(memory.id, embedding_model_id.to_owned());
         }
         self.rejected.remove(&memory.id);
-        self.memories.insert(memory.id, memory);
+        let id = memory.id;
+        self.memories.insert(id, memory);
+        if index_was_synchronized {
+            let record = self.recall_index_record(id);
+            self.recall_index.upsert(&record, self.memories.len());
+        } else {
+            self.recall_index.mark_dirty();
+        }
         Ok(())
     }
 
@@ -316,11 +783,27 @@ impl MemoryStore {
     ///
     /// Returns `Missing` or `NotProposed` for invalid transitions.
     pub fn approve(&mut self, id: Uuid) -> Result<(), MemoryError> {
-        let memory = self.memories.get_mut(&id).ok_or(MemoryError::Missing(id))?;
-        if memory.trust != MemoryTrust::ProposedInference {
+        if self
+            .memories
+            .get(&id)
+            .ok_or(MemoryError::Missing(id))?
+            .trust
+            != MemoryTrust::ProposedInference
+        {
             return Err(MemoryError::NotProposed);
         }
-        memory.trust = MemoryTrust::ReviewedInference;
+        let index_was_synchronized =
+            self.recall_index.synchronized_count() == Some(self.memories.len());
+        self.memories
+            .get_mut(&id)
+            .ok_or(MemoryError::Missing(id))?
+            .trust = MemoryTrust::ReviewedInference;
+        if index_was_synchronized {
+            let record = self.recall_index_record(id);
+            self.recall_index.upsert(&record, self.memories.len());
+        } else {
+            self.recall_index.mark_dirty();
+        }
         Ok(())
     }
 
@@ -334,10 +817,17 @@ impl MemoryStore {
         if memory.trust != MemoryTrust::ProposedInference {
             return Err(MemoryError::NotProposed);
         }
+        let index_was_synchronized =
+            self.recall_index.synchronized_count() == Some(self.memories.len());
         self.memories.remove(&id);
         self.embeddings.remove(&id);
         self.embedding_models.remove(&id);
         self.rejected.insert(id);
+        if index_was_synchronized {
+            self.recall_index.delete(id, self.memories.len());
+        } else {
+            self.recall_index.mark_dirty();
+        }
         Ok(())
     }
 
@@ -404,16 +894,29 @@ impl MemoryStore {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Vec<RecallResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.ensure_recall_index();
         let query_tokens = tokenize(query);
+        let candidate_limit = limit.saturating_mul(32).max(256).min(self.memories.len());
         let mut matches = self
-            .memories
-            .values()
-            .filter(|memory| {
-                memory.expires_at.is_none_or(|expiry| expiry > now)
+            .recall_index
+            .candidates(
+                &query_tokens,
+                query_embedding_model_id,
+                candidate_limit,
+                now.timestamp_millis(),
+            )
+            .into_iter()
+            .filter_map(|candidate| {
+                let memory = self.memories.get(&candidate.id)?;
+                if !(memory.expires_at.is_none_or(|expiry| expiry > now)
                     && memory.trust != MemoryTrust::ProposedInference
-                    && memory.trust != MemoryTrust::BackgroundObservation
-            })
-            .map(|memory| {
+                    && memory.trust != MemoryTrust::BackgroundObservation)
+                {
+                    return None;
+                }
                 let content_tokens = tokenize(&memory.content);
                 let overlap = query_tokens.intersection(&content_tokens).count();
                 let lexical_score = if query_tokens.is_empty() {
@@ -421,17 +924,17 @@ impl MemoryStore {
                 } else {
                     ratio(overlap, query_tokens.len())
                 };
-                let stored_model = self.stored_embedding_model_id(memory.id);
-                let vector_score = (stored_model == query_embedding_model_id)
-                    .then(|| query_embedding.zip(self.embeddings.get(&memory.id)))
-                    .flatten()
-                    .map_or(0.0, |(query, memory)| cosine(query, memory));
-                RecallResult {
+                let vector_score = (candidate.model_id.as_deref()
+                    == Some(query_embedding_model_id))
+                .then(|| query_embedding.zip(candidate.vector.as_deref()))
+                .flatten()
+                .map_or(0.0, |(query, memory)| cosine(query, memory));
+                Some(RecallResult {
                     memory: memory.recalled(),
                     lexical_score,
                     vector_score,
                     combined_score: lexical_score.mul_add(0.55, vector_score * 0.45),
-                }
+                })
             })
             .filter(|result| result.combined_score > 0.0)
             .collect::<Vec<_>>();
@@ -444,6 +947,37 @@ impl MemoryStore {
         });
         matches.truncate(limit);
         matches
+    }
+
+    fn ensure_recall_index(&self) {
+        if self.recall_index.synchronized_count() == Some(self.memories.len()) {
+            return;
+        }
+        let records = self
+            .memories
+            .values()
+            .map(|memory| self.recall_index_record(memory.id))
+            .collect::<Vec<_>>();
+        self.recall_index.rebuild(&records);
+    }
+
+    fn recall_index_record(&self, id: Uuid) -> RecallIndexRecord<'_> {
+        let memory = self
+            .memories
+            .get(&id)
+            .expect("recall index records are created only for stored memories");
+        RecallIndexRecord {
+            id,
+            content: &memory.content,
+            eligible: memory.trust != MemoryTrust::ProposedInference
+                && memory.trust != MemoryTrust::BackgroundObservation,
+            expires_at_millis: memory.expires_at.map(|expiry| expiry.timestamp_millis()),
+            vector: self.embeddings.get(&id).map(Vec::as_slice),
+            model_id: self
+                .embeddings
+                .contains_key(&id)
+                .then(|| self.stored_embedding_model_id(id)),
+        }
     }
 
     #[must_use]
@@ -477,11 +1011,18 @@ impl MemoryStore {
     ///
     /// Returns `Missing` when the requested memory is absent.
     pub fn delete(&mut self, id: Uuid) -> Result<Memory, MemoryError> {
+        let index_was_synchronized =
+            self.recall_index.synchronized_count() == Some(self.memories.len());
         let removed = self.memories.remove(&id).ok_or(MemoryError::Missing(id))?;
         self.embeddings.remove(&id);
         self.embedding_models.remove(&id);
         for memory in self.memories.values_mut() {
             memory.conflicts_with.retain(|other| *other != id);
+        }
+        if index_was_synchronized {
+            self.recall_index.delete(id, self.memories.len());
+        } else {
+            self.recall_index.mark_dirty();
         }
         Ok(removed)
     }
@@ -890,6 +1431,166 @@ mod tests {
         assert_eq!(results[0].memory.id, exact.id);
         store.delete(related.id).expect("delete");
         assert!(store.get(exact.id).unwrap().conflicts_with.is_empty());
+    }
+
+    #[test]
+    fn recall_index_clone_and_deserialize_rebuild_once() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 2,
+            ..EmbeddingModel::default()
+        });
+        let memory = Memory::explicit_user("Atlas uses Rust", MemoryTier::Project, "e1");
+        let expected_id = memory.id;
+        store
+            .upsert(memory, Some(vec![1.0, 0.0]))
+            .expect("indexed memory");
+        let mut replaceable =
+            Memory::explicit_user("Madrid is in Spain", MemoryTier::Semantic, "e2");
+        let replaceable_id = replaceable.id;
+        store
+            .upsert(replaceable.clone(), Some(vec![0.0, 1.0]))
+            .expect("second indexed memory");
+        assert_eq!(store.recall_index.rebuild_count(), 0);
+
+        let mut cloned = store.clone();
+        assert_eq!(cloned.recall_index.rebuild_count(), 0);
+        replaceable.content = "Paris is in France".into();
+        cloned
+            .upsert(replaceable, Some(vec![0.0, 1.0]))
+            .expect("replace in clone before its first recall");
+        assert_eq!(
+            cloned.recall("Atlas", Some(&[1.0, 0.0]), 1, Utc::now())[0]
+                .memory
+                .id,
+            expected_id
+        );
+        assert_eq!(cloned.recall_index.rebuild_count(), 1);
+        let _ = cloned.recall("Atlas", Some(&[1.0, 0.0]), 1, Utc::now());
+        assert_eq!(cloned.recall_index.rebuild_count(), 1);
+
+        let snapshot = serde_json::to_vec(&store).expect("serialize memory store");
+        let mut restored: MemoryStore =
+            serde_json::from_slice(&snapshot).expect("deserialize memory store");
+        assert_eq!(restored.recall_index.rebuild_count(), 0);
+        restored
+            .delete(replaceable_id)
+            .expect("delete from deserialized store before its first recall");
+        assert_eq!(
+            restored.recall("Atlas", Some(&[1.0, 0.0]), 1, Utc::now())[0]
+                .memory
+                .id,
+            expected_id
+        );
+        assert_eq!(restored.recall_index.rebuild_count(), 1);
+        let _ = restored.recall("Atlas", Some(&[1.0, 0.0]), 1, Utc::now());
+        assert_eq!(restored.recall_index.rebuild_count(), 1);
+    }
+
+    #[test]
+    fn recall_index_handles_ten_thousand_memories_under_fifty_ms() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 8,
+            ..EmbeddingModel::default()
+        });
+        let mut expected_id = None;
+        for index in 0..10_000 {
+            let content = if index == 9_876 {
+                "unique needle 9876 target memory".to_owned()
+            } else {
+                format!("archived fact number {index}")
+            };
+            let memory = Memory::explicit_user(content, MemoryTier::Semantic, format!("e{index}"));
+            if index == 9_876 {
+                expected_id = Some(memory.id);
+            }
+            let mut vector = vec![0.0; 8];
+            vector[usize::from(index != 9_876)] = 1.0;
+            store.embeddings.insert(memory.id, vector);
+            store.memories.insert(memory.id, memory);
+        }
+        store.ensure_recall_index();
+        assert_eq!(store.recall_index.rebuild_count(), 1);
+
+        let started = std::time::Instant::now();
+        let results = store.recall(
+            "unique needle 9876",
+            Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            3,
+            Utc::now(),
+        );
+        let elapsed = started.elapsed();
+        eprintln!("FIX-8 10k-memory indexed recall: {elapsed:?}");
+
+        assert_eq!(results.first().map(|result| result.memory.id), expected_id);
+        assert_eq!(store.recall_index.last_candidate_count(), 1);
+        assert_eq!(store.recall_index.rebuild_count(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "10k-memory recall took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn eligibility_is_filtered_before_the_fts_candidate_limit() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 2,
+            ..EmbeddingModel::default()
+        });
+        for index in 0..300 {
+            store
+                .upsert(
+                    Memory::proposed(
+                        "sharedterm identical candidate",
+                        MemoryTier::Semantic,
+                        vec![format!("proposed-{index}")],
+                        0.8,
+                    ),
+                    None,
+                )
+                .expect("proposed memory");
+        }
+        let valid = Memory::explicit_user(
+            "sharedterm identical candidate",
+            MemoryTier::Semantic,
+            "trusted",
+        );
+        let valid_id = valid.id;
+        store.upsert(valid, None).expect("trusted memory");
+
+        let results = store.recall("sharedterm", None, 1, Utc::now());
+        assert_eq!(
+            results.first().map(|result| result.memory.id),
+            Some(valid_id)
+        );
+        assert_eq!(store.recall_index.last_candidate_count(), 1);
+    }
+
+    #[test]
+    fn approving_an_inference_updates_index_eligibility_without_rebuild() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 2,
+            ..EmbeddingModel::default()
+        });
+        let proposed = Memory::proposed(
+            "reviewable sharedterm",
+            MemoryTier::Semantic,
+            vec!["e1".into()],
+            0.8,
+        );
+        let id = proposed.id;
+        store.upsert(proposed, None).expect("proposed memory");
+        assert!(store.recall("sharedterm", None, 1, Utc::now()).is_empty());
+        assert_eq!(store.recall_index.rebuild_count(), 0);
+
+        store.approve(id).expect("approve inference");
+        assert_eq!(
+            store
+                .recall("sharedterm", None, 1, Utc::now())
+                .first()
+                .map(|result| result.memory.id),
+            Some(id)
+        );
+        assert_eq!(store.recall_index.rebuild_count(), 0);
     }
 
     #[test]
