@@ -31,12 +31,22 @@ Linux Secret Service. Configuration and IPC carry only
 OS store returns the key, rebuilds its projection, then launches the bundled
 sidecar asynchronously; normalized health is appended as another event.
 
-OpenCode model output is untrusted. Filesystem and effectful built-ins are
-disabled in both the agent tool map and permission configuration. The initial
-native status tool uses an ephemeral loopback credential and exact registered
-session/directory scope; subsequent native/MCP tools share the same gateway.
-Every admitted tool executes only after native schema, scope, data-zone, policy,
-consent, checkpoint, filtering, audit, and postcondition stages.
+OpenCode model output is untrusted. A reviewed coding-only built-in surface is
+enabled for repository work: reads/search, workspace edits and patches,
+language services, shell/build/test commands, skills and delegated tasks. Its
+primary controls are the pinned OpenCode permission engine and canonical
+project scope. Consequential shell operations ask in the native approval UI;
+known destructive or privileged bypasses are denied. An authenticated
+registered-session before-hook independently rejects unknown tools, mismatched
+directories and explicit paths outside the workspace. That hook is defense in
+depth, not the sole safety boundary, and never rewrites model arguments.
+
+Native desktop, connector, browser, MCP and Personal Agent tools do not use the
+coding compatibility path. They execute only after native schema, scope,
+data-zone, policy, consent, checkpoint, filtering, audit and postcondition
+stages. The initial native status tool uses an ephemeral loopback credential
+and exact registered session/directory scope; subsequent native/MCP tools share
+the same gateway.
 
 ## State model
 

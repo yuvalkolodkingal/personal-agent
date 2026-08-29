@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
@@ -409,6 +409,9 @@ pub(crate) async fn save_config(
     drop(runtime);
     if let Ok(mut profile) = state.profile.lock() {
         let _ = profile.record_runtime_health(&health);
+    }
+    if health.healthy {
+        super::automation_host::ensure_resident_executor(app.clone());
     }
     app.emit("config-updated", &validated.config)
         .map_err(|error| error.to_string())?;
@@ -932,8 +935,10 @@ pub(crate) async fn runtime_resource(
         return Err("session ID is invalid".to_owned());
     }
     let requested_path = path.unwrap_or_default();
-    if requested_path.split('/').any(|part| part == "..") {
-        return Err("workspace path traversal is not allowed".to_owned());
+    if matches!(kind.as_str(), "file_list" | "file_content")
+        && !is_workspace_relative_path(&requested_path)
+    {
+        return Err("file resources require a workspace-relative path".to_owned());
     }
     let (route, mut parameters) = match kind.as_str() {
         "session_messages" => (format!("/session/{session}/message"), vec![]),
@@ -976,6 +981,13 @@ pub(crate) async fn runtime_resource(
         .request_json(reqwest::Method::GET, &route, &query, None)
         .await
         .map_err(|error| error.to_string())
+}
+
+fn is_workspace_relative_path(value: &str) -> bool {
+    !value.contains('\0')
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn valid_runtime_identifier(value: &str, prefix: Option<&str>) -> bool {
@@ -2501,5 +2513,15 @@ mod tests {
             "Look at my projects and add them to memory"
         ));
         assert!(!conversational_memory_intent("What is computer memory?"));
+    }
+
+    #[test]
+    fn file_resources_accept_only_workspace_relative_paths() {
+        assert!(is_workspace_relative_path(""));
+        assert!(is_workspace_relative_path("src/lib.rs"));
+        assert!(!is_workspace_relative_path("../outside"));
+        assert!(!is_workspace_relative_path("/etc/passwd"));
+        assert!(!is_workspace_relative_path("src/../../outside"));
+        assert!(!is_workspace_relative_path("src/evil\0name"));
     }
 }

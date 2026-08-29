@@ -48,8 +48,9 @@ signal.
 
 Evaluate V2 only behind the same boundary. It cannot become production default
 while upstream labels it beta. The M2 compatibility suite includes an isolated
-OpenAI-compatible provider and a harmless native-gateway status turn through
-the real stable sidecar, without reading a user's OpenCode profile.
+OpenAI-compatible provider, a real model-facing workspace write, and a harmless
+native-gateway status turn through the stable sidecar, without reading a user's
+OpenCode profile.
 
 The bundled safety plugin is a legacy-compatible module with exactly one
 runtime export: its default plugin function. OpenCode 1.18.23 interprets every
@@ -69,20 +70,31 @@ must use native secret storage and explicit user consent.
 
 Project-local `opencode.json` and `.opencode` configuration are disabled. The
 native adapter supplies only provider definitions admitted by onboarding. The
-plugin exposes one initial `personal_agent_gateway_status` vertical slice over
-an ephemeral authenticated loopback channel. Rust accepts it only when the
-session ID and canonical working directory match its registry, then runs the
-normal native schema, policy, output filtering, verification, and audit path.
-OpenCode filesystem built-ins are disabled, so this compatibility turn cannot
-fall back to reading a fixture directly.
+plugin exposes reviewed OpenCode coding tools—workspace read/search/edit,
+patching, shell, language services, skills and delegated tasks—under granular
+permissions. Before any built-in runs, the plugin calls an ephemeral,
+authenticated native loopback boundary. Rust accepts the call only when the
+session ID and canonical working directory match its registry, rejects paths
+that escape that workspace, and blocks unreviewed tool names. Unknown
+permission callbacks fail closed, while consequential reviewed operations stay
+visible in the native approval UI. The compatibility fixture proves both an
+actual workspace file write and the native `personal_agent_gateway_status`
+tool turn through the real pinned sidecar.
 
 ## Safety consequence
 
 V1 `tool.execute.before` hooks cannot short-circuit a call, and recent upstream
 reports show argument mutation inconsistencies. Therefore a hook is not the
-safety boundary. Filesystem and effectful built-ins are disabled; native
-Personal Agent gateway tools provide the only admitted path. Unknown permission
-requests fail closed.
+safety boundary and Personal Agent does not use it to rewrite arguments. The
+reviewed coding compatibility surface instead layers the pinned OpenCode
+permission engine and canonical workspace semantics with independent native
+session/directory/path preauthorization. Unknown permission requests fail
+closed, known destructive or privileged shell bypasses are denied, and other
+consequential shell effects require explicit approval. Desktop, connector,
+browser and MCP effects remain native-gateway-only. Replacing the remaining
+filesystem/shell compatibility layer with verified native equivalents stays a
+visible hardening item rather than a false claim that the before-hook provides
+postcondition verification or rollback.
 
 Temporary upstream patches, if ever required, must be minimal, versioned,
 linked to an upstream issue, and removed after compatibility verification.

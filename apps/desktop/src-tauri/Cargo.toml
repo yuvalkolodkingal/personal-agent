@@ -13,6 +13,7 @@ chrono.workspace = true
 image.workspace = true
 personal-agent-audio = { path = "../../../crates/audio", version = "=0.1.0" }
 personal-agent-agent = { path = "../../../crates/agent", version = "=0.1.0" }
+personal-agent-automation = { path = "../../../crates/automation", version = "=0.1.0" }
 personal-agent-browser = { path = "../../../crates/browser", version = "=0.1.0" }
 personal-agent-connectors = { path = "../../../crates/connectors", version = "=0.1.0" }
 personal-agent-context = { path = "../../../crates/context", version = "=0.1.0" }
@@ -33,6 +34,7 @@ sha2.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-global-shortcut.workspace = true
+tauri-plugin-notification.workspace = true
 tauri-plugin-single-instance.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
@@ -44,7 +46,9 @@ url.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures-util.workspace = true
 webkit2gtk = "=2.0.2"
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }

@@ -77,6 +77,16 @@ pub struct AutomationRun {
     pub status: AutomationRunStatus,
     pub attempt: u16,
     pub approval_reason: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    #[serde(default)]
+    pub runtime_session_id: Option<String>,
+    #[serde(default)]
+    pub runtime_request_id: Option<String>,
 }
 
 /// Automation run lifecycle; approval is a suspension, not a failure.
@@ -209,6 +219,11 @@ impl Scheduler {
                     status,
                     attempt: 0,
                     approval_reason: None,
+                    started_at: None,
+                    finished_at: None,
+                    result_summary: None,
+                    runtime_session_id: None,
+                    runtime_request_id: None,
                 };
                 if status == AutomationRunStatus::Queued {
                     queued.push(key.clone());
@@ -248,6 +263,11 @@ impl Scheduler {
                     status: AutomationRunStatus::Queued,
                     attempt: 0,
                     approval_reason: None,
+                    started_at: None,
+                    finished_at: None,
+                    result_summary: None,
+                    runtime_session_id: None,
+                    runtime_request_id: None,
                 },
             );
             queued.push(key);
@@ -293,6 +313,82 @@ impl Scheduler {
         }
         run.status = AutomationRunStatus::Running;
         run.attempt = run.attempt.saturating_add(1);
+        run.started_at = Some(Utc::now());
+        run.finished_at = None;
+        run.result_summary = None;
+        Ok(())
+    }
+
+    /// Enqueue one explicit user-requested run independently of its trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the automation is missing.
+    pub fn run_now(
+        &mut self,
+        automation_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<String, SchedulerError> {
+        if !self.snapshot.automations.contains_key(&automation_id) {
+            return Err(SchedulerError::MissingAutomation(automation_id));
+        }
+        let key = format!(
+            "{automation_id}:manual:{}:{}",
+            now.timestamp_millis(),
+            Uuid::now_v7()
+        );
+        self.snapshot.runs.insert(
+            key.clone(),
+            AutomationRun {
+                id: Uuid::now_v7(),
+                automation_id,
+                schedule_key: key.clone(),
+                scheduled_for: now,
+                status: AutomationRunStatus::Queued,
+                attempt: 0,
+                approval_reason: None,
+                started_at: None,
+                finished_at: None,
+                result_summary: None,
+                runtime_session_id: None,
+                runtime_request_id: None,
+            },
+        );
+        Ok(key)
+    }
+
+    /// Enable or disable a stored definition without discarding its history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the automation is missing.
+    pub fn set_enabled(
+        &mut self,
+        automation_id: Uuid,
+        enabled: bool,
+    ) -> Result<(), SchedulerError> {
+        let automation = self
+            .snapshot
+            .automations
+            .get_mut(&automation_id)
+            .ok_or(SchedulerError::MissingAutomation(automation_id))?;
+        automation.enabled = enabled;
+        Ok(())
+    }
+
+    /// Remove a definition and its run history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the automation is missing.
+    pub fn remove(&mut self, automation_id: Uuid) -> Result<(), SchedulerError> {
+        self.snapshot
+            .automations
+            .remove(&automation_id)
+            .ok_or(SchedulerError::MissingAutomation(automation_id))?;
+        self.snapshot
+            .runs
+            .retain(|_, run| run.automation_id != automation_id);
         Ok(())
     }
 
@@ -315,6 +411,57 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Bind the native runtime request needed to resume an approval-gated run.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or non-running runs and blank runtime identifiers.
+    pub fn bind_approval(
+        &mut self,
+        key: &str,
+        session_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<(), SchedulerError> {
+        if session_id.trim().is_empty() || request_id.trim().is_empty() {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        self.wait_for_approval(key, reason)?;
+        let run = self
+            .snapshot
+            .runs
+            .get_mut(key)
+            .ok_or_else(|| SchedulerError::MissingRun(key.into()))?;
+        run.runtime_session_id = Some(session_id.into());
+        run.runtime_request_id = Some(request_id.into());
+        Ok(())
+    }
+
+    /// Attach the isolated native runtime session executing this run.
+    ///
+    /// # Errors
+    ///
+    /// Rejects blank session IDs or missing/non-running runs.
+    pub fn bind_runtime_session(
+        &mut self,
+        key: &str,
+        session_id: &str,
+    ) -> Result<(), SchedulerError> {
+        if session_id.trim().is_empty() {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        let run = self
+            .snapshot
+            .runs
+            .get_mut(key)
+            .ok_or_else(|| SchedulerError::MissingRun(key.into()))?;
+        if run.status != AutomationRunStatus::Running {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        run.runtime_session_id = Some(session_id.into());
+        Ok(())
+    }
+
     /// Resume a user-approved suspended run.
     ///
     /// # Errors
@@ -331,6 +478,26 @@ impl Scheduler {
         }
         run.status = AutomationRunStatus::Queued;
         run.approval_reason = None;
+        Ok(())
+    }
+
+    /// Resume the same live runtime turn after its native approval was answered.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or non-waiting runs.
+    pub fn resume_after_approval(&mut self, key: &str) -> Result<(), SchedulerError> {
+        let run = self
+            .snapshot
+            .runs
+            .get_mut(key)
+            .ok_or_else(|| SchedulerError::MissingRun(key.into()))?;
+        if run.status != AutomationRunStatus::WaitingApproval {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        run.status = AutomationRunStatus::Running;
+        run.approval_reason = None;
+        run.runtime_request_id = None;
         Ok(())
     }
 
@@ -358,6 +525,8 @@ impl Scheduler {
         } else {
             AutomationRunStatus::Failed
         };
+        run.finished_at = Some(Utc::now());
+        run.runtime_request_id = None;
         let automation = self
             .snapshot
             .automations
@@ -369,6 +538,80 @@ impl Scheduler {
             automation.record_failure();
         }
         Ok(())
+    }
+
+    /// Attach a bounded, user-visible result summary to a terminal run.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or non-terminal runs.
+    pub fn set_result_summary(&mut self, key: &str, summary: &str) -> Result<(), SchedulerError> {
+        let run = self
+            .snapshot
+            .runs
+            .get_mut(key)
+            .ok_or_else(|| SchedulerError::MissingRun(key.into()))?;
+        if !matches!(
+            run.status,
+            AutomationRunStatus::Completed | AutomationRunStatus::Failed
+        ) {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        run.result_summary = Some(summary.chars().take(4_096).collect());
+        Ok(())
+    }
+
+    /// Fail a running or approval-suspended run and apply the definition's
+    /// failure-pause policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or inactive runs.
+    pub fn fail_active(&mut self, key: &str, summary: &str) -> Result<(), SchedulerError> {
+        let run = self
+            .snapshot
+            .runs
+            .get_mut(key)
+            .ok_or_else(|| SchedulerError::MissingRun(key.into()))?;
+        if !matches!(
+            run.status,
+            AutomationRunStatus::Running | AutomationRunStatus::WaitingApproval
+        ) {
+            return Err(SchedulerError::InvalidTransition);
+        }
+        run.status = AutomationRunStatus::Failed;
+        run.finished_at = Some(Utc::now());
+        run.approval_reason = None;
+        run.runtime_request_id = None;
+        run.result_summary = Some(summary.chars().take(4_096).collect());
+        let automation = self
+            .snapshot
+            .automations
+            .get_mut(&run.automation_id)
+            .ok_or(SchedulerError::MissingAutomation(run.automation_id))?;
+        automation.record_failure();
+        Ok(())
+    }
+
+    /// Recover process-bound runs without replaying potentially effectful work.
+    /// Returns the number of runs paused for explicit user retry.
+    pub fn recover_after_restart(&mut self) -> usize {
+        let mut recovered = 0;
+        for run in self.snapshot.runs.values_mut() {
+            if matches!(
+                run.status,
+                AutomationRunStatus::Running | AutomationRunStatus::WaitingApproval
+            ) {
+                run.status = AutomationRunStatus::PausedForUser;
+                run.approval_reason = Some(
+                    "The desktop host restarted during this run. Review it and run again.".into(),
+                );
+                run.runtime_session_id = None;
+                run.runtime_request_id = None;
+                recovered += 1;
+            }
+        }
+        recovered
     }
 
     /// Foreground conversation preempts active background work.
@@ -621,5 +864,69 @@ mod tests {
             scheduler.snapshot().runs[&key].status,
             AutomationRunStatus::PausedForUser
         );
+    }
+
+    #[test]
+    fn manual_run_resumes_the_same_live_turn_after_approval() {
+        let now = Utc::now();
+        let automation = fixture_automation(now + chrono::Duration::hours(1));
+        let id = automation.id;
+        let mut scheduler = Scheduler::default();
+        scheduler.upsert(automation).expect("register");
+        let key = scheduler.run_now(id, now).expect("manual run");
+        scheduler.start(&key).expect("start");
+        scheduler
+            .bind_approval(&key, "ses_background", "req_permission", "write files")
+            .expect("bind approval");
+        scheduler
+            .resume_after_approval(&key)
+            .expect("resume live turn");
+        assert_eq!(
+            scheduler.snapshot().runs[&key].status,
+            AutomationRunStatus::Running
+        );
+        assert_eq!(scheduler.snapshot().runs[&key].attempt, 1);
+        scheduler.finish(&key, true, None).expect("finish");
+        scheduler
+            .set_result_summary(&key, "completed")
+            .expect("summary");
+        assert_eq!(
+            scheduler.snapshot().runs[&key].result_summary.as_deref(),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn restart_pauses_process_bound_work_without_replaying_it() {
+        let now = Utc::now();
+        let automation = fixture_automation(now);
+        let id = automation.id;
+        let mut scheduler = Scheduler::default();
+        scheduler.upsert(automation).expect("register");
+        let key = scheduler.run_now(id, now).expect("manual run");
+        scheduler.start(&key).expect("start");
+        scheduler
+            .bind_approval(&key, "ses_background", "req_permission", "external write")
+            .expect("bind approval");
+        let snapshot = scheduler.snapshot().clone();
+        let mut recovered = Scheduler::from_snapshot(snapshot);
+        assert_eq!(recovered.recover_after_restart(), 1);
+        let run = &recovered.snapshot().runs[&key];
+        assert_eq!(run.status, AutomationRunStatus::PausedForUser);
+        assert!(run.runtime_session_id.is_none());
+        assert!(run.runtime_request_id.is_none());
+    }
+
+    #[test]
+    fn deleting_definition_also_removes_its_run_history() {
+        let now = Utc::now();
+        let automation = fixture_automation(now);
+        let id = automation.id;
+        let mut scheduler = Scheduler::default();
+        scheduler.upsert(automation).expect("register");
+        scheduler.run_now(id, now).expect("manual run");
+        scheduler.remove(id).expect("remove");
+        assert!(scheduler.snapshot().automations.is_empty());
+        assert!(scheduler.snapshot().runs.is_empty());
     }
 }

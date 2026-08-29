@@ -58,6 +58,18 @@ execution, persistent memory, and service integrations. Unsupported operating
 system capabilities are shown as degraded with a concrete reason; they do not
 silently fall back to unrestricted input or filesystem access.
 
+### Coding-agent workspace
+
+The bundled OpenCode runtime exposes the coding surface expected from modern
+terminal agents: workspace file reads and search, edits and multi-file patches,
+language-server operations, shell/build/test commands, Git and worktree flows,
+skills, commands, task lists, and delegated specialist agents. Every built-in
+is preauthorized over an ephemeral authenticated native channel tied to the
+exact session and canonical workspace. Escaped paths, unreviewed tools and
+known destructive bypasses are rejected; reviewed consequential operations use
+the in-app approval queue. A real pinned-sidecar acceptance test must create a
+workspace file through the model-facing `write` tool before a release passes.
+
 ### GUI MCP manager
 
 The MCP workspace manages local stdio and remote HTTP/SSE servers without
@@ -71,3 +83,16 @@ policy gateway as other tools.
 
 See [SPEC.md](SPEC.md), [ROADMAP.md](ROADMAP.md), and
 [docs/architecture/system.md](docs/architecture/system.md).
+
+[SPEC-V2.md](SPEC-V2.md) is the implementation-ready plan for the next phase:
+performance and loading, streaming voice, a native MCP host and connectors, a
+standalone agent runtime (ADR-0002), full desktop control, a built-in CDP agent
+browser, and an itemized backlog for every unfinished feature.
+
+### Artifacts and whiteboard
+
+Artifacts are stored as encrypted, content-addressed blobs with immutable
+versions and source provenance. The desktop workspace previews text and common
+media, restores an old version by creating a new revision, exports only to an
+exact confirmed no-overwrite path, and provides responsive pin, focus, copy,
+reorder, and remove controls for whiteboard cards.

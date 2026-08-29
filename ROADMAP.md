@@ -109,3 +109,13 @@ Exit gate: all product completion criteria pass. Signing credentials, store
 access, unavailable OS/hardware, and commercial accounts may block only their
 external verification; deterministic substitutes and unsigned artifacts remain
 required.
+
+## M10–M16 — Specification V2
+
+[SPEC-V2.md](SPEC-V2.md) defines the next seven milestones as ordered, individually
+verifiable workstreams: M10 hotfix and measurement, M11 performance, M12 voice,
+M13 integrations, M14 desktop and browser, M15 standalone runtime (see
+[ADR-0002](docs/architecture/adr-0002-standalone-runtime.md)), and M16 completion and
+operations. Each carries an exit gate and reserved acceptance-test IDs; as with M0–M9,
+registry status remains authoritative and no milestone is complete until its acceptance
+tests pass.

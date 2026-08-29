@@ -11,48 +11,63 @@ use personal_agent_context::{
     NodeHandle, NodeState, PixelFormat, Rect, ScreenFrameDescriptor, SemanticRole,
     SnapshotGeneration, WindowId,
 };
-use personal_agent_platform::PermissionState;
-use personal_agent_platform::desktop::DesktopPermissionReport;
+use personal_agent_platform::desktop::{
+    DesktopBackendPlan, DesktopPermissionReport, capability_id, current_desktop_backend_plan,
+};
+use personal_agent_platform::{CapabilityStatus, PermissionState};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::Command;
+
+use crate::portal_linux::WaylandPortalManager;
 
 pub(crate) struct CommandNativeBridge {
     sequence: AtomicU64,
     permissions: DesktopPermissionReport,
     connected: bool,
     detail: String,
+    portal: Arc<WaylandPortalManager>,
 }
 
 impl CommandNativeBridge {
     #[must_use]
-    pub(crate) fn discover() -> Self {
+    pub(crate) fn discover_with_portal(portal: Arc<WaylandPortalManager>) -> Self {
         let platform = env::consts::OS;
         let (connected, detail, permissions) = match platform {
             "linux" => {
                 let active = executable("hyprctl") || executable("xdotool");
-                let capture = executable("grim") || executable("gnome-screenshot");
+                let atspi = atspi_available();
+                let capture = env::var_os("WAYLAND_DISPLAY")
+                    .is_some_and(|display| !display.is_empty())
+                    && executable("grim");
                 let input = executable("wtype") || executable("ydotool") || executable("xdotool");
                 (
-                    active,
-                    if active {
-                        "Linux active-window command bridge connected".into()
+                    active && atspi,
+                    if active && atspi {
+                        "Linux AT-SPI semantic tree and active-window bridge connected".into()
+                    } else if active {
+                        "active-window metadata is available, but the AT-SPI bus is unavailable"
+                            .into()
                     } else {
                         "install hyprctl or xdotool for active-window context".into()
                     },
                     DesktopPermissionReport {
-                        accessibility: capability_permission(active, "install hyprctl or xdotool"),
+                        accessibility: capability_permission(
+                            active && atspi,
+                            "enable the AT-SPI accessibility bus and install hyprctl or xdotool",
+                        ),
                         screen_capture: capability_permission(
                             capture,
-                            "install grim or gnome-screenshot and grant screen capture",
+                            "install grim in a wlroots session or connect an XDG ScreenCast portal",
                         ),
                         input_control: capability_permission(
-                            input,
-                            "install/authorize wtype, ydotool, or xdotool",
+                            atspi || input,
+                            "enable AT-SPI or install/authorize wtype, ydotool, or xdotool",
                         ),
                     },
                 )
@@ -112,7 +127,37 @@ impl CommandNativeBridge {
             permissions,
             connected,
             detail,
+            portal,
         }
+    }
+
+    /// Combine the conservative pre-connection platform plan with capabilities
+    /// this exact bridge actually connected. Other platforms intentionally keep
+    /// their degraded native-helper status until their adapters are implemented.
+    #[must_use]
+    pub(crate) fn backend_plan(&self) -> DesktopBackendPlan {
+        let mut plan = current_desktop_backend_plan();
+        if env::consts::OS != "linux" || !self.connected {
+            return plan;
+        }
+        set_capability_supported(&mut plan, capability_id::ACTIVE_VIEW);
+        set_capability_supported(&mut plan, capability_id::ACCESSIBILITY_TREE);
+        if matches!(self.permissions.input_control, PermissionState::Granted) {
+            set_capability_supported(&mut plan, capability_id::INPUT_CONTROL);
+            plan.input_backend = "AT-SPI semantic actions with explicit command fallbacks".into();
+        }
+        if matches!(self.permissions.screen_capture, PermissionState::Granted) {
+            set_capability_supported(&mut plan, capability_id::SCREEN_CAPTURE);
+            plan.screen_capture_backend = "ephemeral compositor capture (grim)".into();
+            if let Some(capability) = plan
+                .capabilities
+                .iter_mut()
+                .find(|capability| capability.id == capability_id::SCREEN_CAPTURE)
+            {
+                capability.backend.clone_from(&plan.screen_capture_backend);
+            }
+        }
+        plan
     }
 
     fn next_generation(&self) -> SnapshotGeneration {
@@ -135,6 +180,16 @@ impl CommandNativeBridge {
     }
 }
 
+fn set_capability_supported(plan: &mut DesktopBackendPlan, id: &str) {
+    if let Some(capability) = plan
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == id)
+    {
+        capability.status = CapabilityStatus::Supported;
+    }
+}
+
 fn capability_permission(available: bool, guidance: &str) -> PermissionState {
     if available {
         PermissionState::Granted
@@ -150,6 +205,31 @@ fn executable(program: &str) -> bool {
         return false;
     };
     env::split_paths(&paths).any(|directory| Path::new(&directory).join(program).is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn atspi_available() -> bool {
+    std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.a11y.Bus",
+            "--object-path",
+            "/org/a11y/bus",
+            "--method",
+            "org.a11y.Bus.GetAddress",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atspi_available() -> bool {
+    false
 }
 
 async fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
@@ -329,26 +409,13 @@ impl NativeDesktopBridge for CommandNativeBridge {
         view: &ActiveView,
         generation: SnapshotGeneration,
     ) -> Result<Vec<AccessibilityNode>, BackendError> {
-        let handle = NodeHandle {
-            window_id: view.window_id.clone(),
-            generation,
-            opaque_id: "active-window".into(),
-        };
-        Ok(vec![AccessibilityNode {
-            handle,
-            role: SemanticRole::Window,
-            name: view.title.clone(),
-            description: Some(
-                "Active window; semantic child bridge is degraded on this host".into(),
-            ),
-            value: None,
-            bounds: view.bounds,
-            states: [NodeState::Enabled, NodeState::Focused].into(),
-            actions: [NodeAction::Focus].into(),
-            parent: None,
-            children: Vec::new(),
-            properties: BTreeMap::from([("application_id".into(), view.application_id.clone())]),
-        }])
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(nodes) = crate::atspi_linux::semantic_nodes(view, generation).await {
+                return Ok(nodes);
+            }
+        }
+        Ok(fallback_window_node(view, generation))
     }
 
     async fn capture_frame(
@@ -385,7 +452,7 @@ impl NativeDesktopBridge for CommandNativeBridge {
         action: &DesktopAction,
         _generation: SnapshotGeneration,
     ) -> Result<NativeActionEvidence, BackendError> {
-        execute_action(action).await?;
+        execute_action(action, &self.portal).await?;
         Ok(NativeActionEvidence {
             backend_operation: format!("{:?}", action.effect()).to_ascii_lowercase(),
             native_target_id: action
@@ -398,6 +465,30 @@ impl NativeDesktopBridge for CommandNativeBridge {
             ),
         })
     }
+}
+
+fn fallback_window_node(
+    view: &ActiveView,
+    generation: SnapshotGeneration,
+) -> Vec<AccessibilityNode> {
+    let handle = NodeHandle {
+        window_id: view.window_id.clone(),
+        generation,
+        opaque_id: "active-window".into(),
+    };
+    vec![AccessibilityNode {
+        handle,
+        role: SemanticRole::Window,
+        name: view.title.clone(),
+        description: Some("Active window; semantic child bridge is degraded on this host".into()),
+        value: None,
+        bounds: view.bounds,
+        states: [NodeState::Enabled, NodeState::Focused].into(),
+        actions: [NodeAction::Focus].into(),
+        parent: None,
+        children: Vec::new(),
+        properties: BTreeMap::from([("application_id".into(), view.application_id.clone())]),
+    }]
 }
 
 async fn capture_png(
@@ -465,7 +556,14 @@ fn redact_rgba(bytes: &mut [u8], width: u32, height: u32, region: Rect) {
     }
 }
 
-async fn execute_action(action: &DesktopAction) -> Result<(), BackendError> {
+async fn execute_action(
+    action: &DesktopAction,
+    portal: &WaylandPortalManager,
+) -> Result<(), BackendError> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = execute_atspi_action(action).await {
+        return result;
+    }
     match action {
         DesktopAction::Launch { application } => {
             launch(&application.stable_id, &application.arguments)
@@ -474,6 +572,17 @@ async fn execute_action(action: &DesktopAction) -> Result<(), BackendError> {
         DesktopAction::Focus { target } | DesktopAction::Click { target, .. } => {
             focus_window(&target.window_id.0).await
         }
+        DesktopAction::Scroll {
+            target: None,
+            delta_x,
+            delta_y,
+        } => match portal
+            .notify_pointer_axis(f64::from(*delta_x), f64::from(*delta_y))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(_) => scroll(*delta_y).await,
+        },
         DesktopAction::Scroll { delta_y, .. } => scroll(*delta_y).await,
         DesktopAction::Inspect { .. }
         | DesktopAction::Capture { .. }
@@ -482,6 +591,30 @@ async fn execute_action(action: &DesktopAction) -> Result<(), BackendError> {
         DesktopAction::Drag { .. } => Err(BackendError::Unavailable(
             "drag requires a coordinate-capable native bridge".into(),
         )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn execute_atspi_action(action: &DesktopAction) -> Option<Result<(), BackendError>> {
+    match action {
+        DesktopAction::Focus { target } if crate::atspi_linux::is_atspi_handle(target) => {
+            Some(crate::atspi_linux::focus(target).await)
+        }
+        DesktopAction::Click { target, .. } if crate::atspi_linux::is_atspi_handle(target) => {
+            Some(crate::atspi_linux::press(target).await)
+        }
+        DesktopAction::TypeText { target, text, .. }
+            if crate::atspi_linux::is_atspi_handle(target) =>
+        {
+            Some(crate::atspi_linux::set_text(target, text).await)
+        }
+        DesktopAction::Scroll {
+            target: Some(target),
+            ..
+        } if crate::atspi_linux::is_atspi_handle(target) => {
+            Some(crate::atspi_linux::scroll_to(target).await)
+        }
+        _ => None,
     }
 }
 

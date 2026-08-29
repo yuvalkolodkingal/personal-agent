@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use personal_agent_contracts::proto::EventEnvelope;
 use personal_agent_policy::{DataZone, Effect, Idempotency, Risk, ToolDescriptor};
 use personal_agent_tools::{ToolCall, ToolError, ToolGateway, ToolImplementation};
@@ -334,6 +334,12 @@ impl ToolImplementation for RuntimeStatusTool {
 struct BridgeRequest {
     session_id: String,
     directory: String,
+    #[serde(default)]
+    operation: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    arguments: Value,
 }
 
 struct NativeToolBridge {
@@ -481,6 +487,18 @@ async fn execute_bridge_request(
     if !authorized {
         return (403, serde_json::json!({"error":"session scope denied"}));
     }
+    if request.operation.as_deref() == Some("authorize") {
+        let Some(tool) = request.tool.as_deref() else {
+            return (400, serde_json::json!({"error":"coding tool is required"}));
+        };
+        return match authorize_coding_tool(tool, &request.arguments, &directory) {
+            Ok(()) => (
+                200,
+                serde_json::json!({"authorized":true,"tool":tool,"boundary":"native-tool-gateway"}),
+            ),
+            Err(reason) => (403, serde_json::json!({"error":reason})),
+        };
+    }
     let call = ToolCall {
         call_id: Uuid::now_v7(),
         goal_id: Uuid::nil(),
@@ -499,6 +517,124 @@ async fn execute_bridge_request(
         Ok(output) => (200, output.value),
         Err(_) => (403, serde_json::json!({"error":"tool call denied"})),
     }
+}
+
+fn authorize_coding_tool(tool: &str, arguments: &Value, directory: &Path) -> Result<(), String> {
+    const CODING_TOOLS: &[&str] = &[
+        "apply_patch",
+        "bash",
+        "edit",
+        "execute",
+        "glob",
+        "grep",
+        "list",
+        "lsp",
+        "patch",
+        "read",
+        "skill",
+        "task",
+        "todoread",
+        "todowrite",
+        "webfetch",
+        "websearch",
+        "write",
+    ];
+    if !CODING_TOOLS.contains(&tool) {
+        return Err("coding tool is not in the reviewed native allowlist".into());
+    }
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "coding tool arguments must be an object".to_owned())?;
+    for key in ["filePath", "path", "cwd", "workdir"] {
+        if let Some(path) = object.get(key).and_then(Value::as_str)
+            && !path_is_within_workspace(directory, path)
+        {
+            return Err(format!("{key} leaves the registered session workspace"));
+        }
+    }
+    if matches!(tool, "apply_patch" | "patch") {
+        let patch_text = object
+            .get("patchText")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "apply_patch patchText is required".to_owned())?;
+        validate_patch_paths(directory, patch_text)?;
+    }
+    if tool == "bash" {
+        let command = object
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "bash command is required".to_owned())?;
+        if command.is_empty() || command.len() > 16 * 1024 || command.contains('\0') {
+            return Err("bash command is empty or exceeds the native limit".into());
+        }
+        let normalized = command.to_ascii_lowercase();
+        if [
+            "rm -rf",
+            "git reset --hard",
+            "git clean -",
+            "sudo ",
+            "doas ",
+            "mkfs",
+            "shutdown",
+            "reboot",
+            "> /dev/",
+        ]
+        .iter()
+        .any(|forbidden| normalized.contains(forbidden))
+        {
+            return Err("destructive or privileged shell command is blocked natively".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_patch_paths(workspace: &Path, patch_text: &str) -> Result<(), String> {
+    const PATH_MARKERS: &[&str] = &[
+        "*** Add File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    let mut found = false;
+    for line in patch_text.lines() {
+        let Some(target) = PATH_MARKERS
+            .iter()
+            .find_map(|marker| line.strip_prefix(marker))
+        else {
+            continue;
+        };
+        found = true;
+        if !path_is_within_workspace(workspace, target.trim()) {
+            return Err("apply_patch target leaves the registered session workspace".into());
+        }
+    }
+    if !found {
+        return Err("apply_patch contains no reviewed file target".into());
+    }
+    Ok(())
+}
+
+fn path_is_within_workspace(workspace: &Path, value: &str) -> bool {
+    if value.is_empty() || value.contains('\0') {
+        return false;
+    }
+    let input = Path::new(value);
+    let candidate = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        workspace.join(input)
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+        return canonical.starts_with(workspace);
+    }
+    let mut ancestor = candidate.as_path();
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            return false;
+        };
+        ancestor = parent;
+    }
+    std::fs::canonicalize(ancestor).is_ok_and(|canonical| canonical.starts_with(workspace))
 }
 
 async fn write_bridge_response(
@@ -546,6 +682,45 @@ pub struct OpenCodeApiClient {
     client: reqwest::Client,
 }
 
+/// Command sent to a native-owned `OpenCode` PTY websocket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PtySocketCommand {
+    /// UTF-8 terminal input. The caller must send arguments and commands as
+    /// terminal input rather than constructing a shell command for the host.
+    Input(String),
+    /// Gracefully detach from the PTY without terminating the PTY process.
+    Close,
+}
+
+/// Sanitized event emitted by a native-owned `OpenCode` PTY websocket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PtySocketEvent {
+    /// UTF-8 output emitted by the terminal.
+    Output(String),
+    /// Absolute UTF-16 cursor emitted after replay by the pinned protocol.
+    Cursor(u64),
+    /// The websocket closed. A normal detach uses code 1000.
+    Closed { code: u16, reason: String },
+    /// The websocket failed after it was connected. Endpoint and credentials
+    /// are deliberately excluded from this error surface.
+    Error(String),
+}
+
+/// Native PTY websocket channels and its owning task.
+///
+/// The loopback endpoint, Basic credential and short-lived connection ticket
+/// remain inside this crate. Dropping the command sender does not terminate the
+/// remote PTY; it only detaches the local websocket.
+pub struct PtySocketConnection {
+    /// Bounded input/control channel.
+    pub commands: mpsc::Sender<PtySocketCommand>,
+    /// Bounded stream of sanitized output/control events.
+    pub events: mpsc::Receiver<PtySocketEvent>,
+    /// Native websocket task. Callers should abort it during host shutdown if
+    /// a graceful `Close` command cannot be delivered.
+    pub task: JoinHandle<()>,
+}
+
 /// A submitted prompt and its private event receiver.
 pub struct PromptSubmission {
     /// Stable user message identifier used to correlate the final assistant reply.
@@ -555,6 +730,168 @@ pub struct PromptSubmission {
 }
 
 impl OpenCodeApiClient {
+    /// Open one authenticated, resumable PTY websocket without disclosing the
+    /// loopback endpoint or sidecar credential to the renderer.
+    ///
+    /// The pinned `OpenCode` protocol sends terminal output as UTF-8 text and a
+    /// single binary control frame (`0x00` plus JSON) with the absolute replay
+    /// cursor. Input remains raw UTF-8 terminal data. The short-lived ticket is
+    /// requested and consumed entirely inside this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier/directory is invalid, ticket
+    /// issuance fails, or the websocket cannot be opened.
+    #[allow(clippy::too_many_lines)] // Ticket issuance and the websocket loop stay adjacent for credential containment.
+    pub async fn connect_pty(
+        &self,
+        pty_id: &str,
+        directory: &Path,
+        cursor: u64,
+    ) -> Result<PtySocketConnection, RuntimeError> {
+        validate_pty_identifier(pty_id)?;
+        let directory = directory
+            .to_str()
+            .ok_or_else(|| RuntimeError::Rejected("PTY workspace path is not UTF-8".into()))?;
+        if directory.is_empty() || directory.contains('\0') {
+            return Err(RuntimeError::Rejected(
+                "PTY workspace path is invalid".into(),
+            ));
+        }
+
+        let path = format!("/pty/{pty_id}/connect-token");
+        let ticket_url = self
+            .endpoint
+            .join(path.trim_start_matches('/'))
+            .map_err(|_| RuntimeError::Rejected("PTY ticket URL is invalid".into()))?;
+        let origin = self.endpoint.origin().ascii_serialization();
+        let response = self
+            .client
+            .post(ticket_url)
+            .query(&[("directory", directory)])
+            .header("x-opencode-ticket", "1")
+            .header(reqwest::header::ORIGIN, origin)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RuntimeError::Rejected(format!(
+                "OpenCode denied the PTY connection ticket with HTTP {status}"
+            )));
+        }
+        let ticket = response
+            .json::<Value>()
+            .await?
+            .get("ticket")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                RuntimeError::Rejected("OpenCode returned an invalid PTY ticket".into())
+            })?;
+
+        let path = format!("/pty/{pty_id}/connect");
+        let mut websocket_url = self
+            .endpoint
+            .join(path.trim_start_matches('/'))
+            .map_err(|_| RuntimeError::Rejected("PTY websocket URL is invalid".into()))?;
+        websocket_url
+            .set_scheme(if websocket_url.scheme() == "https" {
+                "wss"
+            } else {
+                "ws"
+            })
+            .map_err(|()| RuntimeError::Rejected("PTY websocket scheme is invalid".into()))?;
+        websocket_url
+            .query_pairs_mut()
+            .append_pair("directory", directory)
+            .append_pair("cursor", &cursor.to_string())
+            .append_pair("ticket", &ticket);
+
+        let (socket, _) = tokio_tungstenite::connect_async(websocket_url.as_str())
+            .await
+            .map_err(|_| RuntimeError::Rejected("PTY websocket connection failed".into()))?;
+        let (mut sink, mut stream) = socket.split();
+        let (commands_tx, mut commands_rx) = mpsc::channel(128);
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    command = commands_rx.recv() => {
+                        match command {
+                            Some(PtySocketCommand::Input(input)) => {
+                                if input.len() > 64 * 1024 {
+                                    let _ = events_tx.send(PtySocketEvent::Error(
+                                        "terminal input exceeded the native 64 KiB frame limit".into(),
+                                    )).await;
+                                    continue;
+                                }
+                                if sink.send(tokio_tungstenite::tungstenite::Message::Text(input.into())).await.is_err() {
+                                    let _ = events_tx.send(PtySocketEvent::Error(
+                                        "terminal input connection failed".into(),
+                                    )).await;
+                                    break;
+                                }
+                            }
+                            Some(PtySocketCommand::Close) | None => {
+                                let _ = sink.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+                                break;
+                            }
+                        }
+                    }
+                    frame = stream.next() => {
+                        match frame {
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(output))) => {
+                                if events_tx.send(PtySocketEvent::Output(output.to_string())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+                                if let Some(event) = parse_pty_control_frame(&bytes)
+                                    && events_tx.send(event).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => {
+                                let (code, reason) = frame.map_or((1000, String::new()), |frame| {
+                                    (u16::from(frame.code), bounded_text(&frame.reason, 200))
+                                });
+                                let _ = events_tx.send(PtySocketEvent::Closed { code, reason }).await;
+                                break;
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                                if sink.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_)
+                                | tokio_tungstenite::tungstenite::Message::Frame(_))) => {}
+                            Some(Err(_)) => {
+                                let _ = events_tx.send(PtySocketEvent::Error(
+                                    "terminal output connection failed".into(),
+                                )).await;
+                                break;
+                            }
+                            None => {
+                                let _ = events_tx.send(PtySocketEvent::Closed {
+                                    code: 1006,
+                                    reason: "terminal connection ended".into(),
+                                }).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(PtySocketConnection {
+            commands: commands_tx,
+            events: events_rx,
+            task,
+        })
+    }
+
     /// Call one reviewed `OpenCode` operation without exposing credentials to
     /// the renderer.
     ///
@@ -569,6 +906,27 @@ impl OpenCodeApiClient {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, RuntimeError> {
+        self.request_json_with_timeout(method, path, query, body, None)
+            .await
+    }
+
+    /// Call one reviewed `OpenCode` operation with an optional per-request
+    /// timeout override. This is reserved for upstream operations whose
+    /// documented lifetime exceeds the normal 120-second API budget (for
+    /// example, the five-minute MCP OAuth callback waiter).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the route is invalid, the request fails, or the
+    /// response is not JSON.
+    pub async fn request_json_with_timeout(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value, RuntimeError> {
         if !path.starts_with('/') || path.contains("..") || path.contains(['?', '#']) {
             return Err(RuntimeError::Rejected(
                 "runtime API path is not canonical".into(),
@@ -581,6 +939,9 @@ impl OpenCodeApiClient {
         let mut request = self.client.request(method, url).query(query);
         if let Some(body) = body {
             request = request.json(&body);
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
         }
         let response = request.send().await?;
         let status = response.status();
@@ -600,6 +961,33 @@ impl OpenCodeApiClient {
         serde_json::from_slice(&bytes)
             .map_err(|_| RuntimeError::Rejected("OpenCode API returned invalid JSON".into()))
     }
+}
+
+fn validate_pty_identifier(pty_id: &str) -> Result<(), RuntimeError> {
+    if pty_id.is_empty()
+        || pty_id.len() > 128
+        || !pty_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(RuntimeError::Rejected(
+            "PTY identifier is not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_pty_control_frame(bytes: &[u8]) -> Option<PtySocketEvent> {
+    let json = bytes.strip_prefix(&[0])?;
+    let cursor = serde_json::from_slice::<Value>(json)
+        .ok()?
+        .get("cursor")?
+        .as_u64()?;
+    Some(PtySocketEvent::Cursor(cursor))
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 impl OpenCodeSidecar {
@@ -1056,6 +1444,15 @@ impl OpenCodeSidecar {
         if let Some(system) = options.system.filter(|value| !value.trim().is_empty()) {
             prompt_body.insert("system".to_owned(), Value::String(system.to_owned()));
         }
+        let admitted_payload = serde_json::json!({
+            "message_id": message_id,
+            "provider_id": prompt_body.get("model")
+                .and_then(|model| model.get("providerID"))
+                .and_then(Value::as_str),
+            "model_id": prompt_body.get("model")
+                .and_then(|model| model.get("modelID").or_else(|| model.get("id")))
+                .and_then(Value::as_str),
+        });
         let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
             Value::Object(prompt_body),
             "session prompt body",
@@ -1077,7 +1474,7 @@ impl OpenCodeSidecar {
             1,
             session_id,
             "response.admitted",
-            &serde_json::json!({"message_id": message_id}),
+            &admitted_payload,
         )?)
         .await
         .map_err(|_| RuntimeError::StreamClosed)?;
@@ -2147,7 +2544,10 @@ mod tests {
         assert_eq!(body["variant"], "high");
     }
 
-    async fn spawn_openai_compatible_fixture(metadata_path: &std::path::Path) -> (Child, u16) {
+    async fn spawn_openai_compatible_fixture(
+        metadata_path: &std::path::Path,
+        write_path: &std::path::Path,
+    ) -> (Child, u16) {
         let port = OpenCodeSidecar::reserve_loopback_port().expect("fixture port");
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/fixtures/openai-compatible.ts");
@@ -2155,6 +2555,7 @@ mod tests {
             .arg(script)
             .arg(format!("--port={port}"))
             .arg(format!("--metadata-path={}", metadata_path.display()))
+            .arg(format!("--write-path={}", write_path.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2273,6 +2674,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One scenario keeps the complete authenticated boundary contract visible.
     async fn native_tool_bridge_requires_authentication_and_registered_session_scope() {
         let temp = tempfile::tempdir().expect("temp profile");
         let directory = std::fs::canonicalize(temp.path()).expect("canonical fixture directory");
@@ -2304,7 +2706,33 @@ mod tests {
         sessions
             .write()
             .expect("session registry")
-            .insert("session-fixture".into(), directory);
+            .insert("session-fixture".into(), directory.clone());
+        let mismatched_session = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "session_id": "session-other",
+                "directory": directory.display().to_string(),
+            }))
+            .send()
+            .await
+            .expect("mismatched session request");
+        assert_eq!(mismatched_session.status(), reqwest::StatusCode::FORBIDDEN);
+        let other_directory = tempfile::tempdir().expect("other fixture directory");
+        let mismatched_directory = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "session_id": "session-fixture",
+                "directory": other_directory.path().display().to_string(),
+            }))
+            .send()
+            .await
+            .expect("mismatched directory request");
+        assert_eq!(
+            mismatched_directory.status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
         let accepted = client
             .post(bridge.endpoint.clone())
             .bearer_auth(bridge.token.expose_secret())
@@ -2319,6 +2747,80 @@ mod tests {
                 .await
                 .expect("native bridge response")["boundary"],
             "native-tool-gateway"
+        );
+        let coding = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "operation": "authorize",
+                "session_id": "session-fixture",
+                "directory": directory.display().to_string(),
+                "tool": "write",
+                "arguments": {"filePath": directory.join("src/new.rs").display().to_string(), "content": "safe"}
+            }))
+            .send()
+            .await
+            .expect("coding authorization request");
+        assert_eq!(coding.status(), reqwest::StatusCode::OK);
+        let external = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "operation": "authorize",
+                "session_id": "session-fixture",
+                "directory": directory.display().to_string(),
+                "tool": "write",
+                "arguments": {"filePath": "/etc/personal-agent-test", "content": "unsafe"}
+            }))
+            .send()
+            .await
+            .expect("external coding request");
+        assert_eq!(external.status(), reqwest::StatusCode::FORBIDDEN);
+        let destructive = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "operation": "authorize",
+                "session_id": "session-fixture",
+                "directory": directory.display().to_string(),
+                "tool": "bash",
+                "arguments": {"command": "git reset --hard HEAD"}
+            }))
+            .send()
+            .await
+            .expect("destructive coding request");
+        assert_eq!(destructive.status(), reqwest::StatusCode::FORBIDDEN);
+        let escaped_patch = client
+            .post(bridge.endpoint.clone())
+            .bearer_auth(bridge.token.expose_secret())
+            .json(&serde_json::json!({
+                "operation": "authorize",
+                "session_id": "session-fixture",
+                "directory": directory.display().to_string(),
+                "tool": "apply_patch",
+                "arguments": {"patchText": "*** Begin Patch\n*** Add File: /etc/personal-agent-test\n+unsafe\n*** End Patch"}
+            }))
+            .send()
+            .await
+            .expect("escaped patch request");
+        assert_eq!(escaped_patch.status(), reqwest::StatusCode::FORBIDDEN);
+        authorize_coding_tool(
+            "apply_patch",
+            &serde_json::json!({
+                "patchText": "*** Begin Patch\n*** Add File: src/new.rs\n+safe\n*** End Patch"
+            }),
+            &directory,
+        )
+        .expect("workspace patch authorization");
+        assert!(
+            authorize_coding_tool(
+                "apply_patch",
+                &serde_json::json!({
+                    "patchText": "*** Begin Patch\n*** Add File: ../outside\n+unsafe\n*** End Patch"
+                }),
+                &directory,
+            )
+            .is_err()
         );
         assert_eq!(bridge.audit_count().await, 1);
     }
@@ -2384,8 +2886,9 @@ mod tests {
         );
         let temp = tempfile::tempdir().expect("temp profile");
         let fixture_metadata = temp.path().join("provider-requests.json");
+        let fixture_write = temp.path().join("coding-tools-proof.txt");
         let (mut provider, provider_port) =
-            spawn_openai_compatible_fixture(&fixture_metadata).await;
+            spawn_openai_compatible_fixture(&fixture_metadata, &fixture_write).await;
         let fixture_provider = json!({
             "npm": "@ai-sdk/openai-compatible",
             "name": "Synthetic fixture provider",
@@ -2525,26 +3028,23 @@ mod tests {
             advertised_tools.contains("personal_agent_gateway_status"),
             "OpenCode did not advertise the native gateway tool: {provider_requests}"
         );
-        for forbidden in [
-            "apply_patch",
-            "bash",
-            "edit",
-            "execute",
-            "glob",
-            "grep",
-            "patch",
-            "read",
-            "task",
-            "webfetch",
-            "websearch",
-            "write",
-        ] {
+        for required in ["bash", "glob", "grep", "read", "task"] {
             assert!(
-                !advertised_tools.contains(forbidden),
-                "safety plugin exposed forbidden built-in {forbidden}: {advertised_tools:?}"
+                advertised_tools.contains(required),
+                "safety plugin did not expose required coding tool {required}: {advertised_tools:?}"
             );
         }
+        assert!(
+            ["apply_patch", "edit", "patch", "write"]
+                .into_iter()
+                .any(|tool| advertised_tools.contains(tool)),
+            "safety plugin did not expose a workspace edit tool: {advertised_tools:?}"
+        );
         assert_eq!(runtime.tool_audit_count().await, 1);
+        assert_eq!(
+            std::fs::read_to_string(&fixture_write).expect("fixture workspace edit"),
+            "Personal Agent coding tools are active.\n"
+        );
         runtime.stop().await.expect("sidecar stop");
         provider.kill().await.expect("fixture provider stop");
         let _ = provider.wait().await;
@@ -2701,5 +3201,99 @@ mod tests {
             normalize_upstream_event(2, "ses_test", &retry, None).expect("retry status");
         assert_eq!(event.r#type, "response.retrying");
         assert!(!terminal);
+    }
+
+    #[test]
+    fn pty_protocol_rejects_path_injection_and_decodes_only_meta_frames() {
+        assert!(validate_pty_identifier("pty_01-safe").is_ok());
+        assert!(validate_pty_identifier("../pty").is_err());
+        assert!(validate_pty_identifier("pty/other").is_err());
+        assert_eq!(
+            parse_pty_control_frame(b"\0{\"cursor\":42}"),
+            Some(PtySocketEvent::Cursor(42))
+        );
+        assert_eq!(parse_pty_control_frame(b"terminal output"), None);
+        assert_eq!(parse_pty_control_frame(b"\0{\"cursor\":-1}"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the pinned OpenCode sidecar binary; run explicitly for native PTY verification"]
+    async fn live_opencode_pty_round_trip() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let executable = std::env::var_os("PERSONAL_AGENT_OPENCODE_BIN")
+            .map_or_else(|| root.join("target/debug/opencode"), PathBuf::from);
+        let plugin = root.join("packages/opencode-plugin/src/index.ts");
+        let profile = tempfile::tempdir().expect("PTY runtime profile");
+        let workspace = tempfile::tempdir().expect("PTY workspace");
+        let mut runtime = OpenCodeSidecar::new(OpenCodeConfig::pinned(
+            executable,
+            plugin,
+            profile.path().to_path_buf(),
+        ));
+        runtime.start().await.expect("start pinned runtime");
+        let client = runtime.api_client().expect("native API client");
+        let created = client
+            .request_json(
+                reqwest::Method::POST,
+                "/pty",
+                &[("directory", workspace.path().display().to_string())],
+                Some(json!({
+                    "command": "/bin/sh",
+                    "args": [],
+                    "cwd": workspace.path(),
+                    "title": "native PTY verification",
+                    "env": {"TERM": "xterm-256color"},
+                })),
+            )
+            .await
+            .expect("create PTY");
+        let id = created["id"].as_str().expect("PTY id").to_owned();
+        let mut connection = client
+            .connect_pty(&id, workspace.path(), 0)
+            .await
+            .expect("attach PTY");
+        connection
+            .commands
+            .send(PtySocketCommand::Input(
+                "printf '__PERSONAL_AGENT_PTY_OK__\\n'\n".into(),
+            ))
+            .await
+            .expect("send PTY input");
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            while let Some(event) = connection.events.recv().await {
+                if let PtySocketEvent::Output(chunk) = event {
+                    output.push_str(&chunk);
+                    if output.contains("__PERSONAL_AGENT_PTY_OK__") {
+                        return output;
+                    }
+                }
+            }
+            output
+        })
+        .await
+        .expect("PTY output timeout");
+        assert!(output.contains("__PERSONAL_AGENT_PTY_OK__"));
+        client
+            .request_json(
+                reqwest::Method::PUT,
+                &format!("/pty/{id}"),
+                &[("directory", workspace.path().display().to_string())],
+                Some(json!({"size":{"rows":32,"cols":100}})),
+            )
+            .await
+            .expect("resize PTY");
+        let _ = connection.commands.send(PtySocketCommand::Close).await;
+        connection.task.abort();
+        client
+            .request_json(
+                reqwest::Method::DELETE,
+                &format!("/pty/{id}"),
+                &[("directory", workspace.path().display().to_string())],
+                None,
+            )
+            .await
+            .expect("remove PTY");
+        runtime.stop().await.expect("stop runtime");
     }
 }

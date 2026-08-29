@@ -365,6 +365,23 @@ impl EventStore {
         load_snapshot(&self.connection, "agent-supervisor", &goal_id.to_string())
     }
 
+    /// Atomically persist a supervisor transition and its append-only projection event.
+    ///
+    /// # Errors
+    /// Returns schema, sequence, JSON, or database errors.
+    pub fn save_supervisor_snapshot_and_event(
+        &mut self,
+        snapshot: &personal_agent_agent::SupervisorSnapshot,
+        event: &EventEnvelope,
+    ) -> Result<(), StorageError> {
+        self.save_runtime_snapshot_and_event(
+            "agent-supervisor",
+            &snapshot.graph.goal_id.to_string(),
+            snapshot,
+            event,
+        )
+    }
+
     /// Atomically persist the complete scheduler snapshot.
     ///
     /// # Errors
@@ -442,6 +459,68 @@ impl EventStore {
         profile_id: &str,
     ) -> Result<Option<personal_agent_memory::PersistentMemory>, StorageError> {
         load_snapshot(&self.connection, "memory-system-v2", profile_id)
+    }
+
+    /// Persist an application-owned encrypted runtime snapshot.
+    ///
+    /// This narrow generic boundary avoids crate cycles for higher-level core
+    /// subsystems while retaining the same atomic `SQLCipher` transaction.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn save_runtime_snapshot<T: serde::Serialize>(
+        &mut self,
+        kind: &str,
+        id: &str,
+        snapshot: &T,
+    ) -> Result<(), StorageError> {
+        save_snapshot(&mut self.connection, kind, id, snapshot)
+    }
+
+    /// Load an application-owned encrypted runtime snapshot.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn runtime_snapshot<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<T>, StorageError> {
+        load_snapshot(&self.connection, kind, id)
+    }
+
+    /// Atomically persist one runtime snapshot and its append-only domain event.
+    ///
+    /// # Errors
+    /// Returns schema, sequence, JSON, or database errors.
+    pub fn save_runtime_snapshot_and_event<T: serde::Serialize>(
+        &mut self,
+        kind: &str,
+        id: &str,
+        snapshot: &T,
+        event: &EventEnvelope,
+    ) -> Result<(), StorageError> {
+        if event.schema_version != personal_agent_contracts::EVENT_SCHEMA_VERSION {
+            return Err(StorageError::UnsupportedEventSchema(event.schema_version));
+        }
+        let sequence = i64::try_from(event.monotonic_sequence)
+            .map_err(|_| StorageError::SequenceOutOfRange(event.monotonic_sequence))?;
+        let body = serde_json::to_string(snapshot)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO runtime_snapshots(kind,id,body_json,updated_at)
+             VALUES (?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(kind,id) DO UPDATE SET body_json=excluded.body_json, updated_at=excluded.updated_at",
+            params![kind, id, body],
+        )?;
+        tx.execute(
+            "INSERT INTO events(monotonic_sequence,event_id,profile_id,event_type,wall_clock_timestamp,envelope) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![sequence, event.event_id, event.profile_id, event.r#type, event.wall_clock_timestamp, event.encode_to_vec()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -660,6 +739,52 @@ mod tests {
             EventEnvelope::new(1, "test", "default", "goal.created", &json!({})).expect("event");
         store.append(&event).expect("first");
         assert!(store.append(&event).is_err());
+    }
+
+    #[test]
+    fn snapshot_and_event_commit_or_rollback_together() {
+        let mut store = EventStore::open_in_memory(&SecretString::from("test-only-key".to_owned()))
+            .expect("store");
+        let first = EventEnvelope::new(
+            1,
+            "test",
+            "default",
+            "artifact.created",
+            &json!({"version": 1}),
+        )
+        .expect("event");
+        store
+            .save_runtime_snapshot_and_event(
+                "artifact-workspace-v1",
+                "default",
+                &json!({"version": 1}),
+                &first,
+            )
+            .expect("commit");
+        let duplicate = EventEnvelope::new(
+            1,
+            "test",
+            "default",
+            "artifact.changed",
+            &json!({"version": 2}),
+        )
+        .expect("duplicate");
+        assert!(
+            store
+                .save_runtime_snapshot_and_event(
+                    "artifact-workspace-v1",
+                    "default",
+                    &json!({"version": 2}),
+                    &duplicate,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .runtime_snapshot::<serde_json::Value>("artifact-workspace-v1", "default")
+                .expect("load"),
+            Some(json!({"version": 1}))
+        );
     }
 
     #[test]

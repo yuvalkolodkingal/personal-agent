@@ -125,6 +125,61 @@ export type ApplyResult = {
   rejected: Array<{ operation: EditOperation; reason: string }>;
 };
 
+export type NativeDictationAvailability =
+  | "degraded"
+  | "permission_required"
+  | "unavailable";
+
+export type NativeInputContract = {
+  platform: string;
+  session: string;
+  adapter: string;
+  availability: NativeDictationAvailability;
+  review_before_insert: boolean;
+  supports_text_insertion: boolean;
+  supports_live_revisions: boolean;
+  supports_verified_edits: boolean;
+  detail: string;
+  remediation?: string | null;
+};
+
+export type NativeDictationTarget = {
+  application_id: string;
+  title: string;
+  window_id: string;
+  secure: boolean;
+};
+
+export type NativeDictationPending = {
+  transaction_id: number;
+  text: string;
+  final_result: boolean;
+  kind: "insert" | "replace_last" | "undo_last";
+  warning?: string | null;
+  preview_latency_ms: number;
+};
+
+export type NativeDictationStatus = {
+  contract: NativeInputContract;
+  armed_target?: NativeDictationTarget | null;
+  pending?: NativeDictationPending | null;
+  undo_available: boolean;
+  metrics: {
+    last_apply_ms?: number | null;
+    p95_apply_ms?: number | null;
+    apply_samples: number;
+  };
+};
+
+export type NativeDictationApplyResult = {
+  submitted: boolean;
+  verified: boolean;
+  adapter: string;
+  elapsed_ms: number;
+  detail: string;
+  status: NativeDictationStatus;
+};
+
 /**
  * Typed frontend boundary for the native dictation engine and focused-target adapter.
  * The module is deliberately independent of chat and wake capture; callers feed the partials
@@ -172,6 +227,50 @@ export class DictationClient {
 
   reset(mode: DictationMode = "natural"): Promise<void> {
     return this.#transport("dictation_reset", { mode }) as Promise<void>;
+  }
+
+  nativeStatus(): Promise<NativeDictationStatus> {
+    return this.#transport(
+      "native_dictation_status",
+    ) as Promise<NativeDictationStatus>;
+  }
+
+  armNative(delayMs = 2_500): Promise<NativeDictationStatus> {
+    return this.#transport("native_dictation_arm", {
+      delayMs,
+    }) as Promise<NativeDictationStatus>;
+  }
+
+  disarmNative(): Promise<NativeDictationStatus> {
+    return this.#transport(
+      "native_dictation_disarm",
+    ) as Promise<NativeDictationStatus>;
+  }
+
+  stageNative(update: DictationUpdate): Promise<NativeDictationStatus> {
+    return this.#transport("native_dictation_stage", {
+      update,
+    }) as Promise<NativeDictationStatus>;
+  }
+
+  discardNative(): Promise<NativeDictationStatus> {
+    return this.#transport(
+      "native_dictation_discard",
+    ) as Promise<NativeDictationStatus>;
+  }
+
+  confirmNative(delayMs = 2_500): Promise<NativeDictationApplyResult> {
+    return this.#transport("native_dictation_confirm", {
+      confirmed: true,
+      delayMs,
+    }) as Promise<NativeDictationApplyResult>;
+  }
+
+  undoNative(delayMs = 2_500): Promise<NativeDictationApplyResult> {
+    return this.#transport("native_dictation_undo", {
+      confirmed: true,
+      delayMs,
+    }) as Promise<NativeDictationApplyResult>;
   }
 }
 

@@ -9,6 +9,13 @@ const voiceCallbacks = vi.hoisted(() => ({
   final: null as null | ((text: string, meta: VoiceTranscriptMeta) => void),
   partial: null as null | ((text: string, meta: VoiceTranscriptMeta) => void),
 }));
+const eventCallbacks = vi.hoisted(
+  () =>
+    ({}) as Record<
+      string,
+      (event: { payload: Record<string, unknown> }) => void
+    >,
+);
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
@@ -56,12 +63,46 @@ const meta: VoiceTranscriptMeta = {
   audioEndMs: 100,
 };
 
+const nativeContract = {
+  platform: "linux",
+  session: "wayland",
+  adapter: "wtype",
+  availability: "degraded",
+  review_before_insert: true,
+  supports_text_insertion: true,
+  supports_live_revisions: true,
+  supports_verified_edits: false,
+  detail: "Wayland text insertion is available but unverified.",
+  remediation: "Verify the destination field visually.",
+};
+
+const nativeTarget = {
+  application_id: "code",
+  title: "Project notes",
+  window_id: "0xabc",
+  secure: false,
+};
+
+const nativeStatus = (pending: Record<string, unknown> | null = null) => ({
+  contract: nativeContract,
+  armed_target: nativeTarget,
+  pending,
+  undo_available: false,
+  metrics: { apply_samples: 0 },
+});
+
 describe("voice input routing", () => {
   beforeEach(() => {
     voiceCallbacks.final = null;
     voiceCallbacks.partial = null;
+    for (const name of Object.keys(eventCallbacks)) delete eventCallbacks[name];
     listen.mockReset();
-    listen.mockResolvedValue(() => undefined);
+    listen.mockImplementation(
+      (name: string, callback: (event: { payload: Record<string, unknown> }) => void) => {
+        eventCallbacks[name] = callback;
+        return Promise.resolve(() => undefined);
+      },
+    );
     invoke.mockReset();
     invoke.mockImplementation((command: string, payload?: Record<string, unknown>) => {
       if (command === "bootstrap")
@@ -142,6 +183,33 @@ describe("voice input routing", () => {
           ],
         });
       }
+      if (command === "native_dictation_status")
+        return Promise.resolve({ ...nativeStatus(), armed_target: null });
+      if (command === "native_dictation_arm")
+        return Promise.resolve(nativeStatus());
+      if (command === "native_dictation_disarm" || command === "native_dictation_discard")
+        return Promise.resolve({ ...nativeStatus(), armed_target: null });
+      if (command === "native_dictation_stage") {
+        const update = payload?.update as { rendered_text: string; final_result: boolean };
+        return Promise.resolve(
+          nativeStatus({
+            transaction_id: 1,
+            text: update.rendered_text,
+            final_result: update.final_result,
+            kind: "insert",
+            preview_latency_ms: 1,
+          }),
+        );
+      }
+      if (command === "native_dictation_confirm")
+        return Promise.resolve({
+          submitted: true,
+          verified: false,
+          adapter: "wtype",
+          elapsed_ms: 2,
+          detail: "Verify visually",
+          status: nativeStatus(),
+        });
       if (command === "chat_send")
         return Promise.resolve({
           session_id: "ses_voice",
@@ -211,6 +279,39 @@ describe("voice input routing", () => {
     );
   });
 
+  it("refreshes pending runtime approvals before a tool turn completes", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Agent" });
+    act(() => voiceCallbacks.final?.("run the reviewed checks", meta));
+    await waitFor(() => expect(eventCallbacks["runtime-event"]).toBeTypeOf("function"));
+
+    act(() =>
+      eventCallbacks["runtime-event"]!({
+        payload: {
+          schemaVersion: 1,
+          eventId: "evt-approval",
+          wallClockTimestamp: new Date().toISOString(),
+          monotonicSequence: 1,
+          origin: "opencode",
+          profileId: "default",
+          sessionId: "ses_voice",
+          type: "approval.requested",
+          payloadJson: JSON.stringify({
+            id: "perm-1",
+            permission: "bash",
+          }),
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("runtime_catalog", {
+        directory: fallbackConfig.runtime.working_directory,
+      }),
+    );
+    expect(screen.getByText("Waiting for your approval")).toBeInTheDocument();
+  });
+
   it("handles the deterministic start-dictation command without a model turn", async () => {
     render(<App />);
     act(() => voiceCallbacks.final?.("start dictation", meta));
@@ -221,5 +322,26 @@ describe("voice input routing", () => {
       ),
     );
     expect(invoke).not.toHaveBeenCalledWith("chat_send", expect.anything());
+  });
+
+  it("reviews focused-app dictation and requires an explicit delayed apply", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Dictation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Focused app" }));
+    await screen.findByRole("button", { name: "Arm in 3 seconds" });
+    fireEvent.click(screen.getByRole("button", { name: "Arm in 3 seconds" }));
+    await screen.findByText(/Armed: Project notes/);
+
+    act(() => voiceCallbacks.final?.("hello world", meta));
+    await screen.findByText("hello world");
+    expect(invoke).not.toHaveBeenCalledWith("chat_send", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply in 3s · code" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("native_dictation_confirm", {
+        confirmed: true,
+        delayMs: 2_500,
+      }),
+    );
   });
 });

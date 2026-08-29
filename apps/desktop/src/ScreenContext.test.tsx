@@ -78,10 +78,32 @@ const context = {
         states: ["enabled", "editable"],
         actions: ["focus", "set_value"],
       },
+      {
+        handle: { ...handle, opaque_id: "save" },
+        role: "button",
+        name: "Save",
+        states: ["enabled"],
+        actions: ["press"],
+      },
     ],
     backend: "AT-SPI",
     degraded_reasons: [],
   },
+};
+
+const portalStatus = {
+  interfaces: {
+    screencast_version: 6,
+    remote_desktop_version: undefined,
+    available_source_types: 7,
+    available_cursor_modes: 3,
+  },
+  phase: "idle",
+  consent: "required",
+  kind: undefined,
+  streams: [],
+  pipewire_transport: false,
+  detail: "ScreenCast v6 is available; RemoteDesktop control is not exposed by this portal backend",
 };
 
 describe("screen context capability surface", () => {
@@ -91,6 +113,7 @@ describe("screen context capability surface", () => {
       if (command === "desktop_status") return Promise.resolve(status);
       if (command === "desktop_snapshot") return Promise.resolve(context);
       if (command === "desktop_execute") return Promise.resolve({});
+      if (command === "portal_status") return Promise.resolve(portalStatus);
       return Promise.resolve(undefined);
     });
   });
@@ -112,6 +135,7 @@ describe("screen context capability surface", () => {
     expect(await screen.findByText("Document body")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Focus" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Type" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Press" })).toBeDisabled();
   });
 
   it("sends semantic postconditions for approved text control", async () => {
@@ -155,5 +179,71 @@ describe("screen context capability surface", () => {
         }),
       ),
     );
+  });
+
+  it("dispatches an approved semantic press action", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "desktop_status")
+        return Promise.resolve({
+          ...status,
+          permissions: {
+            accessibility: { state: "granted" },
+            screen_capture: { state: "granted" },
+            input_control: { state: "granted" },
+          },
+        });
+      if (command === "desktop_snapshot") return Promise.resolve(context);
+      if (command === "desktop_execute") return Promise.resolve({});
+      return Promise.resolve(undefined);
+    });
+    render(<ScreenContext />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Read active view" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Press" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("desktop_execute", {
+        request: expect.objectContaining({
+          action: expect.objectContaining({
+            action: "click",
+            button: "primary",
+            click_count: 1,
+          }),
+          authorization: expect.objectContaining({ approved_effects: ["interact"] }),
+          postconditions: [{ postcondition: "generation_advanced" }],
+        }),
+      }),
+    );
+  });
+
+  it("exposes consent-bound portal capture without pretending control exists", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "desktop_status") return Promise.resolve(status);
+      if (command === "portal_status") return Promise.resolve(portalStatus);
+      if (command === "portal_connect")
+        return Promise.resolve({
+          ...portalStatus,
+          phase: "active",
+          consent: "granted",
+          kind: "screen_cast",
+          streams: [{ node_id: 42, size: [1920, 1080] }],
+          detail: "Portal selection is active. PipeWire frame transport is not connected.",
+        });
+      return Promise.resolve(undefined);
+    });
+    render(<ScreenContext />);
+
+    expect(await screen.findByRole("button", { name: "Share screen via portal" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Grant screen control" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Share screen via portal" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("portal_connect", {
+        requestControl: false,
+        parentWindow: "",
+      }),
+    );
+    expect(await screen.findByText("User-selected session active")).toBeInTheDocument();
+    expect(screen.getByText(/PipeWire frames not connected/)).toBeInTheDocument();
   });
 });

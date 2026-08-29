@@ -5,6 +5,10 @@
 
 use super::DesktopState;
 use crate::native_desktop::CommandNativeBridge;
+use crate::native_dictation::{
+    NativeDictationApplyResult, NativeDictationSession, NativeDictationStatus,
+};
+use crate::portal_linux::{PortalStatus, WaylandPortalManager};
 use base64::Engine as _;
 use personal_agent_audio::{
     CommandRouter, DictationEngine, DictationMode, DictationUpdate, EditOperation, EditReceipt,
@@ -22,6 +26,7 @@ use personal_agent_context::{
     BridgeDesktopBackend, CaptureScope, DesktopActionOutcome, DesktopActionRequest, DesktopBackend,
     DesktopCoordinator, ScreenPrivacyPolicy,
 };
+use personal_agent_core::{EgressRecord, EgressSource};
 use personal_agent_local_execution::{
     CommandSpec, DockerRequest, ExecutionPolicy, ExecutionResult, LocalExecutor,
 };
@@ -31,6 +36,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
@@ -41,6 +47,8 @@ pub(crate) struct CapabilityState {
     connectors: Mutex<Vec<ConnectorConfig>>,
     browser: AsyncMutex<BrowserRuntime>,
     dictation: Mutex<DictationEngine>,
+    native_dictation: AsyncMutex<NativeDictationSession>,
+    portal: Arc<WaylandPortalManager>,
     desktop: AsyncMutex<DesktopCoordinator<BridgeDesktopBackend<CommandNativeBridge>>>,
 }
 
@@ -58,6 +66,7 @@ impl CapabilityState {
         } else {
             Vec::new()
         };
+        let portal = WaylandPortalManager::live();
         Ok(Self {
             connectors_path,
             connectors: Mutex::new(connectors),
@@ -66,10 +75,16 @@ impl CapabilityState {
                 engine: None,
             }),
             dictation: Mutex::new(DictationEngine::default()),
-            desktop: AsyncMutex::new(DesktopCoordinator::new(
-                BridgeDesktopBackend::current(CommandNativeBridge::discover()),
-                ScreenPrivacyPolicy::default(),
-            )),
+            native_dictation: AsyncMutex::new(NativeDictationSession::discover()),
+            desktop: AsyncMutex::new({
+                let bridge = CommandNativeBridge::discover_with_portal(portal.clone());
+                let plan = bridge.backend_plan();
+                DesktopCoordinator::new(
+                    BridgeDesktopBackend::with_plan(bridge, plan),
+                    ScreenPrivacyPolicy::default(),
+                )
+            }),
+            portal,
         })
     }
 
@@ -95,7 +110,7 @@ impl CapabilityState {
         Ok(())
     }
 
-    fn mutate_connectors<T>(
+    pub(crate) fn mutate_connectors<T>(
         &self,
         operation: impl FnOnce(&mut Vec<ConnectorConfig>) -> Result<T, String>,
     ) -> Result<T, String> {
@@ -109,6 +124,67 @@ impl CapabilityState {
         *connectors = candidate;
         Ok(result)
     }
+
+    pub(crate) fn connector(&self, id: Uuid) -> Result<ConnectorConfig, String> {
+        self.connectors
+            .lock()
+            .map_err(|_| "connector state lock is poisoned".to_owned())?
+            .iter()
+            .find(|connector| connector.id == id)
+            .cloned()
+            .ok_or_else(|| "connector does not exist".to_owned())
+    }
+
+    pub(crate) async fn shutdown_portal(&self) {
+        self.portal.disconnect().await;
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn portal_status(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<PortalStatus, String> {
+    let status = state.portal.status();
+    if status.interfaces.screencast_version.is_none()
+        && status.interfaces.remote_desktop_version.is_none()
+        && matches!(status.phase, crate::portal_linux::PortalSessionPhase::Idle)
+    {
+        Ok(state.portal.probe().await)
+    } else {
+        Ok(status)
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn portal_connect(
+    request_control: bool,
+    parent_window: Option<String>,
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<PortalStatus, String> {
+    let parent_window = parent_window.unwrap_or_default();
+    if parent_window.len() > 512
+        || parent_window.contains('\0')
+        || (!parent_window.is_empty()
+            && !parent_window.starts_with("wayland:")
+            && !parent_window.starts_with("x11:"))
+    {
+        return Err("portal parent window handle is invalid".into());
+    }
+    state.portal.connect(request_control, &parent_window).await
+}
+
+#[tauri::command]
+pub(crate) async fn portal_cancel(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<PortalStatus, String> {
+    Ok(state.portal.cancel().await)
+}
+
+#[tauri::command]
+pub(crate) async fn portal_disconnect(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<PortalStatus, String> {
+    Ok(state.portal.disconnect().await)
 }
 
 #[derive(serde::Serialize)]
@@ -285,6 +361,71 @@ pub(crate) fn dictation_apply(operations: Vec<EditOperation>) -> DictationApplyR
     DictationApplyResult { receipts, rejected }
 }
 
+#[tauri::command]
+pub(crate) async fn native_dictation_status(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationStatus, String> {
+    Ok(state.native_dictation.lock().await.status())
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_arm(
+    delay_ms: u64,
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationStatus, String> {
+    state.native_dictation.lock().await.arm(delay_ms).await
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_disarm(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationStatus, String> {
+    Ok(state.native_dictation.lock().await.disarm())
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_stage(
+    update: DictationUpdate,
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationStatus, String> {
+    state.native_dictation.lock().await.stage(update).await
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_discard(
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationStatus, String> {
+    Ok(state.native_dictation.lock().await.discard())
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_confirm(
+    confirmed: bool,
+    delay_ms: u64,
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationApplyResult, String> {
+    state
+        .native_dictation
+        .lock()
+        .await
+        .confirm(confirmed, delay_ms)
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn native_dictation_undo(
+    confirmed: bool,
+    delay_ms: u64,
+    state: tauri::State<'_, CapabilityState>,
+) -> Result<NativeDictationApplyResult, String> {
+    state
+        .native_dictation
+        .lock()
+        .await
+        .undo(confirmed, delay_ms)
+        .await
+}
+
 fn connector_kind(value: &str) -> Result<ConnectorKind, String> {
     match value {
         "github" => Ok(ConnectorKind::GitHub),
@@ -376,7 +517,7 @@ pub(crate) async fn connector_action(
             Err(error) => Err(format!("connector endpoint is unreachable: {error}")),
         };
     }
-    let removed_secret = state.mutate_connectors(|connectors| {
+    let removed_secrets = state.mutate_connectors(|connectors| {
         let index = connectors
             .iter()
             .position(|connector| connector.id == id)
@@ -385,22 +526,33 @@ pub(crate) async fn connector_action(
             "enable" => connectors[index].enabled = true,
             "disable" => connectors[index].enabled = false,
             "delete" if confirmed => {
-                let reference = match &connectors[index].auth {
-                    ConnectorAuth::OAuth2 { keychain_alias, .. }
-                    | ConnectorAuth::BearerToken { keychain_alias } => {
-                        SecretReference::parse(keychain_alias).ok()
+                let references = match &connectors[index].auth {
+                    ConnectorAuth::OAuth2 {
+                        keychain_alias,
+                        refresh_keychain_alias,
+                        ..
+                    } => [Some(keychain_alias), refresh_keychain_alias.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|alias| SecretReference::parse(alias).ok())
+                        .collect(),
+                    ConnectorAuth::BearerToken { keychain_alias } => {
+                        SecretReference::parse(keychain_alias)
+                            .ok()
+                            .into_iter()
+                            .collect()
                     }
-                    ConnectorAuth::None => None,
+                    ConnectorAuth::None => Vec::new(),
                 };
                 connectors.remove(index);
-                return Ok(reference);
+                return Ok(references);
             }
             "delete" => return Err("connector removal requires confirmation".into()),
             _ => return Err("unknown connector action".into()),
         }
-        Ok(None)
+        Ok(Vec::new())
     })?;
-    if let Some(reference) = removed_secret {
+    for reference in removed_secrets {
         let _ = OsSecretStore.delete(&reference);
     }
     Ok(json!({"ok": true}))
@@ -467,9 +619,11 @@ pub(crate) async fn connector_execute(
     body: Option<Value>,
     idempotency_key: Option<String>,
     state: tauri::State<'_, CapabilityState>,
+    desktop: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
     use personal_agent_connectors::Connector as _;
     let id = Uuid::parse_str(&id).map_err(|_| "connector ID is invalid".to_owned())?;
+    crate::connector_oauth::refresh_if_needed(id, &state).await?;
     let config = state
         .connectors
         .lock()
@@ -478,6 +632,10 @@ pub(crate) async fn connector_execute(
         .find(|connector| connector.id == id)
         .cloned()
         .ok_or_else(|| "connector does not exist".to_owned())?;
+    let destination = format!("{:?}", config.kind).to_ascii_lowercase();
+    let request_bytes = serde_json::to_vec(&json!({"query": &query, "body": &body}))
+        .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX));
+    let operation = method.trim().to_ascii_uppercase();
     let connector = RestConnector::new(config, KeychainCredentials);
     let response = connector
         .execute(ConnectorRequest {
@@ -491,7 +649,32 @@ pub(crate) async fn connector_execute(
         })
         .await
         .map_err(|error| error.to_string())?;
+    record_egress(
+        &desktop,
+        EgressRecord {
+            id: Uuid::now_v7(),
+            at: chrono::Utc::now(),
+            source: EgressSource::Connector,
+            destination,
+            operation,
+            data_class: "connector request".into(),
+            size_bytes: Some(request_bytes),
+            purpose: "user-authorized connector action".into(),
+            session_id: None,
+            scope_key: None,
+        },
+    )?;
     serde_json::to_value(response).map_err(|error| error.to_string())
+}
+
+fn record_egress(desktop: &DesktopState, record: EgressRecord) -> Result<(), String> {
+    desktop
+        .profile
+        .lock()
+        .map_err(|_| "profile state lock is poisoned".to_owned())?
+        .record_egress(record)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn browser_policy(state: &DesktopState) -> Result<(bool, BrowserPolicy), String> {
@@ -545,16 +728,36 @@ pub(crate) async fn browser_open(
 pub(crate) async fn browser_navigate(
     url: String,
     state: tauri::State<'_, CapabilityState>,
+    desktop: tauri::State<'_, DesktopState>,
 ) -> Result<PageSnapshot, String> {
     let url = Url::parse(&url).map_err(|error| error.to_string())?;
+    let destination = url.origin().ascii_serialization();
+    let request_bytes = u64::try_from(url.as_str().len()).unwrap_or(u64::MAX);
     let mut runtime = state.browser.lock().await;
-    runtime
+    let snapshot = runtime
         .engine
         .as_mut()
         .ok_or_else(|| "open a browser profile first".to_owned())?
         .navigate(&url)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    drop(runtime);
+    record_egress(
+        &desktop,
+        EgressRecord {
+            id: Uuid::now_v7(),
+            at: chrono::Utc::now(),
+            source: EgressSource::Web,
+            destination,
+            operation: "navigate".into(),
+            data_class: "URL metadata".into(),
+            size_bytes: Some(request_bytes),
+            purpose: "user-requested browser navigation".into(),
+            session_id: None,
+            scope_key: None,
+        },
+    )?;
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -563,12 +766,27 @@ pub(crate) async fn browser_action(
     handle: Option<NodeHandle>,
     text: Option<String>,
     state: tauri::State<'_, CapabilityState>,
+    desktop: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
     let mut runtime = state.browser.lock().await;
     let engine = runtime
         .engine
         .as_mut()
         .ok_or_else(|| "open a browser profile first".to_owned())?;
+    let destination = engine
+        .snapshot()
+        .await
+        .map_err(|error| error.to_string())?
+        .url
+        .origin()
+        .ascii_serialization();
+    let size_bytes = match operation.as_str() {
+        "type" => {
+            Some(u64::try_from(text.as_deref().unwrap_or_default().len()).unwrap_or(u64::MAX))
+        }
+        "snapshot" | "click" => Some(0),
+        _ => None,
+    };
     let value = match operation.as_str() {
         "snapshot" => {
             serde_json::to_value(engine.snapshot().await.map_err(|error| error.to_string())?)
@@ -594,7 +812,31 @@ pub(crate) async fn browser_action(
         }
         _ => return Err("unknown browser action".into()),
     };
-    value.map_err(|error| error.to_string())
+    let value = value.map_err(|error| error.to_string())?;
+    drop(runtime);
+    if let Some(size_bytes) = size_bytes {
+        record_egress(
+            &desktop,
+            EgressRecord {
+                id: Uuid::now_v7(),
+                at: chrono::Utc::now(),
+                source: EgressSource::Web,
+                destination,
+                operation: operation.clone(),
+                data_class: if operation == "type" {
+                    "typed text"
+                } else {
+                    "browser request metadata"
+                }
+                .into(),
+                size_bytes: Some(size_bytes),
+                purpose: "user-requested browser action".into(),
+                session_id: None,
+                scope_key: None,
+            },
+        )?;
+    }
+    Ok(value)
 }
 
 #[tauri::command]

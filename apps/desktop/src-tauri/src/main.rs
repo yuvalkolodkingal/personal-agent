@@ -1,9 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod artifacts_host;
+#[cfg(target_os = "linux")]
+mod atspi_linux;
+mod automation_host;
 mod capabilities;
+mod connector_oauth;
+mod goals_host;
 mod mcp_host;
 mod native_desktop;
+mod native_dictation;
+#[cfg(target_os = "linux")]
+mod portal_linux;
+#[cfg(not(target_os = "linux"))]
+#[path = "portal_stub.rs"]
+mod portal_linux;
+mod pty_host;
+mod skills_agents;
+mod usage_host;
 
 use personal_agent_core::{
     AppProjection, PersistentMemory, PersonalAgentConfig, ProfileState, load_or_initialize_config,
@@ -351,6 +366,10 @@ fn persist_runtime_health(state: &DesktopState, health: &RuntimeHealth) {
 }
 
 fn clean_shutdown(app: &tauri::AppHandle) {
+    let capabilities = app.state::<capabilities::CapabilityState>();
+    tauri::async_runtime::block_on(capabilities.shutdown_portal());
+    let pty = app.state::<pty_host::PtyHostState>();
+    tauri::async_runtime::block_on(pty.shutdown());
     let state = app.state::<DesktopState>();
     if let Ok(mut runtime) = state.runtime.try_lock()
         && let Err(error) = tauri::async_runtime::block_on(runtime.stop())
@@ -417,6 +436,7 @@ fn main() {
                 .arg("--autostart")
                 .build(),
         )
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -455,6 +475,13 @@ fn main() {
             let database = app_data.join("profiles/default.db");
             let mut profile = ProfileState::open(&database, "default", &OsSecretStore)?;
             profile.record_lifecycle_start(previous_unclean_run)?;
+            let automation_state = automation_host::AutomationHostState::load(&mut profile)
+                .map_err(std::io::Error::other)?;
+            let goals_state = goals_host::GoalsHostState::load(
+                &mut profile,
+                &config.config.runtime.working_directory,
+            )
+            .map_err(std::io::Error::other)?;
             let memory = if let Some(memory) = profile.persistent_memory_snapshot()? {
                 memory
             } else {
@@ -475,7 +502,11 @@ fn main() {
                 &config.config,
             );
             app.manage(capabilities::CapabilityState::load(&app_data)?);
+            app.manage(pty_host::PtyHostState::default());
+            app.manage(connector_oauth::ConnectorOAuthState::default());
             app.manage(mcp_host::McpHostState::load(&app_data)?);
+            app.manage(automation_state);
+            app.manage(goals_state);
             app.manage(DesktopState {
                 profile: Mutex::new(profile),
                 memory: Mutex::new(memory),
@@ -521,6 +552,8 @@ fn main() {
                 tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
                 persist_runtime_health(&state, &health);
                 if health.healthy {
+                    automation_host::ensure_resident_executor(handle.clone());
+                    goals_host::ensure_resident_executor(handle.clone());
                     let mcp = handle.state::<mcp_host::McpHostState>();
                     match mcp_host::restore_enabled_servers(&mcp, &state).await {
                         Ok(snapshot) => {
@@ -552,6 +585,19 @@ fn main() {
             api::runtime_operation,
             api::runtime_answer,
             api::domain_action,
+            automation_host::automation_snapshot,
+            automation_host::automation_execute,
+            goals_host::goals_snapshot,
+            goals_host::goals_execute,
+            usage_host::usage_snapshot,
+            usage_host::usage_export,
+            artifacts_host::artifact_snapshot,
+            artifacts_host::artifact_create,
+            artifacts_host::artifact_add_version,
+            artifacts_host::artifact_restore_version,
+            artifacts_host::artifact_content,
+            artifacts_host::artifact_action,
+            artifacts_host::artifact_export,
             api::provider_oauth_authorize,
             api::provider_oauth_callback,
             api::provider_set_key,
@@ -573,6 +619,10 @@ fn main() {
             capabilities::connector_action,
             capabilities::connector_set_grants,
             capabilities::connector_execute,
+            connector_oauth::connector_oauth_authorize,
+            connector_oauth::connector_oauth_cancel,
+            connector_oauth::connector_oauth_refresh,
+            connector_oauth::connector_oauth_revoke,
             capabilities::browser_open,
             capabilities::browser_navigate,
             capabilities::browser_action,
@@ -584,12 +634,35 @@ fn main() {
             capabilities::voice_route,
             capabilities::dictation_latency_report,
             capabilities::dictation_reset,
+            capabilities::native_dictation_status,
+            capabilities::native_dictation_arm,
+            capabilities::native_dictation_disarm,
+            capabilities::native_dictation_stage,
+            capabilities::native_dictation_discard,
+            capabilities::native_dictation_confirm,
+            capabilities::native_dictation_undo,
             capabilities::desktop_status,
             capabilities::desktop_set_capture,
             capabilities::desktop_snapshot,
             capabilities::desktop_execute,
+            capabilities::portal_status,
+            capabilities::portal_connect,
+            capabilities::portal_cancel,
+            capabilities::portal_disconnect,
+            pty_host::pty_capability,
+            pty_host::pty_list,
+            pty_host::pty_create,
+            pty_host::pty_reconnect,
+            pty_host::pty_input,
+            pty_host::pty_resize,
+            pty_host::pty_read,
+            pty_host::pty_terminate,
             mcp_host::mcp_manager_snapshot,
             mcp_host::mcp_manager_execute,
+            skills_agents::skills_agents_snapshot,
+            skills_agents::skills_agents_write,
+            skills_agents::skills_agents_set_enabled,
+            skills_agents::skills_agents_delete,
             migration_dry_run,
             migration_import,
         ]);

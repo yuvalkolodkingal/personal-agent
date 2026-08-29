@@ -6,7 +6,14 @@ type Connector = {
   display_name: string;
   kind: string;
   base_url: string;
-  auth: { kind: string; keychain_alias?: string; account_label?: string };
+  auth: {
+    kind: string;
+    keychain_alias?: string;
+    account_label?: string;
+    client_id?: string;
+    scopes?: string[];
+    expires_at?: string | null;
+  };
   grants: Array<{ resource: string; action: string }>;
   enabled: boolean;
   health?: { state: string; detail: string; checked_at?: string };
@@ -29,6 +36,12 @@ const templates = [
   ["custom_rest", "Custom REST API"],
 ] as const;
 
+const oauthScopes: Record<string, string[]> = {
+  github: ["read:user", "user:email"],
+  gmail: ["https://www.googleapis.com/auth/gmail.readonly"],
+  google_calendar: ["https://www.googleapis.com/auth/calendar.readonly"],
+};
+
 export function ConnectorManager() {
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [wizard, setWizard] = useState(false);
@@ -47,6 +60,10 @@ export function ConnectorManager() {
   const [requestPath, setRequestPath] = useState("");
   const [requestBody, setRequestBody] = useState("");
   const [requestResult, setRequestResult] = useState<ConnectorResponse | null>(null);
+  const [oauthConnector, setOauthConnector] = useState<Connector | null>(null);
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthPending, setOauthPending] = useState(false);
+  const [notice, setNotice] = useState("");
 
   const refresh = async () => {
     try {
@@ -82,6 +99,70 @@ export function ConnectorManager() {
     setBusy(id);
     try {
       await invoke("connector_action", { id, operation, confirmed });
+      await refresh();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const authorizeOAuth = async () => {
+    if (!oauthConnector || !oauthClientId.trim()) return;
+    setOauthPending(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await invoke<{ message: string }>("connector_oauth_authorize", {
+        id: oauthConnector.id,
+        clientId: oauthClientId.trim(),
+        scopes: oauthScopes[oauthConnector.kind] ?? [],
+      });
+      setNotice(result.message);
+      setOauthConnector(null);
+      await refresh();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setOauthPending(false);
+    }
+  };
+
+  const cancelOAuth = async () => {
+    if (!oauthConnector) return;
+    try {
+      await invoke("connector_oauth_cancel", { id: oauthConnector.id });
+    } catch (caught) {
+      setError(String(caught));
+    }
+  };
+
+  const refreshOAuth = async (connector: Connector) => {
+    setBusy(connector.id);
+    setError("");
+    try {
+      const result = await invoke<{ message: string }>("connector_oauth_refresh", {
+        id: connector.id,
+      });
+      setNotice(result.message);
+      await refresh();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const revokeOAuth = async (connector: Connector) => {
+    if (!window.confirm(`Revoke OAuth access for ${connector.display_name}?`)) return;
+    setBusy(connector.id);
+    setError("");
+    try {
+      const result = await invoke<{ message: string }>("connector_oauth_revoke", {
+        id: connector.id,
+        confirmed: true,
+      });
+      setNotice(result.message);
       await refresh();
     } catch (caught) {
       setError(String(caught));
@@ -182,6 +263,7 @@ export function ConnectorManager() {
         <button className="primary" onClick={() => setWizard(true)}>+ Connect app</button>
       </header>
       {error && <p className="error-banner">{error}</p>}
+      {notice && <p className="connector-notice" role="status">{notice}</p>}
       <div className="connector-grid">
         {connectors.map((connector) => (
           <article key={connector.id} className={connector.enabled ? "connected" : ""}>
@@ -191,6 +273,12 @@ export function ConnectorManager() {
               <b>{connector.health?.state ?? (connector.enabled ? "enabled" : "disabled")}</b>
             </header>
             <p>{connector.health?.detail ?? connector.base_url}</p>
+            {connector.auth.kind === "oauth2" && (
+              <p className="connector-auth-state">
+                <strong>{connector.auth.account_label || "OAuth connected"}</strong>
+                <small>{connector.auth.scopes?.join(" · ") || "Reviewed read-only scopes"}</small>
+              </p>
+            )}
             <div className="scope-chips">
               {connector.grants.map((grant) => <span key={`${grant.resource}:${grant.action}`}>{grant.action} {grant.resource}</span>)}
             </div>
@@ -199,6 +287,26 @@ export function ConnectorManager() {
               <button disabled={busy === connector.id} onClick={() => setEditing(editing === connector.id ? null : connector.id)}>Permissions</button>
               <button disabled={busy === connector.id || !connector.enabled} onClick={() => { setRequestResult(null); setRequesting(requesting === connector.id ? null : connector.id); const first = connector.grants[0]; if (first) { setRequestResource(first.resource); setRequestAction(first.action as GrantAction); } }}>API request</button>
               <button disabled={busy === connector.id} onClick={() => void action(connector.id, connector.enabled ? "disable" : "enable")}>{connector.enabled ? "Disable" : "Enable"}</button>
+              {oauthScopes[connector.kind] && connector.auth.kind !== "bearer_token" && (
+                <button
+                  disabled={busy === connector.id}
+                  onClick={() => {
+                    setOauthConnector(connector);
+                    setOauthClientId(connector.auth.client_id ?? "");
+                    setError("");
+                  }}
+                >
+                  {connector.auth.kind === "oauth2" ? "Reconnect OAuth" : "Connect OAuth"}
+                </button>
+              )}
+              {connector.auth.kind === "oauth2" && ["gmail", "google_calendar"].includes(connector.kind) && (
+                <>
+                  <button disabled={busy === connector.id} onClick={() => void refreshOAuth(connector)}>Refresh OAuth</button>
+                </>
+              )}
+              {connector.auth.kind === "oauth2" && (
+                <button className="danger" disabled={busy === connector.id} onClick={() => void revokeOAuth(connector)}>Revoke OAuth</button>
+              )}
               <button className="danger" disabled={busy === connector.id} onClick={() => void action(connector.id, "delete", true)}>Remove</button>
             </footer>
             {editing === connector.id && (
@@ -256,6 +364,31 @@ export function ConnectorManager() {
             <aside><strong>Safe initial access</strong><p>Read-only service scopes. Sending, editing, deleting, and external writes require a separate grant and confirmation.</p></aside>
             <footer><button type="button" onClick={() => setWizard(false)}>Cancel</button><button className="primary" disabled={busy === "create"}>{busy === "create" ? "Connecting…" : "Create connection"}</button></footer>
           </form>
+        </div>
+      )}
+      {oauthConnector && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => { if (!oauthPending) setOauthConnector(null); }}>
+          <section className="connector-wizard connector-oauth-dialog" role="dialog" aria-modal="true" aria-labelledby="connector-oauth-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header>
+              <div><span>SECURE OAUTH</span><h2 id="connector-oauth-title">Connect {oauthConnector.display_name}</h2></div>
+              <button type="button" disabled={oauthPending} onClick={() => setOauthConnector(null)}>×</button>
+            </header>
+            <p>A fresh PKCE-protected browser authorization uses a private loopback callback. Access and refresh tokens go directly to your OS keychain.</p>
+            <label>
+              Public desktop client ID
+              <small>This identifies your OAuth app; it is not a client secret.</small>
+              <input autoComplete="off" value={oauthClientId} onChange={(event) => setOauthClientId(event.target.value)} placeholder={oauthConnector.kind === "github" ? "GitHub OAuth App client ID" : "Google Desktop client ID"} disabled={oauthPending} />
+            </label>
+            <aside>
+              <strong>Reviewed read-only scopes</strong>
+              <p>{(oauthScopes[oauthConnector.kind] ?? []).join(" · ")}</p>
+            </aside>
+            {oauthPending && <p role="status">Waiting for the browser authorization…</p>}
+            <footer>
+              <button type="button" onClick={() => { if (oauthPending) void cancelOAuth(); else setOauthConnector(null); }}>{oauthPending ? "Cancel authorization" : "Close"}</button>
+              <button type="button" className="primary" disabled={oauthPending || !oauthClientId.trim()} onClick={() => void authorizeOAuth()}>{oauthPending ? "Waiting…" : "Open secure sign-in"}</button>
+            </footer>
+          </section>
         </div>
       )}
     </section>

@@ -5,6 +5,7 @@
 
 use super::DesktopState;
 use async_trait::async_trait;
+use personal_agent_core::{EgressRecord, EgressSource};
 use personal_agent_mcp_manager::{
     AdapterError, CURRENT_PROTOCOL_VERSION, CapabilityCatalog, GatewayToolRequest, ImportSource,
     InstalledRelease, InvocationContext, LifecycleState, McpManager, OperationConsent,
@@ -24,13 +25,40 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
 use uuid::Uuid;
 
 pub(crate) struct McpHostState {
     path: PathBuf,
     manager: Mutex<McpManager>,
+    oauth_attempts: Mutex<OAuthAttemptRegistry>,
+}
+
+const MCP_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(330);
+const MCP_OAUTH_ATTEMPT_TTL: Duration = Duration::from_secs(360);
+
+#[derive(Default)]
+struct OAuthAttemptRegistry {
+    pending: BTreeMap<Uuid, Instant>,
+}
+
+impl OAuthAttemptRegistry {
+    fn reserve(&mut self, server_id: Uuid, now: Instant) -> bool {
+        self.pending.retain(|_, started_at| {
+            now.checked_duration_since(*started_at)
+                .is_some_and(|elapsed| elapsed < MCP_OAUTH_ATTEMPT_TTL)
+        });
+        if self.pending.contains_key(&server_id) {
+            return false;
+        }
+        self.pending.insert(server_id, now);
+        true
+    }
+
+    fn clear(&mut self, server_id: Uuid) {
+        self.pending.remove(&server_id);
+    }
 }
 
 impl McpHostState {
@@ -47,6 +75,7 @@ impl McpHostState {
         let state = Self {
             path,
             manager: Mutex::new(manager),
+            oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
         };
         // Persist normalized transient lifecycle state before it can be shown
         // or synchronized into the newly-created OpenCode sidecar.
@@ -270,11 +299,9 @@ pub(crate) async fn mcp_manager_execute(
             if let Err(error) = connect_server(&host, &desktop, server_id).await {
                 record_connection_failure(&host, &app, server_id, &error)?;
                 if is_authentication_required(&host, server_id)? {
-                    start_oauth(&host, &desktop, server_id).await?;
-                    result.message = Some(
-                        "Sign-in opened in your browser. Complete it, return here, and press Connect."
-                            .into(),
-                    );
+                    result.message = Some(oauth_result_message(
+                        start_oauth(&host, &desktop, server_id).await?,
+                    ));
                 } else {
                     return Err(error);
                 }
@@ -288,11 +315,9 @@ pub(crate) async fn mcp_manager_execute(
             if let Err(error) = connect_server(&host, &desktop, server_id).await {
                 record_connection_failure(&host, &app, server_id, &error)?;
                 if is_authentication_required(&host, server_id)? {
-                    start_oauth(&host, &desktop, server_id).await?;
-                    result.message = Some(
-                        "Server needs sign-in. The authorization flow opened in your browser."
-                            .into(),
-                    );
+                    result.message = Some(oauth_result_message(
+                        start_oauth(&host, &desktop, server_id).await?,
+                    ));
                 } else {
                     return Err(error);
                 }
@@ -476,6 +501,10 @@ pub(crate) async fn mcp_manager_execute(
                             })?;
                         Ok((server.definition.clone(), advertised_tool))
                     })?;
+                    let input_bytes = serde_json::to_vec(&request.arguments)
+                        .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX));
+                    let destination = definition.namespace.clone();
+                    let operation = request.tool_name.clone();
                     let start = Instant::now();
                     let content = execute_through_tool_gateway(
                         &definition,
@@ -484,6 +513,23 @@ pub(crate) async fn mcp_manager_execute(
                         approval_digest.is_some(),
                     )
                     .await?;
+                    desktop
+                        .profile
+                        .lock()
+                        .map_err(|_| "profile state lock is poisoned".to_owned())?
+                        .record_egress(EgressRecord {
+                            id: Uuid::now_v7(),
+                            at: chrono::Utc::now(),
+                            source: EgressSource::Mcp,
+                            destination,
+                            operation,
+                            data_class: "tool arguments".into(),
+                            size_bytes: Some(input_bytes),
+                            purpose: "user-approved MCP test call".into(),
+                            session_id: None,
+                            scope_key: None,
+                        })
+                        .map_err(|error| error.to_string())?;
                     result.test_output = Some(TestToolOutput {
                         tool,
                         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -525,11 +571,9 @@ pub(crate) async fn mcp_manager_execute(
                     return Err(error);
                 }
             }
-            start_oauth(&host, &desktop, server_id).await?;
-            result.message = Some(
-                "Sign-in opened in your browser. Complete it, return here, and press Connect."
-                    .into(),
-            );
+            result.message = Some(oauth_result_message(
+                start_oauth(&host, &desktop, server_id).await?,
+            ));
         }
         ManagerAction::OpenKeychainSetup {
             server_id,
@@ -616,7 +660,7 @@ async fn start_oauth(
     host: &McpHostState,
     desktop: &DesktopState,
     server_id: Uuid,
-) -> Result<(), String> {
+) -> Result<OAuthStartResult, String> {
     let server = read_manager(host, |manager| manager.server(server_id).cloned())?;
     if !matches!(
         server.definition.transport,
@@ -624,6 +668,9 @@ async fn start_oauth(
     ) {
         return Err("OAuth is available only for remote MCP servers".into());
     }
+    let Some(_attempt) = OAuthAttemptGuard::reserve(host, server_id)? else {
+        return Ok(OAuthStartResult::AlreadyInProgress);
+    };
     let directory = desktop
         .config
         .read()
@@ -631,57 +678,86 @@ async fn start_oauth(
         .runtime
         .working_directory
         .clone();
-    let response = desktop
-        .runtime
-        .lock()
-        .await
-        .request_json(
+    // `authenticate` owns OpenCode's callback waiter for up to five minutes.
+    // Clone the authenticated API client so this long wait never holds the
+    // runtime lifecycle mutex and block chat/session operations.
+    let runtime_api = {
+        let runtime = desktop.runtime.lock().await;
+        runtime.api_client().map_err(|error| error.to_string())?
+    };
+    runtime_api
+        .request_json_with_timeout(
             reqwest::Method::POST,
-            &format!("/mcp/{}/auth", server.definition.namespace),
+            &oauth_authenticate_route(&server.definition.namespace),
             &[("directory", directory)],
             None,
+            Some(MCP_OAUTH_CALLBACK_TIMEOUT),
         )
         .await
-        .map_err(|error| error.to_string())?;
-    let authorization_url = response
-        .get("authorizationUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "OpenCode did not return an MCP authorization URL".to_owned())?;
-    open_external_url(authorization_url)
+        .map_err(|error| {
+            format!(
+                "MCP sign-in did not complete: {error}. Close any stale or expired authorization pages, then retry Sign in."
+            )
+        })?;
+    connect_server(host, desktop, server_id)
+        .await
+        .map_err(|error| {
+            format!("Sign-in completed, but the MCP server could not connect: {error}")
+        })?;
+    Ok(OAuthStartResult::Connected)
 }
 
-fn open_external_url(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| "authorization URL is invalid".to_owned())?;
-    if !matches!(parsed.scheme(), "https" | "http") {
-        return Err("authorization URL must use HTTPS or loopback HTTP".into());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OAuthStartResult {
+    Connected,
+    AlreadyInProgress,
+}
+
+fn oauth_result_message(result: OAuthStartResult) -> String {
+    match result {
+        OAuthStartResult::Connected => {
+            "Sign-in completed and the MCP server connected.".into()
+        }
+        OAuthStartResult::AlreadyInProgress => {
+            "Sign-in is already in progress. Finish the existing browser authorization; a second flow was not started."
+                .into()
+        }
     }
-    if parsed.scheme() == "http"
-        && !parsed
-            .host_str()
-            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
-    {
-        return Err("authorization URL must use HTTPS or loopback HTTP".into());
+}
+
+fn oauth_authenticate_route(namespace: &str) -> String {
+    format!("/mcp/{namespace}/auth/authenticate")
+}
+
+struct OAuthAttemptGuard<'a> {
+    host: &'a McpHostState,
+    server_id: Uuid,
+}
+
+impl<'a> OAuthAttemptGuard<'a> {
+    fn reserve(host: &'a McpHostState, server_id: Uuid) -> Result<Option<Self>, String> {
+        let mut attempts = host
+            .oauth_attempts
+            .lock()
+            .map_err(|_| "MCP OAuth attempt lock is poisoned".to_owned())?;
+        if !attempts.reserve(server_id, Instant::now()) {
+            return Ok(None);
+        }
+        Ok(Some(Self { host, server_id }))
     }
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(parsed.as_str());
-        command
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("rundll32");
-        command.args(["url.dll,FileProtocolHandler", parsed.as_str()]);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(parsed.as_str());
-        command
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| "the system browser could not be opened".to_owned())
+}
+
+impl Drop for OAuthAttemptGuard<'_> {
+    fn drop(&mut self) {
+        let Ok(mut attempts) = self.host.oauth_attempts.lock() else {
+            tracing::error!(
+                server_id = %self.server_id,
+                "MCP OAuth attempt lock is poisoned"
+            );
+            return;
+        };
+        attempts.clear(self.server_id);
+    }
 }
 
 fn consent(operation_digest: String, displayed_text: String) -> OperationConsent {
@@ -1448,6 +1524,7 @@ mod tests {
         let host = McpHostState {
             path: blocker.join("manager.json"),
             manager: Mutex::new(McpManager::default()),
+            oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
         };
         let result = with_manager(&host, |manager| {
             manager.add_server(definition("Rejected", "rejected"))
@@ -1497,6 +1574,36 @@ mod tests {
         assert_eq!(descriptor.risk, Risk::Consequential);
         assert_eq!(descriptor.effect, Effect::ExternalWrite);
         assert!(!descriptor.reversible);
+    }
+
+    #[test]
+    fn oauth_uses_callback_owning_route_and_single_flight_state() {
+        let route = oauth_authenticate_route("composio");
+        assert_eq!(route, "/mcp/composio/auth/authenticate");
+        assert_ne!(route, "/mcp/composio/auth");
+        assert_eq!(
+            oauth_result_message(OAuthStartResult::Connected),
+            "Sign-in completed and the MCP server connected."
+        );
+
+        let server_id = Uuid::new_v4();
+        let other_server_id = Uuid::new_v4();
+        let now = Instant::now();
+        let mut attempts = OAuthAttemptRegistry::default();
+        assert!(attempts.reserve(server_id, now));
+        assert!(!attempts.reserve(server_id, now + Duration::from_secs(1)));
+        assert!(attempts.reserve(other_server_id, now + Duration::from_secs(1)));
+        attempts.clear(server_id);
+        assert!(attempts.reserve(server_id, now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn abandoned_oauth_attempt_expires_without_blocking_a_fresh_start() {
+        let server_id = Uuid::new_v4();
+        let now = Instant::now();
+        let mut attempts = OAuthAttemptRegistry::default();
+        assert!(attempts.reserve(server_id, now));
+        assert!(attempts.reserve(server_id, now + MCP_OAUTH_ATTEMPT_TTL));
     }
 
     #[tokio::test]

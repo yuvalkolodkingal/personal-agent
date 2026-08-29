@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "updated_on": "2026-08-26",
+  "updated_on": "2026-08-29",
   "products": [
     {
       "id": "COMP-001",
       "product": "OpenCode",
       "category": "agent-runtime",
       "primary_source": "https://opencode.ai/docs/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "provider-neutral runtime",
@@ -23,7 +23,7 @@
       "product": "OpenClaw",
       "category": "agent-runtime",
       "primary_source": "https://docs.openclaw.ai/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "isolated agents",
@@ -38,7 +38,7 @@
       "product": "GLaDOS",
       "category": "voice-assistant",
       "primary_source": "https://github.com/dnhkng/GlaDOS",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "local voice pipeline",
@@ -51,7 +51,7 @@
       "product": "Leon",
       "category": "voice-assistant",
       "primary_source": "https://github.com/leon-ai/leon",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "local providers",
@@ -66,7 +66,7 @@
       "product": "Home Assistant Assist",
       "category": "smart-home",
       "primary_source": "https://developers.home-assistant.io/docs/voice/overview/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "local voice",
@@ -80,7 +80,7 @@
       "product": "OpenVoiceOS",
       "category": "voice-assistant",
       "primary_source": "https://openvoiceos.github.io/ovos-technical-manual/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "wake words",
@@ -94,7 +94,7 @@
       "product": "ChatGPT Agent/Tasks",
       "category": "assistant",
       "primary_source": "https://openai.com/index/introducing-chatgpt-agent/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "browser agent",
@@ -109,7 +109,7 @@
       "product": "Claude/Cowork",
       "category": "assistant",
       "primary_source": "https://www.anthropic.com/engineering/how-we-contain-claude",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "computer use",
@@ -124,7 +124,7 @@
       "product": "Gemini",
       "category": "assistant",
       "primary_source": "https://gemini.google.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "multimodal live",
@@ -138,7 +138,7 @@
       "product": "Alexa+",
       "category": "assistant",
       "primary_source": "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "ambient assistance",
@@ -152,7 +152,7 @@
       "product": "Microsoft Copilot",
       "category": "assistant",
       "primary_source": "https://support.microsoft.com/en-us/microsoft-copilot/using-copilot-tasks",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "goal-based tasks",
@@ -167,7 +167,7 @@
       "product": "Perplexity Computer",
       "category": "assistant",
       "primary_source": "https://www.perplexity.ai/help-center/en/articles/11521526-perplexity-tasks",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "cited research",
@@ -182,7 +182,7 @@
       "product": "Codex",
       "category": "coding-agent",
       "primary_source": "https://developers.openai.com/codex/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "parallel agents",
@@ -197,7 +197,7 @@
       "product": "Claude Code",
       "category": "coding-agent",
       "primary_source": "https://docs.anthropic.com/en/docs/claude-code/overview",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "hooks",
@@ -212,7 +212,7 @@
       "product": "Gemini CLI",
       "category": "coding-agent",
       "primary_source": "https://github.com/google-gemini/gemini-cli",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "terminal agent",
@@ -226,7 +226,7 @@
       "product": "Goose",
       "category": "coding-agent",
       "primary_source": "https://block.github.io/goose/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "extensions",
@@ -240,7 +240,7 @@
       "product": "Cline",
       "category": "coding-agent",
       "primary_source": "https://docs.cline.bot/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "approval-driven tools",
@@ -254,7 +254,7 @@
       "product": "OpenHands",
       "category": "coding-agent",
       "primary_source": "https://docs.all-hands.dev/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "sandboxed execution",
@@ -268,7 +268,7 @@
       "product": "Aider",
       "category": "coding-agent",
       "primary_source": "https://aider.chat/docs/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "git-native edits",
@@ -281,7 +281,7 @@
       "product": "Cursor",
       "category": "coding-agent",
       "primary_source": "https://docs.cursor.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "IDE agents",
@@ -295,7 +295,7 @@
       "product": "Windsurf",
       "category": "coding-agent",
       "primary_source": "https://docs.windsurf.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "IDE agent",
@@ -309,7 +309,7 @@
       "product": "Playwright MCP",
       "category": "browser",
       "primary_source": "https://github.com/microsoft/playwright-mcp",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "structured browser control",
@@ -322,7 +322,7 @@
       "product": "Chrome DevTools MCP",
       "category": "browser",
       "primary_source": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "CDP inspection",
@@ -335,7 +335,7 @@
       "product": "browser-use",
       "category": "browser",
       "primary_source": "https://docs.browser-use.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "agent browser abstraction",
@@ -348,7 +348,7 @@
       "product": "agent-browser",
       "category": "browser",
       "primary_source": "https://github.com/vercel-labs/agent-browser",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "native automation CLI",
@@ -363,7 +363,7 @@
       "product": "Stagehand",
       "category": "browser",
       "primary_source": "https://docs.stagehand.dev/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "structured actions",
@@ -377,7 +377,7 @@
       "product": "Skyvern",
       "category": "browser",
       "primary_source": "https://docs.skyvern.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "visual fallback",
@@ -390,7 +390,7 @@
       "product": "Pipecat",
       "category": "voice",
       "primary_source": "https://docs.pipecat.ai/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "realtime pipelines",
@@ -404,7 +404,7 @@
       "product": "LiveKit Agents",
       "category": "voice",
       "primary_source": "https://docs.livekit.io/agents/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "realtime voice agents",
@@ -418,7 +418,7 @@
       "product": "TEN",
       "category": "voice",
       "primary_source": "https://github.com/ten-framework/ten-framework",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "realtime multimodal pipelines",
@@ -433,7 +433,7 @@
       "product": "OpenAI Realtime",
       "category": "voice",
       "primary_source": "https://platform.openai.com/docs/guides/realtime",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "speech-to-speech",
@@ -447,7 +447,7 @@
       "product": "Gemini Live",
       "category": "voice",
       "primary_source": "https://ai.google.dev/gemini-api/docs/live-api",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "realtime voice and vision",
@@ -462,7 +462,7 @@
       "product": "Talon",
       "category": "dictation",
       "primary_source": "https://talonvoice.com/docs/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "cross-platform voice control",
@@ -477,7 +477,7 @@
       "product": "n8n",
       "category": "automation",
       "primary_source": "https://docs.n8n.io/advanced-ai/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "event and schedule triggers",
@@ -492,7 +492,7 @@
       "product": "Raycast",
       "category": "desktop-productivity",
       "primary_source": "https://developers.raycast.com/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "command palette",
@@ -506,7 +506,7 @@
       "product": "Alfred",
       "category": "desktop-productivity",
       "primary_source": "https://www.alfredapp.com/help/",
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "capabilities": [
         "hotkeys",

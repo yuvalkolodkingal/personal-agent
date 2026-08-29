@@ -6,6 +6,7 @@ import type {
   McpCatalogEntry,
   McpManagedServer,
   McpManagerAction,
+  McpManagerActionResult,
   McpManagerController,
   McpManagerSnapshot,
 } from "./McpManager.types";
@@ -115,6 +116,39 @@ describe("MCP Manager", () => {
     expect(screen.getByRole("button", { name: "Connect OAuth" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add key securely" })).toBeInTheDocument();
     expect(screen.queryByLabelText(/API key value/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps OAuth authorization single-flight across all sign-in controls", async () => {
+    let finishAuthorization: ((value: McpManagerActionResult) => void) | undefined;
+    const pending = new Promise<McpManagerActionResult>((resolve) => {
+      finishAuthorization = resolve;
+    });
+    const execute = vi.fn(() => pending);
+    const authenticationRequired = {
+      ...connectedServer,
+      state: "authentication_required" as const,
+      negotiated_protocol: null,
+    };
+    render(
+      <McpManager
+        snapshot={{ ...snapshot, servers: [authenticationRequired] }}
+        controller={controller(execute)}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(screen.getAllByRole("button", { name: "Signing in…" })).toHaveLength(2);
+    fireEvent.click(screen.getAllByRole("button", { name: "Signing in…" })[1]!);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith({
+      type: "start_oauth",
+      server_id: connectedServer.definition.id,
+    });
+
+    finishAuthorization?.({});
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled(),
+    );
   });
 
   it("generates a typed test form and routes the request through the controller", async () => {

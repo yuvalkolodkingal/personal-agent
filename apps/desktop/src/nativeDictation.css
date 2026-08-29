@@ -1,0 +1,137 @@
+.native-dictation-panel {
+  margin: 0 12px 8px;
+  border: 1px solid rgba(var(--accent-rgb), 0.28);
+  border-radius: 12px;
+  background: rgba(8, 21, 29, 0.94);
+  color: #9bb1bd;
+  padding: 10px 12px;
+  display: grid;
+  gap: 9px;
+}
+
+.native-dictation-panel header,
+.native-arm-row,
+.native-review > div:first-child,
+.native-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.native-dictation-panel header > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.native-dictation-panel strong {
+  color: #d9e6eb;
+  font-size: 11px;
+}
+
+.native-dictation-panel small,
+.native-dictation-panel p,
+.native-dictation-panel em {
+  margin: 0;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.native-dictation-panel em {
+  color: #c9a66e;
+}
+
+.native-capability {
+  border: 1px solid #355263;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font: 700 7px Rajdhani, sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.native-capability.degraded {
+  border-color: #8c713e;
+  color: #e1bd72;
+}
+
+.native-capability.permission_required,
+.native-capability.unavailable {
+  border-color: #70443f;
+  color: #e49a8d;
+}
+
+.native-arm-row p {
+  max-width: 75%;
+}
+
+.native-dictation-panel button {
+  border: 1px solid #345464;
+  border-radius: 8px;
+  background: #102530;
+  color: #a8c5d1;
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 9px;
+}
+
+.native-dictation-panel button.primary {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.2);
+  color: #aef3fa;
+}
+
+.native-dictation-panel button:disabled {
+  opacity: 0.4;
+}
+
+.native-review {
+  display: grid;
+  gap: 7px;
+}
+
+.native-review > div:first-child span {
+  color: var(--accent);
+  font: 700 8px Rajdhani, sans-serif;
+  letter-spacing: 0.1em;
+}
+
+.native-review > p {
+  min-height: 32px;
+  border: 1px solid rgba(124, 151, 168, 0.18);
+  border-radius: 8px;
+  background: rgba(3, 10, 15, 0.6);
+  color: #dce7eb;
+  padding: 8px;
+  white-space: pre-wrap;
+}
+
+.composer .dictation-target-mode {
+  border-color: rgba(var(--accent-rgb), 0.16);
+}
+
+@media (max-width: 720px) {
+  .native-dictation-panel header,
+  .native-arm-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .native-arm-row p {
+    max-width: none;
+  }
+
+  .composer {
+    flex-wrap: wrap;
+  }
+
+  .composer .dictation-target-mode {
+    order: 4;
+    width: 100%;
+  }
+
+  .composer .dictation-target-mode button {
+    flex: 1;
+  }
+}

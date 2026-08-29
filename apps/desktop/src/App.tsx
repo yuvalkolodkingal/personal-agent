@@ -13,7 +13,14 @@ import { ConnectorManager } from "./ConnectorManager";
 import { ScreenContext } from "./ScreenContext";
 import { McpManagerHost } from "./McpManagerHost";
 import { LocalExecutionPanel } from "./LocalExecutionPanel";
+import { PersistentTerminal } from "./PersistentTerminal";
 import { MemorySystemsPanel } from "./MemorySystemsPanel";
+import { GoalsTasks } from "./GoalsTasks";
+import { NativeDictationPanel } from "./NativeDictationPanel";
+import { ArtifactsWorkspace } from "./ArtifactsWorkspace";
+import { AutomationCenter } from "./AutomationCenter";
+import { SkillsAgents } from "./SkillsAgents";
+import { UsageEgress } from "./UsageEgress";
 import type {
   AppConfig,
   Bootstrap,
@@ -30,6 +37,7 @@ import {
   transcriptEvent,
   type DeterministicCommand,
   type DictationMode,
+  type NativeDictationStatus,
 } from "./dictation";
 import {
   useVoiceCapture,
@@ -128,9 +136,9 @@ const featureAudit: FeatureAuditItem[] = [
   },
   {
     area: "Goals and task execution",
-    status: "partial",
+    status: "implemented",
     detail:
-      "Durable goal/task types exist; the desktop does not yet run a background task graph supervisor.",
+      "Encrypted task graphs run through a restart-safe resident supervisor with bounded concurrency, checkpoint recovery, native approvals, explicit pause/resume/cancel/retry controls and event projection.",
   },
   {
     area: "Browser workspace",
@@ -142,31 +150,31 @@ const featureAudit: FeatureAuditItem[] = [
     area: "Projects, terminal and local execution",
     status: "partial",
     detail:
-      "Workspace-scoped process and hardened Docker execution APIs are implemented alongside OpenCode file/VCS resources. No dedicated execution UI or true persistent PTY is wired.",
+      "A responsive xterm workspace UI now drives native-owned OpenCode PTYs with structured create/input/resize/terminate/reconnect operations, bounded replay and confirmation gates. Sessions persist for the pinned runtime lifetime; Linux is live-verified while Windows/macOS remain build-supported but not yet live-verified here.",
   },
   {
     area: "Artifacts",
-    status: "partial",
+    status: "implemented",
     detail:
-      "Artifact metadata is durable; editing, previews and version restoration are not wired.",
+      "Encrypted content-addressed artifacts, immutable versions, safe previews, source provenance, restoration, export and whiteboard controls are wired.",
   },
   {
     area: "Automations",
-    status: "partial",
+    status: "implemented",
     detail:
-      "The scheduler engine is implemented and tested; desktop-created schedules are not yet executed by a resident runner.",
+      "Desktop schedules persist in the encrypted profile, recover without unsafe replay and execute in isolated resident agent sessions with bounded concurrency, missed-run policy, results and native approval suspension. Event-trigger watcher adapters remain explicit unsupported states.",
   },
   {
     area: "App integrations and skills",
     status: "partial",
     detail:
-      "GitHub, Gmail, Calendar, Slack, Microsoft Graph and custom REST connections have a GUI, keychain tokens, read-only grants, health and execution boundaries. Provider OAuth/refresh and service-specific workflows remain incomplete.",
+      "GitHub, Gmail and Calendar have native PKCE/state/loopback OAuth with OS-keychain-only tokens and reviewed read-only scopes. The authenticated Skills & Agents workspace discovers runtime agents, commands and skills; it safely manages confirmed user-owned agent/command Markdown while keeping skills discovery-only. Slack/Microsoft OAuth and service-specific workflows remain incomplete.",
   },
   {
     area: "Usage, notifications and updates",
-    status: "not_wired",
+    status: "partial",
     detail:
-      "Policy/config types exist, but normalized cost metering, native notification delivery and automatic updates are not wired.",
+      "Encrypted provider token and reported-cost accounting, durable scope budgets, content-free egress records, filtered export, and native automation notifications are wired. Provider-omitted prices remain explicitly unknown; desktop toast buttons and automatic updates remain unwired.",
   },
 ];
 
@@ -456,9 +464,9 @@ export const fallbackConfig: AppConfig = {
   },
   notifications: {
     enabled: true,
-    goal_completion: true,
+    task_completion: true,
     approvals: true,
-    automation_failures: true,
+    failures: true,
     sound: true,
   },
   updates: {
@@ -692,6 +700,12 @@ function ChatView({
   >("agent");
   const [dictationMode, setDictationMode] =
     useState<DictationMode>("natural");
+  const [dictationTarget, setDictationTarget] = useState<
+    "composer" | "focused_app"
+  >("composer");
+  const [nativeDictation, setNativeDictation] =
+    useState<NativeDictationStatus | null>(null);
+  const [nativeDictationBusy, setNativeDictationBusy] = useState(false);
   const [voiceMuted, setVoiceMuted] = useState(false);
   const messageListRef = useRef<HTMLDivElement>(null);
   const pushToTalkPressed = useRef(false);
@@ -701,6 +715,7 @@ function ChatView({
   const composerRef = useRef(composer);
   const voiceInputModeRef = useRef(voiceInputMode);
   const dictationModeRef = useRef(dictationMode);
+  const dictationTargetRef = useRef(dictationTarget);
   const dictationClient = useRef(new DictationClient());
   const dictationBuffer = useRef(new InAppDictationBuffer());
   const dictationQueue = useRef<Promise<void>>(Promise.resolve());
@@ -713,6 +728,7 @@ function ChatView({
   busyRef.current = busy;
   voiceInputModeRef.current = voiceInputMode;
   dictationModeRef.current = dictationMode;
+  dictationTargetRef.current = dictationTarget;
   useEffect(() => {
     let compactRail = window.innerWidth <= 1050;
     let compactInspector = window.innerWidth <= 1320;
@@ -961,6 +977,12 @@ function ChatView({
         const restored = dictationBuffer.current.cancelProvisional();
         composerRef.current = restored;
         setComposer(restored);
+        if (dictationTargetRef.current === "focused_app") {
+          void dictationClient.current
+            .disarmNative()
+            .then(setNativeDictation)
+            .catch(() => undefined);
+        }
       }
       dictationQueue.current = dictationQueue.current
         .catch(() => undefined)
@@ -968,6 +990,92 @@ function ChatView({
     },
     [],
   );
+
+  const chooseDictationTarget = useCallback(
+    (target: "composer" | "focused_app") => {
+      dictationGeneration.current += 1;
+      voiceActionsRef.current.cancel();
+      setDictationTarget(target);
+      dictationTargetRef.current = target;
+      dictationQueue.current = dictationQueue.current
+        .catch(() => undefined)
+        .then(async () => {
+          await dictationClient.current.reset(dictationModeRef.current);
+          if (target === "focused_app") {
+            setNativeDictation(await dictationClient.current.nativeStatus());
+          } else {
+            setNativeDictation(await dictationClient.current.disarmNative());
+            dictationBuffer.current.sync(composerRef.current);
+          }
+        })
+        .catch((caught) =>
+          setError(`Focused-app dictation is unavailable: ${String(caught)}`),
+        );
+    },
+    [],
+  );
+
+  const armNativeDictation = useCallback(async () => {
+    setNativeDictationBusy(true);
+    setError("");
+    try {
+      setNativeDictation(await dictationClient.current.armNative(2_500));
+    } catch (caught) {
+      setError(`Could not arm focused-app dictation: ${String(caught)}`);
+      setNativeDictation(await dictationClient.current.nativeStatus().catch(() => null));
+    } finally {
+      setNativeDictationBusy(false);
+    }
+  }, []);
+
+  const disarmNativeDictation = useCallback(async () => {
+    setNativeDictationBusy(true);
+    try {
+      setNativeDictation(await dictationClient.current.disarmNative());
+    } catch (caught) {
+      setError(`Could not disarm focused-app dictation: ${String(caught)}`);
+    } finally {
+      setNativeDictationBusy(false);
+    }
+  }, []);
+
+  const applyNativeDictation = useCallback(async () => {
+    setNativeDictationBusy(true);
+    setError("");
+    try {
+      const result = await dictationClient.current.confirmNative(2_500);
+      setNativeDictation(result.status);
+      if (!result.verified) setError(result.detail);
+      await dictationClient.current.reset(dictationModeRef.current);
+    } catch (caught) {
+      setError(`Focused-app dictation was not applied: ${String(caught)}`);
+    } finally {
+      setNativeDictationBusy(false);
+    }
+  }, []);
+
+  const discardNativeDictation = useCallback(async () => {
+    try {
+      setNativeDictation(await dictationClient.current.discardNative());
+      await dictationClient.current.reset(dictationModeRef.current);
+    } catch (caught) {
+      setError(`Could not discard dictation: ${String(caught)}`);
+    }
+  }, []);
+
+  const undoNativeDictation = useCallback(async () => {
+    setNativeDictationBusy(true);
+    setError("");
+    try {
+      const result = await dictationClient.current.undoNative(2_500);
+      setNativeDictation(result.status);
+      if (!result.verified) setError(result.detail);
+    } catch (caught) {
+      setError(`Native undo was blocked: ${String(caught)}`);
+    } finally {
+      setNativeDictationBusy(false);
+    }
+  }, []);
 
   const ingestDictation = useCallback(
     (text: string, finalResult: boolean, meta: VoiceTranscriptMeta) => {
@@ -993,13 +1101,17 @@ function ChatView({
             generation !== dictationGeneration.current
           )
             return;
-          const next = dictationBuffer.current.apply(update.operations);
-          composerRef.current = next;
-          setComposer(next);
           setDictationMode(update.mode);
           dictationModeRef.current = update.mode;
-          if (update.operations.length)
-            await dictationClient.current.apply(update.operations);
+          if (dictationTargetRef.current === "focused_app") {
+            setNativeDictation(await dictationClient.current.stageNative(update));
+          } else {
+            const next = dictationBuffer.current.apply(update.operations);
+            composerRef.current = next;
+            setComposer(next);
+            if (update.operations.length)
+              await dictationClient.current.apply(update.operations);
+          }
         })
         .catch((caught) => setError(`Dictation failed: ${String(caught)}`));
     },
@@ -1027,9 +1139,15 @@ function ChatView({
           chooseVoiceInputMode("dictation");
           return true;
         case "stop_dictation": {
-          const restored = dictationBuffer.current.cancelProvisional();
-          composerRef.current = restored;
-          setComposer(restored);
+          if (dictationTargetRef.current === "focused_app") {
+            setNativeDictation(
+              await dictationClient.current.discardNative().catch(() => null),
+            );
+          } else {
+            const restored = dictationBuffer.current.cancelProvisional();
+            composerRef.current = restored;
+            setComposer(restored);
+          }
           chooseVoiceInputMode("agent");
           return true;
         }
@@ -1078,9 +1196,15 @@ function ChatView({
         );
         if (route.route === "commands") {
           if (inputMode === "dictation") {
-            const restored = dictationBuffer.current.cancelProvisional();
-            composerRef.current = restored;
-            setComposer(restored);
+            if (dictationTargetRef.current === "focused_app") {
+              setNativeDictation(
+                await dictationClient.current.discardNative().catch(() => null),
+              );
+            } else {
+              const restored = dictationBuffer.current.cancelProvisional();
+              composerRef.current = restored;
+              setComposer(restored);
+            }
           }
           let handled = true;
           for (const command of route.commands)
@@ -1224,6 +1348,17 @@ function ChatView({
         setTurnStage(`Using ${String(eventPayload(payload).tool ?? "a tool")}`);
       if (payload.type === "tool.completed")
         setTurnStage("Reviewing tool result");
+      if (
+        payload.type === "approval.requested" ||
+        payload.type === "clarification.requested"
+      ) {
+        setTurnStage(
+          payload.type === "approval.requested"
+            ? "Waiting for your approval"
+            : "Waiting for your answer",
+        );
+        void refreshCatalog();
+      }
       if (payload.type === "response.retrying")
         setTurnStage(
           `Provider retry ${String(eventPayload(payload).attempt ?? "")}`.trim(),
@@ -1259,7 +1394,7 @@ function ChatView({
         setError(`Voice recovered with fallback: ${payload.detail}`);
     }).then((fn) => unlisten.push(fn));
     return () => unlisten.forEach((fn) => fn());
-  }, [finalizeTurn, onHistory, setMessages]);
+  }, [finalizeTurn, onHistory, refreshCatalog, setMessages]);
 
   useEffect(() => {
     if (!busy || !pendingTurn) return;
@@ -1298,11 +1433,11 @@ function ChatView({
         finalizeTurn({
           text: "",
           error:
-            "The model did not produce a completed response within two minutes. You can retry this message.",
+            "The model did not produce a completed response within the 30 minute safety limit. You can retry this message.",
           status: "failed",
           speak: false,
         }),
-      120_000,
+      30 * 60_000,
     );
     return () => {
       disposed = true;
@@ -1956,6 +2091,17 @@ function ChatView({
             <strong>Microphone:</strong> {voice.error}
           </p>
         )}
+        {voiceInputMode === "dictation" && dictationTarget === "focused_app" && (
+          <NativeDictationPanel
+            status={nativeDictation}
+            arming={nativeDictationBusy}
+            onArm={() => void armNativeDictation()}
+            onDisarm={() => void disarmNativeDictation()}
+            onApply={() => void applyNativeDictation()}
+            onDiscard={() => void discardNativeDictation()}
+            onUndo={() => void undoNativeDictation()}
+          />
+        )}
         <form
           className="composer"
           onSubmit={(event) => {
@@ -1993,13 +2139,41 @@ function ChatView({
               Dictation
             </button>
           </div>
+          {voiceInputMode === "dictation" && (
+            <div
+              className="voice-input-mode dictation-target-mode"
+              role="group"
+              aria-label="Dictation target"
+            >
+              <button
+                type="button"
+                className={dictationTarget === "composer" ? "active" : ""}
+                aria-pressed={dictationTarget === "composer"}
+                onClick={() => chooseDictationTarget("composer")}
+                title="Review dictation in the Personal Agent composer"
+              >
+                Composer
+              </button>
+              <button
+                type="button"
+                className={dictationTarget === "focused_app" ? "active" : ""}
+                aria-pressed={dictationTarget === "focused_app"}
+                onClick={() => chooseDictationTarget("focused_app")}
+                title="Review, then insert into an explicitly armed application"
+              >
+                Focused app
+              </button>
+            </div>
+          )}
           <textarea
             aria-label="Message JARVIS"
             rows={1}
             value={composer}
             placeholder={
               voiceInputMode === "dictation"
-                ? `Dictate in ${dictationMode} mode, review, then Send…`
+                ? dictationTarget === "focused_app"
+                  ? "Voice goes to the armed app; partials stay in the review panel…"
+                  : `Dictate in ${dictationMode} mode, review, then Send…`
                 : "Message JARVIS…  (/ for commands, @ for files)"
             }
             onChange={(event) => {
@@ -2061,7 +2235,7 @@ function ChatView({
           <span className={voiceInputMode === "dictation" ? "live" : ""}>
             INPUT {voiceInputMode.toUpperCase()}
             {voiceInputMode === "dictation"
-              ? ` · ${dictationMode.toUpperCase()}`
+              ? ` · ${dictationMode.toUpperCase()} · ${dictationTarget === "focused_app" ? "FOCUSED APP" : "COMPOSER"}`
               : ""}
           </span>
           {voiceMuted && <span>MUTED / SLEEPING</span>}
@@ -2653,12 +2827,11 @@ function ProjectView({
     }
   };
   useEffect(() => {
+    if (tab === "terminal") return;
     void load(
       tab === "diff"
         ? "vcs_diff"
-        : tab === "terminal"
-          ? "pty_list"
-          : tab === "worktrees"
+        : tab === "worktrees"
             ? "worktree_list"
             : "file_list",
     );
@@ -2754,42 +2927,17 @@ function ProjectView({
         <pre className="diff-view">{JSON.stringify(data, null, 2)}</pre>
       )}
       {tab === "terminal" && (
-        <div className="terminal-view">
-          <div className="terminal-toolbar">
-            <button
-              onClick={async () => {
-                try {
-                  setData(
-                    await invoke("runtime_operation", {
-                      kind: "pty_create",
-                      identifier: null,
-                      sessionId: null,
-                      directory: config.runtime.working_directory,
-                      payload: {
-                        command: config.workspace.terminal_shell,
-                        cwd: config.runtime.working_directory,
-                        title: "Personal Agent terminal",
-                      },
-                      confirmed: false,
-                    }),
-                  );
-                } catch (caught) {
-                  setError(String(caught));
-                }
-              }}
-            >
-              New terminal
-            </button>
-          </div>
-          <pre>{JSON.stringify(data, null, 2)}</pre>
-          <p>
-            PTY lifecycle is native. OpenCode streams interactive terminal bytes
-            over its authenticated PTY channel; active sessions and controls
-            remain visible here.
-          </p>
-          <LocalExecutionPanel
+        <div className="terminal-view terminal-stack">
+          <PersistentTerminal
             workingDirectory={config.runtime.working_directory}
+            shell={String(config.workspace.terminal_shell ?? "")}
           />
+          <details className="captured-execution">
+            <summary>Captured commands and Docker jobs</summary>
+            <LocalExecutionPanel
+              workingDirectory={config.runtime.working_directory}
+            />
+          </details>
         </div>
       )}
       {tab === "worktrees" && (
@@ -2861,39 +3009,6 @@ function IntegrationsView({
             />
           )}
         </div>
-      </div>
-    </section>
-  );
-}
-
-function CatalogView({
-  catalog,
-}: {
-  destination: Destination;
-  catalog: RuntimeCatalog;
-}) {
-  return (
-    <section className="catalog-page">
-      <SectionHeader
-        eyebrow="OPENCODE CATALOG"
-        title="Agents, commands and skills"
-      />
-      <div className="catalog-columns three">
-        {["agents", "commands", "skills"].map((name) => (
-          <div key={name}>
-            <h3>{name}</h3>
-            {asArray(resourceData(catalog, name, [])).map((item) => (
-              <article key={labelOf(item)}>
-                <strong>{labelOf(item)}</strong>
-                <small>
-                  {String(
-                    item.description ?? item.mode ?? item.source ?? "Available",
-                  )}
-                </small>
-              </article>
-            ))}
-          </div>
-        ))}
       </div>
     </section>
   );
@@ -3189,45 +3304,6 @@ function DiagnosticsView({
     </section>
   );
 }
-function UsageView({ history }: { history: EventEnvelope[] }) {
-  const runtime = history.filter(
-    (event) =>
-      event.origin.includes("runtime") || event.type.startsWith("response."),
-  );
-  const tools = history.filter((event) => event.type.includes("tool"));
-  return (
-    <section className="usage-page">
-      <SectionHeader
-        eyebrow="LOCAL ACCOUNTING"
-        title="Usage, cost and outbound data"
-      />
-      <div className="metric-cards">
-        <article>
-          <b>{runtime.length}</b>
-          <span>runtime events</span>
-        </article>
-        <article>
-          <b>{tools.length}</b>
-          <span>tool events</span>
-        </article>
-        <article>
-          <b>0</b>
-          <span>secret values recorded</span>
-        </article>
-        <article>
-          <b>{new Set(history.map((event) => event.origin)).size}</b>
-          <span>event origins</span>
-        </article>
-      </div>
-      <p>
-        Provider token and cost totals appear when emitted by the selected
-        model. Egress records preserve destination, data kind, purpose, and size
-        without storing credentials.
-      </p>
-    </section>
-  );
-}
-
 export function App() {
   const [active, setActive] = useState<Destination>("Chat");
   const [config, setConfig] = useState<AppConfig>(fallbackConfig);
@@ -3379,9 +3455,10 @@ export function App() {
         }}
       />
     );
-  else if (
-    ["Goals & tasks", "Memory", "Automations", "Artifacts"].includes(active)
-  )
+  else if (active === "Automations") content = <AutomationCenter />;
+  else if (active === "Goals & tasks")
+    content = <GoalsTasks onProjection={setProjection} />;
+  else if (active === "Memory")
     content = (
       <DomainView
         destination={active}
@@ -3393,6 +3470,7 @@ export function App() {
         setProjection={setProjection}
       />
     );
+  else if (active === "Artifacts") content = <ArtifactsWorkspace />;
   else if (active === "Projects & terminal")
     content = (
       <ProjectView config={config} catalog={catalog} onCatalog={setCatalog} />
@@ -3406,7 +3484,7 @@ export function App() {
       />
     );
   else if (active === "Skills & agents")
-    content = <CatalogView destination={active} catalog={catalog} />;
+    content = <SkillsAgents config={config} onConfig={setConfig} />;
   else if (active === "History") content = <HistoryView history={history} />;
   else if (active === "Browser") content = <BrowserView config={config} />;
   else if (active === "Diagnostics")
@@ -3419,7 +3497,7 @@ export function App() {
       />
     );
   else if (active === "Usage & egress")
-    content = <UsageView history={history} />;
+    content = <UsageEgress />;
   else
     content = (
       <ConfigEditor

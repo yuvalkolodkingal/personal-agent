@@ -104,6 +104,47 @@ describe("DictationClient", () => {
       client.route("run the tests and explain the failure", "command"),
     ).resolves.toMatchObject({ route: "agent_goal" });
   });
+
+  it("uses explicit confirmation and a focus-switch delay for native apply and undo", async () => {
+    const nativeStatus = {
+      contract: {
+        platform: "linux",
+        session: "wayland",
+        adapter: "wtype",
+        availability: "degraded",
+        review_before_insert: true,
+        supports_text_insertion: true,
+        supports_live_revisions: true,
+        supports_verified_edits: false,
+        detail: "unverified keystrokes",
+      },
+      armed_target: null,
+      pending: null,
+      undo_available: false,
+      metrics: { apply_samples: 0 },
+    } as const;
+    const transport = vi.fn<DictationTransport>().mockResolvedValue({
+      submitted: true,
+      verified: false,
+      adapter: "wtype",
+      elapsed_ms: 4,
+      detail: "verify visually",
+      status: nativeStatus,
+    });
+    const client = new DictationClient(transport);
+
+    await client.confirmNative(3_000);
+    await client.undoNative(1_500);
+
+    expect(transport).toHaveBeenNthCalledWith(1, "native_dictation_confirm", {
+      confirmed: true,
+      delayMs: 3_000,
+    });
+    expect(transport).toHaveBeenNthCalledWith(2, "native_dictation_undo", {
+      confirmed: true,
+      delayMs: 1_500,
+    });
+  });
 });
 
 describe("InAppDictationBuffer", () => {

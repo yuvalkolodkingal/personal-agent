@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_on": "2026-08-26",
+  "updated_on": "2026-08-29",
   "tests": [
     {
       "id": "AT-M0-LEGACY-MAP",
@@ -117,8 +117,8 @@
     {
       "id": "AT-M2-SAFETY-PLUGIN",
       "milestone": "M2",
-      "behavior": "The packaged OpenCode plugin has a loader-compatible export shape, fails unknown permission callbacks closed, and removes every effectful upstream built-in before a model request.",
-      "verification": "bun --cwd packages/opencode-plugin test && cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
+      "behavior": "The packaged OpenCode plugin has a loader-compatible export shape, fails unknown permission callbacks closed, exposes reviewed coding built-ins under granular permissions, preauthorizes each call through the registered-session native boundary, and surfaces reviewed permission/question events before the turn completes; the real sidecar fixture must complete an actual workspace file edit.",
+      "verification": "bun --cwd packages/opencode-plugin test && bun --cwd apps/desktop test App.voice.test.tsx && cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
       "kind": "automated",
       "status": "passed"
     },
@@ -133,7 +133,7 @@
     {
       "id": "AT-M2-NATIVE-TOOL-BRIDGE",
       "milestone": "M2",
-      "behavior": "The sidecar plugin can invoke only an authenticated, registered-session-scoped native tool; rejected tokens/scopes are unaudited and an accepted call traverses policy, filtering, verification, and audit.",
+      "behavior": "The sidecar plugin can use the native bridge only with its ephemeral bearer token and an exact registered session/workspace match; coding preauthorization rejects escaped paths and destructive shell bypasses, while accepted native tools traverse policy, filtering, verification, and audit.",
       "verification": "cargo test -p personal-agent-runtime native_tool_bridge_requires_authentication_and_registered_session_scope && cargo test -p personal-agent-runtime isolated_sidecar_streams_a_synthetic_provider_tool_turn",
       "kind": "automated",
       "status": "passed"

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   JsonSchemaProperty,
   McpCatalogEntry,
@@ -125,6 +125,7 @@ export function McpManager({
   const [confirmOperation, setConfirmOperation] = useState<ConfirmOperation | null>(null);
   const [exportText, setExportText] = useState<string | null>(null);
   const [testOutput, setTestOutput] = useState<McpTestOutput | null>(null);
+  const inFlightActions = useRef(new Set<string>());
 
   useEffect(() => {
     if (selectedId && snapshot.servers.some((server) => server.definition.id === selectedId)) return;
@@ -156,7 +157,12 @@ export function McpManager({
     });
   }, [search, snapshot.servers, statusFilter]);
 
-  async function execute(action: McpManagerAction, key: string = action.type): Promise<McpManagerActionResult> {
+  async function execute(
+    action: McpManagerAction,
+    key: string = "server_id" in action ? `${action.type}:${action.server_id}` : action.type,
+  ): Promise<McpManagerActionResult> {
+    if (inFlightActions.current.has(key)) return {};
+    inFlightActions.current.add(key);
     setBusy(key);
     setError(null);
     setNotice(null);
@@ -192,6 +198,7 @@ export function McpManager({
       setError(message);
       throw cause;
     } finally {
+      inFlightActions.current.delete(key);
       setBusy(null);
     }
   }
@@ -505,8 +512,8 @@ function ServerCard({
           </button>
         ) : null}
         {server.state === "authentication_required" ? (
-          <button className="mcp-button mcp-button-primary" type="button" onClick={() => onAction({ type: "start_oauth", server_id: id })}>
-            Sign in
+          <button className="mcp-button mcp-button-primary" type="button" disabled={working} onClick={() => onAction({ type: "start_oauth", server_id: id })}>
+            {working ? "Signing in…" : "Sign in"}
           </button>
         ) : null}
         {server.state === "connected" ? (
@@ -598,7 +605,7 @@ function ServerDetails({
         ))}
       </nav>
       <div className="mcp-details-body">
-        {tab === "overview" ? <Overview server={server} onAction={onAction} onPreview={onPreview} /> : null}
+        {tab === "overview" ? <Overview server={server} busy={busy} onAction={onAction} onPreview={onPreview} /> : null}
         {tab === "tools" ? <ToolExplorer server={server} busy={busy} onAction={onAction} testOutput={testOutput} /> : null}
         {tab === "resources" ? <ResourceList server={server} /> : null}
         {tab === "prompts" ? <PromptList server={server} /> : null}
@@ -611,10 +618,12 @@ function ServerDetails({
 
 function Overview({
   server,
+  busy,
   onAction,
   onPreview,
 }: {
   server: McpManagedServer;
+  busy: string | null;
   onAction: (action: McpManagerAction) => void;
   onPreview: (
     previewType: "uninstall_preview",
@@ -692,8 +701,8 @@ function Overview({
         <h3>Authentication</h3>
         <p>Tokens never enter MCP configuration. OAuth grants and API keys are referenced from the OS keychain.</p>
         <div className="mcp-inline-actions">
-          <button className="mcp-button mcp-button-subtle" type="button" onClick={() => onAction({ type: "start_oauth", server_id: server.definition.id })}>
-            Connect OAuth
+          <button className="mcp-button mcp-button-subtle" type="button" disabled={busy?.includes(server.definition.id)} onClick={() => onAction({ type: "start_oauth", server_id: server.definition.id })}>
+            {busy?.includes(server.definition.id) ? "Signing in…" : "Connect OAuth"}
           </button>
           <button className="mcp-button mcp-button-subtle" type="button" onClick={() => onAction({ type: "open_keychain_setup", server_id: server.definition.id })}>
             Add key securely

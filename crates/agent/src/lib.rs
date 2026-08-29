@@ -539,6 +539,211 @@ impl DurableSupervisor {
         Ok(())
     }
 
+    /// Persist a runtime checkpoint/session identifier for restart-safe supervision.
+    ///
+    /// # Errors
+    /// Rejects missing tasks and tasks that are not active or approval-suspended.
+    pub fn bind_checkpoint(
+        &mut self,
+        task_id: Uuid,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if !matches!(task.status, WorkStatus::Running | WorkStatus::Waiting) {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.checkpoint_id = Some(checkpoint_id.into());
+        Ok(())
+    }
+
+    /// Suspend one running task while a native approval is outstanding.
+    ///
+    /// # Errors
+    /// Rejects missing or non-running tasks.
+    pub fn wait_for_approval(
+        &mut self,
+        task_id: Uuid,
+        reason: impl Into<String>,
+    ) -> Result<ScheduleDecision, PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if task.status != WorkStatus::Running {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Waiting;
+        self.snapshot.running_order.retain(|id| *id != task_id);
+        Ok(ScheduleDecision::WaitForApproval {
+            task_id,
+            reason: reason.into(),
+        })
+    }
+
+    /// Return an approval-suspended task to the same live runtime turn.
+    ///
+    /// # Errors
+    /// Rejects missing tasks, non-waiting tasks, or a full worker lane.
+    pub fn resume_after_approval(&mut self, task_id: Uuid) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if task.status != WorkStatus::Waiting
+            || self.snapshot.running_order.len() >= self.maximum_parallelism
+        {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Running;
+        self.snapshot.running_order.push(task_id);
+        Ok(())
+    }
+
+    /// Pause one non-terminal task without losing attempts or checkpoints.
+    ///
+    /// # Errors
+    /// Rejects missing or terminal tasks.
+    pub fn pause(&mut self, task_id: Uuid) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if matches!(
+            task.status,
+            WorkStatus::Completed | WorkStatus::Failed | WorkStatus::Cancelled
+        ) {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Paused;
+        self.snapshot.running_order.retain(|id| *id != task_id);
+        Ok(())
+    }
+
+    /// Resume one explicitly paused task into the durable queue.
+    ///
+    /// # Errors
+    /// Rejects missing or non-paused tasks.
+    pub fn resume(&mut self, task_id: Uuid) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if task.status != WorkStatus::Paused {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Queued;
+        Ok(())
+    }
+
+    /// Cancel one non-terminal task and remove it from the running lane.
+    ///
+    /// # Errors
+    /// Rejects missing or already-terminal tasks.
+    pub fn cancel(&mut self, task_id: Uuid) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if matches!(task.status, WorkStatus::Completed | WorkStatus::Cancelled) {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Cancelled;
+        self.snapshot.running_order.retain(|id| *id != task_id);
+        Ok(())
+    }
+
+    /// Retry failed or safely suspended work without resetting its attempt counter.
+    ///
+    /// # Errors
+    /// Rejects missing tasks, unsupported states, or exhausted attempts.
+    pub fn retry(&mut self, task_id: Uuid) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if !matches!(task.status, WorkStatus::Failed | WorkStatus::Waiting)
+            || task.attempt >= task.max_attempts
+        {
+            return Err(if task.attempt >= task.max_attempts {
+                PlanError::AttemptsExhausted(task_id)
+            } else {
+                PlanError::TaskNotReady(task_id)
+            });
+        }
+        task.status = WorkStatus::Queued;
+        task.checkpoint_id = None;
+        Ok(())
+    }
+
+    /// Mark an active task as terminally failed so retry remains an explicit UI action.
+    ///
+    /// # Errors
+    /// Rejects missing or non-running tasks.
+    pub fn fail(&mut self, task_id: Uuid, output: Value) -> Result<(), PlanError> {
+        let task = self
+            .snapshot
+            .graph
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(PlanError::MissingTask(task_id))?;
+        if !matches!(task.status, WorkStatus::Running | WorkStatus::Waiting) {
+            return Err(PlanError::TaskNotReady(task_id));
+        }
+        task.status = WorkStatus::Failed;
+        task.output = Some(output);
+        self.snapshot.running_order.retain(|id| *id != task_id);
+        Ok(())
+    }
+
+    /// Pause every non-terminal node in a goal graph.
+    pub fn pause_all(&mut self) {
+        for task in self.snapshot.graph.tasks.values_mut() {
+            if !matches!(
+                task.status,
+                WorkStatus::Completed | WorkStatus::Failed | WorkStatus::Cancelled
+            ) {
+                task.status = WorkStatus::Paused;
+            }
+        }
+        self.snapshot.running_order.clear();
+    }
+
+    /// Resume every task explicitly paused with its goal.
+    pub fn resume_all(&mut self) {
+        for task in self.snapshot.graph.tasks.values_mut() {
+            if task.status == WorkStatus::Paused {
+                task.status = WorkStatus::Queued;
+            }
+        }
+    }
+
+    /// Cancel every unfinished node in a goal graph.
+    pub fn cancel_all(&mut self) {
+        for task in self.snapshot.graph.tasks.values_mut() {
+            if !matches!(task.status, WorkStatus::Completed | WorkStatus::Cancelled) {
+                task.status = WorkStatus::Cancelled;
+            }
+        }
+        self.snapshot.running_order.clear();
+    }
+
     /// Pause active background tasks for the priority user lane.
     pub fn preempt_for_user(&mut self) {
         for task_id in std::mem::take(&mut self.snapshot.running_order) {
@@ -736,6 +941,77 @@ mod tests {
         assert_eq!(
             recovered.snapshot().graph.tasks[&unsafe_task.id].status,
             WorkStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn native_controls_preserve_attempts_and_require_explicit_retry() {
+        let goal_id = Uuid::now_v7();
+        let mut task = task(goal_id, "background work");
+        task.max_attempts = 3;
+        let task_id = task.id;
+        let graph = TaskGraph {
+            goal_id,
+            revision: 1,
+            tasks: [(task.id, task)].into(),
+            edges: vec![],
+        };
+        let mut supervisor = DurableSupervisor::new(graph, 1, 3).expect("supervisor");
+        supervisor.start(task_id).expect("start");
+        supervisor
+            .bind_checkpoint(task_id, "ses_background")
+            .expect("bind checkpoint");
+        supervisor.pause(task_id).expect("pause");
+        assert_eq!(
+            supervisor.snapshot().graph.tasks[&task_id].status,
+            WorkStatus::Paused
+        );
+        supervisor.resume(task_id).expect("resume");
+        supervisor.start(task_id).expect("restart");
+        supervisor
+            .fail(task_id, json!({"error":"provider disconnected"}))
+            .expect("fail");
+        assert_eq!(
+            supervisor.snapshot().graph.tasks[&task_id].status,
+            WorkStatus::Failed
+        );
+        supervisor.retry(task_id).expect("retry");
+        let retried = &supervisor.snapshot().graph.tasks[&task_id];
+        assert_eq!(retried.status, WorkStatus::Queued);
+        assert_eq!(retried.attempt, 2);
+        assert!(retried.checkpoint_id.is_none());
+    }
+
+    #[test]
+    fn approval_waiting_is_a_durable_suspension_not_a_failure() {
+        let goal_id = Uuid::now_v7();
+        let task = task(goal_id, "approval gated");
+        let task_id = task.id;
+        let graph = TaskGraph {
+            goal_id,
+            revision: 1,
+            tasks: [(task.id, task)].into(),
+            edges: vec![],
+        };
+        let mut supervisor = DurableSupervisor::new(graph, 1, 3).expect("supervisor");
+        supervisor.start(task_id).expect("start");
+        assert!(matches!(
+            supervisor
+                .wait_for_approval(task_id, "write workspace")
+                .expect("wait"),
+            ScheduleDecision::WaitForApproval { .. }
+        ));
+        assert_eq!(
+            supervisor.snapshot().graph.tasks[&task_id].status,
+            WorkStatus::Waiting
+        );
+        assert!(supervisor.snapshot().running_order.is_empty());
+        supervisor
+            .resume_after_approval(task_id)
+            .expect("resume approval");
+        assert_eq!(
+            supervisor.snapshot().graph.tasks[&task_id].status,
+            WorkStatus::Running
         );
     }
 

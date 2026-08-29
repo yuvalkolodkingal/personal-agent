@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_on": "2026-08-26",
+  "updated_on": "2026-08-29",
   "rejections": [
     {
       "id": "REJ-001",
@@ -84,7 +84,7 @@
       "products": [
         "OpenCode"
       ],
-      "reason": "Upstream reports show argument mutation/short-circuit gaps. Effectful built-ins are disabled and replaced by gated MCP tools.",
+      "reason": "Upstream reports show argument mutation/short-circuit gaps. Personal Agent never rewrites arguments in the hook or treats it as the sole boundary: reviewed coding tools layer pinned OpenCode permissions and canonical workspace scope with native preauthorization, while non-coding effects use gated native tools.",
       "category": "security",
       "decision": "replaced-equivalently",
       "sources": [

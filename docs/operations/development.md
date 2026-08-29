@@ -52,10 +52,12 @@ provider configuration.
 
 The runtime compatibility test starts every dependency with isolated XDG and
 application-data directories. Its local OpenAI-compatible fixture records only
-request shape metadata, advertises one harmless native-gateway status call, and
-proves that OpenCode crosses the authenticated, session-scoped Rust tool bridge
-before streaming a terminal answer. It does not inherit provider credentials,
-global plugins, or project-local OpenCode configuration.
+request-shape metadata, first asks the real pinned sidecar to write a temporary
+workspace file through its model-facing coding surface, then calls the harmless
+native-gateway status tool and streams a terminal answer. Separate boundary
+tests reject mismatched session/directory pairs and explicit file or patch
+targets outside the canonical workspace. The fixture does not inherit provider
+credentials, global plugins, or project-local OpenCode configuration.
 
 Production uses the same isolation: the child receives an application-owned
 private home/config/data/cache/state/temp tree and a cleared, allowlisted
@@ -97,8 +99,9 @@ The CI installer-smoke jobs build and inspect a Debian package, Windows NSIS
 installer, and macOS application bundle. Each extracted payload must contain
 the native host, an OpenCode executable that reports the pinned version, and a
 byte-identical copy of the reviewed safety plugin. The runtime compatibility
-test additionally proves that this plugin removes upstream filesystem and
-effectful tools from the model request before allowing the native status turn.
+test additionally proves that this plugin advertises the reviewed coding-tool
+surface, preauthorizes calls through the registered-session native boundary,
+performs a real workspace file edit, and completes the native status turn.
 The native architecture matrix remains separate so x64 and ARM64 compilation
 failures are visible independently from packaging failures.
 

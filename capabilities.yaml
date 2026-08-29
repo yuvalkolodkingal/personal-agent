@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_on": "2026-08-26",
+  "updated_on": "2026-08-29",
   "capabilities": [
     {
       "id": "CAP-CONTRACTS",
@@ -12,7 +12,7 @@
       "sources": [
         "legacy://Jarvis"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "replaced-equivalently",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -39,7 +39,7 @@
       "sources": [
         "legacy://Jarvis"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "replaced-equivalently",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -69,7 +69,7 @@
         "legacy://Jarvis",
         "https://developers.home-assistant.io/docs/voice/overview/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -104,7 +104,7 @@
         "https://docs.anthropic.com/en/docs/claude-code/overview",
         "https://github.com/google-gemini/gemini-cli"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -149,7 +149,7 @@
         "https://docs.pipecat.ai/",
         "https://docs.livekit.io/agents/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -185,7 +185,7 @@
         "https://gemini.google.com/",
         "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -220,7 +220,7 @@
         "https://docs.cursor.com/",
         "https://docs.windsurf.com/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -255,7 +255,7 @@
         "https://aider.chat/docs/",
         "https://docs.cline.bot/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -288,7 +288,7 @@
         "https://docs.anthropic.com/en/docs/claude-code/overview",
         "https://developers.openai.com/codex/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "strengthened",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -323,7 +323,7 @@
         "https://developers.raycast.com/",
         "https://www.alfredapp.com/help/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -360,7 +360,7 @@
         "https://docs.stagehand.dev/",
         "https://docs.skyvern.com/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -395,7 +395,7 @@
         "https://docs.all-hands.dev/",
         "https://block.github.io/goose/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "new",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -428,7 +428,7 @@
         "https://openai.com/chatgpt/overview/",
         "https://www.anthropic.com/claude"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "strengthened",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -461,7 +461,7 @@
         "https://developers.home-assistant.io/docs/voice/overview/",
         "https://docs.n8n.io/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "strengthened",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -496,7 +496,7 @@
         "https://developers.openai.com/codex/",
         "https://docs.cline.bot/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "strengthened",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -532,7 +532,7 @@
         "https://www.aboutamazon.com/what-we-do/devices-services/alexa-plus",
         "https://developers.home-assistant.io/docs/voice/overview/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "new",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -565,7 +565,7 @@
         "https://gemini.google.com/",
         "https://www.anthropic.com/claude"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "new",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -598,7 +598,7 @@
         "https://www.anthropic.com/claude",
         "https://gemini.google.com/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -627,7 +627,7 @@
         "legacy://Jarvis",
         "https://opencode.ai/docs/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -654,7 +654,7 @@
       "sources": [
         "legacy://Jarvis"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "new",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",
@@ -683,7 +683,7 @@
         "legacy://Jarvis",
         "https://v2.tauri.app/"
       ],
-      "verified_on": "2026-08-26",
+      "verified_on": "2026-08-29",
       "source_confidence": "high",
       "legacy_status": "ported",
       "security_privacy": "Subject to data-zone labels, least privilege, consent for consequential effects, secret filtering, and immutable audit.",

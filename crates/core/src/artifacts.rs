@@ -124,6 +124,36 @@ impl ArtifactRepository {
     pub fn get(&self, id: Uuid) -> Option<&Artifact> {
         self.artifacts.get(&id)
     }
+
+    /// Return artifacts in stable identifier order for deterministic projections.
+    #[must_use]
+    pub fn list(&self) -> Vec<Artifact> {
+        self.artifacts.values().cloned().collect()
+    }
+
+    /// Rename an artifact without changing immutable content versions.
+    ///
+    /// # Errors
+    /// Returns `BlankMetadata` or `Missing`.
+    pub fn rename(&mut self, id: Uuid, title: &str) -> Result<(), ArtifactError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ArtifactError::BlankMetadata);
+        }
+        self.artifacts
+            .get_mut(&id)
+            .ok_or(ArtifactError::Missing(id))?
+            .title = title.into();
+        Ok(())
+    }
+
+    /// Remove an artifact and return its immutable metadata.
+    ///
+    /// # Errors
+    /// Returns `Missing` for an unknown artifact.
+    pub fn remove(&mut self, id: Uuid) -> Result<Artifact, ArtifactError> {
+        self.artifacts.remove(&id).ok_or(ArtifactError::Missing(id))
+    }
 }
 
 fn artifact_version(
@@ -256,6 +286,57 @@ impl Whiteboard {
             .artifact_id;
         Ok(self.add(artifact_id))
     }
+
+    /// Remove one card while preserving its underlying artifact.
+    ///
+    /// # Errors
+    /// Returns `MissingCard` for an unknown ID.
+    pub fn remove(&mut self, id: Uuid) -> Result<WhiteboardCard, ArtifactError> {
+        let card = self
+            .cards
+            .remove(&id)
+            .ok_or(ArtifactError::MissingCard(id))?;
+        self.order.retain(|candidate| *candidate != id);
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
+        Ok(card)
+    }
+
+    /// Remove every card that points at a deleted artifact.
+    pub fn remove_artifact(&mut self, artifact_id: Uuid) {
+        let removed = self
+            .cards
+            .values()
+            .filter(|card| card.artifact_id == artifact_id)
+            .map(|card| card.id)
+            .collect::<BTreeSet<_>>();
+        self.cards.retain(|id, _| !removed.contains(id));
+        self.order.retain(|id| !removed.contains(id));
+        if self.focused.is_some_and(|id| removed.contains(&id)) {
+            self.focused = None;
+        }
+    }
+}
+
+/// Encrypted snapshot metadata for the artifact library and whiteboard.
+/// Content bytes remain in the `SQLCipher` content-addressed blob store.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactWorkspace {
+    pub repository: ArtifactRepository,
+    pub whiteboard: Whiteboard,
+}
+
+impl ArtifactWorkspace {
+    /// Delete an artifact and all whiteboard references to it.
+    ///
+    /// # Errors
+    /// Returns `Missing` for an unknown artifact.
+    pub fn remove_artifact(&mut self, id: Uuid) -> Result<Artifact, ArtifactError> {
+        let artifact = self.repository.remove(id)?;
+        self.whiteboard.remove_artifact(id);
+        Ok(artifact)
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -308,5 +389,23 @@ mod tests {
         assert!(board.cards[&first].pinned);
         assert_eq!(board.focused, Some(second));
         assert_eq!(board.order, vec![second, first]);
+        board.remove(second).expect("remove");
+        assert_eq!(board.order, vec![first]);
+        assert_eq!(board.focused, None);
+    }
+
+    #[test]
+    fn deleting_an_artifact_removes_all_of_its_cards() {
+        let mut workspace = ArtifactWorkspace::default();
+        let artifact = workspace
+            .repository
+            .create("Draft", ArtifactKind::Text, "text/plain", b"one", vec![])
+            .expect("artifact");
+        workspace.whiteboard.add(artifact.id);
+        workspace.whiteboard.add(artifact.id);
+        workspace.remove_artifact(artifact.id).expect("delete");
+        assert!(workspace.repository.list().is_empty());
+        assert!(workspace.whiteboard.cards.is_empty());
+        assert!(workspace.whiteboard.order.is_empty());
     }
 }

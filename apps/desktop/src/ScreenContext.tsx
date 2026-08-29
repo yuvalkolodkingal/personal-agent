@@ -22,6 +22,20 @@ type DesktopStatus = {
   };
   permissions: Record<string, PermissionValue>;
 };
+type PortalStatus = {
+  interfaces: {
+    screencast_version?: number;
+    remote_desktop_version?: number;
+    available_source_types: number;
+    available_cursor_modes: number;
+  };
+  phase: "idle" | "probing" | "creating" | "selecting" | "awaiting_consent" | "active" | "cancelling" | "cancelled" | "failed";
+  consent: "required" | "requesting" | "granted" | "cancelled" | "denied" | "unavailable";
+  kind?: "screen_cast" | "remote_desktop";
+  streams: Array<{ node_id: number; position?: [number, number]; size?: [number, number] }>;
+  pipewire_transport: boolean;
+  detail: string;
+};
 
 function permissionGranted(value: PermissionValue | undefined) {
   return value?.state === "granted";
@@ -71,6 +85,8 @@ export function ScreenContext() {
   const [context, setContext] = useState<ContextResponse | null>(null);
   const [capture, setCapture] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [portalBusy, setPortalBusy] = useState(false);
+  const [portalStatus, setPortalStatus] = useState<PortalStatus | null>(null);
   const [error, setError] = useState("");
 
   const canObserve = Boolean(
@@ -85,7 +101,47 @@ export function ScreenContext() {
 
   useEffect(() => {
     void invoke<DesktopStatus>("desktop_status").then(setStatus).catch((caught) => setError(String(caught)));
+    void invoke<PortalStatus>("portal_status").then(setPortalStatus).catch((caught) => setError(String(caught)));
   }, []);
+
+  const connectPortal = async (requestControl: boolean) => {
+    setPortalBusy(true);
+    setError("");
+    setPortalStatus((current) => current ? { ...current, phase: "awaiting_consent", consent: "requesting", detail: "Waiting for the system portal selection" } : current);
+    try {
+      setPortalStatus(await invoke<PortalStatus>("portal_connect", { requestControl, parentWindow: "" }));
+    } catch (caught) {
+      setError(String(caught));
+      try {
+        setPortalStatus(await invoke<PortalStatus>("portal_status"));
+      } catch {
+        // Keep the primary portal error visible.
+      }
+    } finally {
+      setPortalBusy(false);
+    }
+  };
+
+  const cancelPortal = async () => {
+    setError("");
+    try {
+      setPortalStatus(await invoke<PortalStatus>("portal_cancel"));
+    } catch (caught) {
+      setError(String(caught));
+    }
+  };
+
+  const disconnectPortal = async () => {
+    setPortalBusy(true);
+    setError("");
+    try {
+      setPortalStatus(await invoke<PortalStatus>("portal_disconnect"));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setPortalBusy(false);
+    }
+  };
 
   const observe = async (withPixels = capture) => {
     setBusy(true);
@@ -159,6 +215,28 @@ export function ScreenContext() {
           ))}
         </div>
       )}
+      {portalStatus && (
+        <section className={`portal-session-panel ${portalStatus.consent}`} aria-label="Wayland portal session">
+          <div>
+            <span>WAYLAND PORTAL</span>
+            <strong>{portalStatus.phase === "active" ? "User-selected session active" : "Private system selection"}</strong>
+            <small>{portalStatus.detail}</small>
+            {portalStatus.streams.length > 0 && <small>{portalStatus.streams.length} selected stream{portalStatus.streams.length === 1 ? "" : "s"} · PipeWire frames {portalStatus.pipewire_transport ? "connected" : "not connected"}</small>}
+          </div>
+          <div>
+            {(["creating", "selecting", "awaiting_consent", "cancelling"] as string[]).includes(portalStatus.phase) ? (
+              <button onClick={() => void cancelPortal()}>Cancel portal request</button>
+            ) : portalStatus.phase === "active" ? (
+              <button disabled={portalBusy} onClick={() => void disconnectPortal()}>Disconnect portal</button>
+            ) : (
+              <>
+                <button disabled={portalBusy || !portalStatus.interfaces.screencast_version} onClick={() => void connectPortal(false)}>Share screen via portal</button>
+                <button title={portalStatus.interfaces.remote_desktop_version ? "Request pointer control through the system portal" : "RemoteDesktop is not exposed by this portal backend"} disabled={portalBusy || !portalStatus.interfaces.remote_desktop_version} onClick={() => void connectPortal(true)}>Grant screen control</button>
+              </>
+            )}
+          </div>
+        </section>
+      )}
       {context && (
         <div className="screen-observation">
           <div>
@@ -170,6 +248,7 @@ export function ScreenContext() {
                 <article key={node.handle.opaque_id}>
                   <div><b>{node.role}</b><strong>{node.name || "Unnamed control"}</strong><small>{node.states.join(" · ")}</small></div>
                   <div>
+                    {node.actions.includes("press") && <button title={canControl ? "Press this semantic control" : permissionDetail(status?.permissions.input_control)} disabled={busy || !canControl} onClick={() => void act({ action: "click", target: node.handle, button: "primary", click_count: 1 }, "interact", [{ postcondition: "generation_advanced" }])}>Press</button>}
                     {node.actions.includes("focus") && <button title={canControl ? "Focus this semantic control" : permissionDetail(status?.permissions.input_control)} disabled={busy || !canControl} onClick={() => void act({ action: "focus", target: node.handle }, "navigate", [{ postcondition: "condition", condition: "window_exists", window_id: node.handle.window_id }, { postcondition: "generation_advanced" }])}>Focus</button>}
                     {(node.actions.includes("set_value") || node.actions.includes("replace_selection")) && <button title={canControl ? "Type into this editable semantic control" : permissionDetail(status?.permissions.input_control)} disabled={busy || !canControl} onClick={() => { const text = window.prompt("Text to type"); if (text) void act({ action: "type_text", target: node.handle, text, replace_selection: node.actions.includes("replace_selection") }, "write_text", [{ postcondition: "condition", condition: "node_value_contains", target: { selector: "semantic", window_id: node.handle.window_id, role: node.role, name: node.name }, text }, { postcondition: "generation_advanced" }]); }}>Type</button>}
                   </div>

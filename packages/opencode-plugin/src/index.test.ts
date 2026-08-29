@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import plugin from "./index";
 
-const disabledBuiltinEffects = [
-  "apply_patch", "bash", "edit", "execute", "external_directory", "glob", "grep",
-  "patch", "read", "skill", "task", "webfetch", "websearch", "write",
+const codingTools = [
+  "apply_patch", "bash", "edit", "execute", "glob", "grep", "list", "lsp", "patch",
+  "read", "skill", "task", "todowrite", "todoread", "webfetch", "websearch", "write",
 ] as const;
 
 describe("OpenCode safety bridge", () => {
@@ -13,19 +13,29 @@ describe("OpenCode safety bridge", () => {
     expect(typeof module.default).toBe("function");
   });
 
-  it("disables every effectful built-in", async () => {
+  it("enables workspace coding tools with granular safety policy", async () => {
     const hooks = await plugin(); const config: any = { agent: { jarvis: {} } };
     await hooks.config(config);
-    for (const name of disabledBuiltinEffects) {
-      expect(config.permission[name]["*"]).toBe("deny"); expect(config.agent.jarvis.tools[name]).toBe(false);
-    }
+    for (const name of codingTools) expect(config.agent.jarvis.tools[name]).toBe(true);
+    expect(config.permission.edit).toBe("allow");
+    expect(config.permission.read["*"]).toBe("allow");
+    expect(config.permission.read["**/.env"]).toBe("deny");
+    expect(config.permission.bash["*"]).toBe("ask");
+    expect(config.permission.bash["cargo test*"]).toBe("allow");
+    expect(config.permission.bash["git push*"]).toBe("ask");
+    expect(config.permission.bash["git reset --hard*"]).toBe("deny");
+    expect(config.permission.external_directory).toBe("ask");
+    expect(config.permission.webfetch).toBe("ask");
   });
 
-  it("fails every upstream permission callback closed", async () => {
+  it("keeps reviewed approvals pending and fails unknown permissions closed", async () => {
     const hooks = await plugin();
-    const output: { status: "ask" | "deny" | "allow" } = { status: "allow" };
-    await hooks["permission.ask"]({}, output);
-    expect(output.status).toBe("deny");
+    const reviewed: { status: "ask" | "deny" | "allow" } = { status: "ask" };
+    await hooks["permission.ask"]({ permission: "bash" }, reviewed);
+    expect(reviewed.status).toBe("ask");
+    const unknown: { status: "ask" | "deny" | "allow" } = { status: "allow" };
+    await hooks["permission.ask"]({ permission: "unreviewed-native-effect" }, unknown);
+    expect(unknown.status).toBe("deny");
   });
 
   it("registers only the native authenticated gateway status slice", async () => {

@@ -1,6 +1,6 @@
 # Current landscape and source log
 
-Verified 2026-08-26. `competitors.yaml` is the structured inventory;
+Verified 2026-08-29. `competitors.yaml` is the structured inventory;
 `capabilities.yaml` is the deduplicated adoption decision. Historical analysis
 comes from the read-only Jarvis surveys and is not treated as current without a
 fresh primary source.
@@ -10,8 +10,11 @@ fresh primary source.
 OpenCode remains the runtime base because its stable server is protected,
 OpenAPI/SSE driven, provider-neutral, local-provider capable, and extensible by
 agents, skills, plugins, and MCP. Version 1.18.23 is pinned. The embedded V2 SDK
-remains beta. Current plugin limitations require effectful built-ins to be
-disabled rather than wrapped as the safety mechanism.
+remains beta. Current V1 hook limitations mean a before-hook cannot be trusted
+as the sole safety mechanism. The coding compatibility surface therefore uses
+the pinned runtime's own granular permissions and canonical workspace scope,
+plus independent native preauthorization; non-coding effects remain behind
+native gateway tools.
 
 OpenClaw and Leon add isolated local workspaces, channel routing, layered
 memory, local-provider choice, native/agent skill separation, and bounded

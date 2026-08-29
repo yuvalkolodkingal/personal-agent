@@ -26,8 +26,10 @@ limits accidental/model/extension effects and protects secrets at rest.
 1. UI to native core: requests are validated; UI state grants no authority.
 2. Core to OpenCode/provider: per-run auth, loopback only, version pin, output
    normalized and treated as untrusted.
-3. Runtime to tool gateway: effectful built-ins disabled; declared MCP tools
-   cannot bypass native policy.
+3. Runtime coding boundary: reviewed repository tools use pinned OpenCode
+   permissions, canonical workspace scope and independent native
+   preauthorization; desktop, connector, browser and MCP effects cannot bypass
+   native policy.
 4. Trusted state/secrets/private memory to untrusted content: cross-zone
    effects ask or deny.
 5. Workspace/desktop/isolated execution: mounts, network, tools, and inherited
@@ -62,7 +64,13 @@ differs by platform. Prompt injection cannot be perfectly classified. Hosted
 STT/providers receive user data after explicit configuration. Wake words false
 accept. Browser account takeover gives a page whatever the user grants during
 takeover. Plugin and connector vulnerabilities remain possible within declared
-scopes. Hardware/driver latency can miss audio targets.
+scopes. Hardware/driver latency can miss audio targets. The pinned OpenCode
+filesystem/shell compatibility surface has native session, workspace and path
+preauthorization plus granular approvals, but it does not yet provide the full
+checkpoint, postcondition and rollback guarantees of a native Personal Agent
+tool. Persistent PTYs survive renderer detach/reconnect but not a sidecar
+restart. Provider pricing fields and byte counts can be absent, so the usage UI
+labels them unknown instead of estimating them.
 
 Residual risk must appear in diagnostics and approval language. A feature that
 cannot enforce its boundary is unavailable with a reason, not silently weaker.

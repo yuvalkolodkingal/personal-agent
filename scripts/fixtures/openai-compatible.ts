@@ -21,6 +21,7 @@ function argument(name: string): string {
 
 const port = Number.parseInt(argument("port"), 10);
 const metadataPath = argument("metadata-path");
+const writePath = argument("write-path");
 const requestMetadata: RequestMetadata[] = [];
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
   throw new Error("fixture port is invalid");
@@ -69,11 +70,31 @@ const server = Bun.serve({
       toolNames,
     });
     await Bun.write(metadataPath, `${JSON.stringify(requestMetadata)}\n`);
+    if (hasToolResult && requestMetadata.length >= 3) {
+      return eventStream([
+        chunk({ role: "assistant" }),
+        chunk({ content: "workspace edit and native gateway completed" }),
+        chunk({}, "stop"),
+      ]);
+    }
+
     if (hasToolResult) {
       return eventStream([
         chunk({ role: "assistant" }),
-        chunk({ content: "native gateway completed" }),
-        chunk({}, "stop"),
+        chunk({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_fixture_gateway",
+              type: "function",
+              function: {
+                name: "personal_agent_gateway_status",
+                arguments: JSON.stringify({}),
+              },
+            },
+          ],
+        }),
+        chunk({}, "tool_calls"),
       ]);
     }
 
@@ -83,11 +104,14 @@ const server = Bun.serve({
         tool_calls: [
           {
             index: 0,
-            id: "call_fixture_gateway",
+            id: "call_fixture_write",
             type: "function",
             function: {
-              name: "personal_agent_gateway_status",
-              arguments: JSON.stringify({}),
+              name: "write",
+              arguments: JSON.stringify({
+                filePath: writePath,
+                content: "Personal Agent coding tools are active.\n",
+              }),
             },
           },
         ],
