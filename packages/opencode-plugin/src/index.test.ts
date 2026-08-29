@@ -38,6 +38,24 @@ describe("OpenCode safety bridge", () => {
     expect(unknown.status).toBe("deny");
   });
 
+  it("reviews every coding tool permission", async () => {
+    const hooks = await plugin();
+    const toolsWithoutPermissions = new Set<string>();
+    const reviewedPermissions = new Set<string>();
+
+    for (const name of codingTools) {
+      const output: { status: "ask" | "deny" | "allow" } = { status: "ask" };
+      await hooks["permission.ask"]({ permission: name }, output);
+      if (output.status !== "deny") reviewedPermissions.add(name);
+    }
+
+    expect(
+      codingTools.every(
+        (name) => reviewedPermissions.has(name) || toolsWithoutPermissions.has(name),
+      ),
+    ).toBe(true);
+  });
+
   it("registers only the native authenticated gateway status slice", async () => {
     const hooks = await plugin();
     expect(Object.keys(hooks.tool)).toEqual(["personal_agent_gateway_status"]);

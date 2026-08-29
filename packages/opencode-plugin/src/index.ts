@@ -19,8 +19,9 @@ const codingTools = [
 ] as const;
 
 const reviewedPermissions = new Set([
-  "bash", "doom_loop", "edit", "execute", "external_directory", "glob", "grep", "list",
-  "lsp", "question", "read", "skill", "task", "todowrite", "webfetch", "websearch",
+  "apply_patch", "bash", "doom_loop", "edit", "execute", "external_directory", "glob",
+  "grep", "list", "lsp", "patch", "question", "read", "skill", "task", "todoread",
+  "todowrite", "webfetch", "websearch", "write",
 ]);
 
 const readRules = {
