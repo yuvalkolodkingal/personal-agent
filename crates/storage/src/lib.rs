@@ -5,6 +5,7 @@ use prost::Message;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,81 @@ pub enum StorageError {
 /// Owned encrypted store. Database access never crosses the native-core boundary.
 pub struct EventStore {
     connection: Connection,
+}
+
+/// One append-only provider-accounting fact stored alongside a runtime event.
+#[derive(Clone, Copy, Debug)]
+pub struct UsageFactWrite<'a> {
+    pub id: &'a str,
+    pub day: &'a str,
+    pub session_id: Option<&'a str>,
+    pub body_json: &'a str,
+}
+
+/// One append-only, content-free egress record stored alongside a domain event.
+#[derive(Clone, Copy, Debug)]
+pub struct EgressWrite<'a> {
+    pub id: &'a str,
+    pub day: &'a str,
+    pub session_id: Option<&'a str>,
+    pub destination: &'a str,
+    /// `None` is represented as `-1` in the legacy non-null v4 column. The JSON
+    /// body remains authoritative and preserves the public optional value.
+    pub size_bytes: Option<u64>,
+    pub body_json: &'a str,
+}
+
+/// Additive accounting totals produced by SQL `GROUP BY` recovery queries.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredUsageAggregate {
+    pub provider_steps: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub total_was_reported: bool,
+    pub reported_cost_microusd: u64,
+    pub unknown_cost_steps: u64,
+    pub tool_calls: u64,
+    pub egress_events: u64,
+    pub known_egress_bytes: u64,
+    pub unknown_egress_sizes: u64,
+    pub providers: Vec<String>,
+    pub models: Vec<String>,
+}
+
+/// Recovered per-dimension aggregates for one profile and date range.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredUsageAggregates {
+    pub turns: BTreeMap<String, StoredUsageAggregate>,
+    pub sessions: BTreeMap<String, StoredUsageAggregate>,
+    pub days: BTreeMap<String, StoredUsageAggregate>,
+    pub scopes: BTreeMap<String, StoredUsageAggregate>,
+}
+
+/// One bounded page of serialized detail records.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredUsagePage {
+    pub usage_facts_json: Vec<String>,
+    pub egress_json: Vec<String>,
+    pub usage_total: u64,
+    pub egress_total: u64,
+}
+
+/// Bounded detail query. Aggregates intentionally use only the date range;
+/// provider/model/session/source narrow detail rows and their page totals.
+#[derive(Clone, Copy, Debug)]
+pub struct UsagePageQuery<'a> {
+    pub limit: usize,
+    pub offset: usize,
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub source: Option<&'a str>,
 }
 
 /// Durable application projection plus the last event included in it.
@@ -214,9 +290,7 @@ impl EventStore {
     ///
     /// Returns an error for unsupported/out-of-range events or failed storage.
     pub fn append(&mut self, event: &EventEnvelope) -> Result<(), StorageError> {
-        if event.schema_version != personal_agent_contracts::EVENT_SCHEMA_VERSION {
-            return Err(StorageError::UnsupportedEventSchema(event.schema_version));
-        }
+        validate_event(event)?;
         let sequence = i64::try_from(event.monotonic_sequence)
             .map_err(|_| StorageError::SequenceOutOfRange(event.monotonic_sequence))?;
         let tx = self
@@ -228,6 +302,217 @@ impl EventStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically append a runtime event and any accounting facts it produced.
+    ///
+    /// Provider usage and egress are append-only rows; this path never rewrites
+    /// a `runtime_snapshots` ledger blob.
+    ///
+    /// # Errors
+    /// Returns schema, sequence, JSON, or database errors.
+    pub fn append_usage_event(
+        &mut self,
+        event: &EventEnvelope,
+        usage_facts: &[UsageFactWrite<'_>],
+        egress: &[EgressWrite<'_>],
+    ) -> Result<(), StorageError> {
+        validate_event(event)?;
+        let sequence = i64::try_from(event.monotonic_sequence)
+            .map_err(|_| StorageError::SequenceOutOfRange(event.monotonic_sequence))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for fact in usage_facts {
+            tx.execute(
+                "INSERT INTO provider_usage(
+                   id,profile_id,amount_usd,body_json,day,session_id
+                 ) VALUES (
+                   ?1,?2,json_extract(?5,'$.cost.microusd') / 1000000.0,?5,?3,?4
+                 )",
+                params![
+                    fact.id,
+                    event.profile_id,
+                    fact.day,
+                    fact.session_id,
+                    fact.body_json
+                ],
+            )?;
+        }
+        for record in egress {
+            let size_bytes = record
+                .size_bytes
+                .map_or(-1, |size| i64::try_from(size).unwrap_or(i64::MAX));
+            tx.execute(
+                "INSERT INTO egress(
+                   id,profile_id,destination,size_bytes,body_json,day,session_id
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    record.id,
+                    event.profile_id,
+                    record.destination,
+                    size_bytes,
+                    record.body_json,
+                    record.day,
+                    record.session_id
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO events(monotonic_sequence,event_id,profile_id,event_type,wall_clock_timestamp,envelope) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![sequence, event.event_id, event.profile_id, event.r#type, event.wall_clock_timestamp, event.encode_to_vec()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rebuild additive usage state using SQL grouping rather than replaying a
+    /// serialized ledger or every detail row in Rust.
+    ///
+    /// # Errors
+    /// Returns database or malformed stored-JSON errors.
+    pub fn usage_aggregates(
+        &self,
+        profile_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<StoredUsageAggregates, StorageError> {
+        let mut aggregates = StoredUsageAggregates {
+            turns: grouped_usage_facts(&self.connection, profile_id, "$.turn_id", from, to)?,
+            sessions: grouped_usage_facts(&self.connection, profile_id, "$.session_id", from, to)?,
+            days: grouped_usage_facts(&self.connection, profile_id, "$.day_utc", from, to)?,
+            scopes: grouped_usage_facts(&self.connection, profile_id, "$.scope_key", from, to)?,
+        };
+        merge_egress_aggregates(
+            &self.connection,
+            profile_id,
+            "day",
+            &mut aggregates.days,
+            from,
+            to,
+        )?;
+        merge_egress_aggregates(
+            &self.connection,
+            profile_id,
+            "session_id",
+            &mut aggregates.sessions,
+            from,
+            to,
+        )?;
+        merge_egress_aggregates(
+            &self.connection,
+            profile_id,
+            "json_extract(body_json, '$.scope_key')",
+            &mut aggregates.scopes,
+            from,
+            to,
+        )?;
+        Ok(aggregates)
+    }
+
+    /// Return one newest-first detail page and the filtered row counts.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub fn usage_page(
+        &self,
+        profile_id: &str,
+        query: UsagePageQuery<'_>,
+    ) -> Result<StoredUsagePage, StorageError> {
+        let limit = i64::try_from(query.limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
+        let usage_total = count_usage_rows(&self.connection, profile_id, query)?;
+        let egress_total = count_egress_rows(&self.connection, profile_id, query)?;
+        let mut usage_statement = self.connection.prepare(
+            "SELECT body_json FROM provider_usage
+             WHERE profile_id=?1
+               AND json_extract(body_json,'$.kind')='provider'
+               AND (?2 IS NULL OR day >= ?2)
+               AND (?3 IS NULL OR day <= ?3)
+               AND (?4 IS NULL OR instr(lower(COALESCE(json_extract(body_json,'$.provider_id'),'')),lower(?4)) > 0)
+               AND (?5 IS NULL OR instr(lower(COALESCE(json_extract(body_json,'$.model_id'),'')),lower(?5)) > 0)
+               AND (?6 IS NULL OR instr(lower(session_id),lower(?6)) > 0)
+             ORDER BY day DESC, rowid DESC LIMIT ?7 OFFSET ?8",
+        )?;
+        let usage_facts_json = usage_statement
+            .query_map(
+                params![
+                    profile_id,
+                    query.from,
+                    query.to,
+                    query.provider,
+                    query.model,
+                    query.session,
+                    limit,
+                    offset
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut egress_statement = self.connection.prepare(
+            "SELECT body_json FROM egress
+             WHERE profile_id=?1
+               AND (?2 IS NULL OR day >= ?2)
+               AND (?3 IS NULL OR day <= ?3)
+               AND (?4 IS NULL OR instr(lower(COALESCE(session_id,'')),lower(?4)) > 0)
+               AND (?5 IS NULL OR lower(json_extract(body_json,'$.source'))=lower(?5))
+             ORDER BY day DESC, rowid DESC LIMIT ?6 OFFSET ?7",
+        )?;
+        let egress_json = egress_statement
+            .query_map(
+                params![
+                    profile_id,
+                    query.from,
+                    query.to,
+                    query.session,
+                    query.source,
+                    limit,
+                    offset
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(StoredUsagePage {
+            usage_facts_json,
+            egress_json,
+            usage_total,
+            egress_total,
+        })
+    }
+
+    /// Return the latest persisted turn context for every session.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub fn usage_turn_contexts(&self, profile_id: &str) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT body_json FROM (
+               SELECT body_json,
+                      ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY rowid DESC) AS rank
+               FROM provider_usage
+               WHERE profile_id=?1
+                 AND json_extract(body_json,'$.kind')='turn_started'
+             ) WHERE rank=1",
+        )?;
+        statement
+            .query_map([profile_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Whether a content-free egress identifier was already recorded.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub fn egress_exists(&self, profile_id: &str, id: &str) -> Result<bool, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM egress WHERE profile_id=?1 AND id=?2)",
+                params![profile_id, id],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
     }
 
     /// Resume a bounded event subscription after a known sequence number.
@@ -709,6 +994,28 @@ impl EventStore {
         load_snapshot(&self.connection, kind, id)
     }
 
+    /// Return the storage revision marker for one runtime snapshot.
+    ///
+    /// This supports compatibility checks which prove a legacy snapshot stayed
+    /// frozen while newer append-only rows were written.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub fn runtime_snapshot_updated_at(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT updated_at FROM runtime_snapshots WHERE kind=?1 AND id=?2",
+                params![kind, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
     /// Atomically persist one runtime snapshot and its append-only domain event.
     ///
     /// # Errors
@@ -742,6 +1049,183 @@ impl EventStore {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn grouped_usage_facts(
+    connection: &Connection,
+    profile_id: &str,
+    key_path: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<BTreeMap<String, StoredUsageAggregate>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT
+           json_extract(body_json, ?2) AS aggregate_key,
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.input'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.output'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.reasoning'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.cache_read'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.cache_write'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.total'),0) ELSE 0 END),
+           CASE
+             WHEN SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN 1 ELSE 0 END)=0 THEN 0
+             ELSE MIN(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.tokens.total_was_reported'),0) ELSE 1 END)
+           END,
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' THEN COALESCE(json_extract(body_json,'$.cost.microusd'),0) ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='provider' AND json_extract(body_json,'$.cost.microusd') IS NULL THEN 1 ELSE 0 END),
+           SUM(CASE WHEN json_extract(body_json,'$.kind')='tool_call' THEN 1 ELSE 0 END),
+           json_group_array(DISTINCT json_extract(body_json,'$.provider_id')) FILTER (
+             WHERE json_extract(body_json,'$.kind')='provider' AND json_extract(body_json,'$.provider_id') IS NOT NULL
+           ),
+           json_group_array(DISTINCT json_extract(body_json,'$.model_id')) FILTER (
+             WHERE json_extract(body_json,'$.kind')='provider' AND json_extract(body_json,'$.model_id') IS NOT NULL
+           )
+         FROM provider_usage
+         WHERE profile_id=?1
+           AND json_extract(body_json,'$.kind') IN ('provider','tool_call')
+           AND json_extract(body_json,?2) IS NOT NULL
+           AND (?3 IS NULL OR day >= ?3)
+           AND (?4 IS NULL OR day <= ?4)
+         GROUP BY aggregate_key",
+    )?;
+    let rows = statement.query_map(params![profile_id, key_path, from, to], |row| {
+        let providers_json = row.get::<_, String>(12)?;
+        let models_json = row.get::<_, String>(13)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            StoredUsageAggregate {
+                provider_steps: nonnegative(row.get::<_, i64>(1)?),
+                input_tokens: nonnegative(row.get::<_, i64>(2)?),
+                output_tokens: nonnegative(row.get::<_, i64>(3)?),
+                reasoning_tokens: nonnegative(row.get::<_, i64>(4)?),
+                cache_read_tokens: nonnegative(row.get::<_, i64>(5)?),
+                cache_write_tokens: nonnegative(row.get::<_, i64>(6)?),
+                total_tokens: nonnegative(row.get::<_, i64>(7)?),
+                total_was_reported: row.get::<_, i64>(8)? != 0,
+                reported_cost_microusd: nonnegative(row.get::<_, i64>(9)?),
+                unknown_cost_steps: nonnegative(row.get::<_, i64>(10)?),
+                tool_calls: nonnegative(row.get::<_, i64>(11)?),
+                providers: serde_json::from_str(&providers_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        12,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                models: serde_json::from_str(&models_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                ..StoredUsageAggregate::default()
+            },
+        ))
+    })?;
+    rows.collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn merge_egress_aggregates(
+    connection: &Connection,
+    profile_id: &str,
+    key_expression: &str,
+    target: &mut BTreeMap<String, StoredUsageAggregate>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(), StorageError> {
+    let key_expression = match key_expression {
+        "day" => "day",
+        "session_id" => "session_id",
+        "json_extract(body_json, '$.scope_key')" => "json_extract(body_json, '$.scope_key')",
+        _ => return Err(StorageError::Database(rusqlite::Error::InvalidQuery)),
+    };
+    let sql = format!(
+        "SELECT {key_expression}, COUNT(*),
+                SUM(CASE WHEN size_bytes >= 0 THEN size_bytes ELSE 0 END),
+                SUM(CASE WHEN size_bytes < 0 THEN 1 ELSE 0 END)
+         FROM egress
+         WHERE profile_id=?1
+           AND {key_expression} IS NOT NULL
+           AND (?2 IS NULL OR day >= ?2)
+           AND (?3 IS NULL OR day <= ?3)
+         GROUP BY {key_expression}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params![profile_id, from, to], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            nonnegative(row.get::<_, i64>(1)?),
+            nonnegative(row.get::<_, i64>(2)?),
+            nonnegative(row.get::<_, i64>(3)?),
+        ))
+    })?;
+    for row in rows {
+        let (key, events, known_bytes, unknown_sizes) = row?;
+        let aggregate = target.entry(key).or_default();
+        aggregate.egress_events = aggregate.egress_events.saturating_add(events);
+        aggregate.known_egress_bytes = aggregate.known_egress_bytes.saturating_add(known_bytes);
+        aggregate.unknown_egress_sizes =
+            aggregate.unknown_egress_sizes.saturating_add(unknown_sizes);
+    }
+    Ok(())
+}
+
+fn count_usage_rows(
+    connection: &Connection,
+    profile_id: &str,
+    query: UsagePageQuery<'_>,
+) -> Result<u64, StorageError> {
+    let count = connection.query_row(
+        "SELECT COUNT(*) FROM provider_usage
+         WHERE profile_id=?1
+           AND json_extract(body_json,'$.kind')='provider'
+           AND (?2 IS NULL OR day >= ?2)
+           AND (?3 IS NULL OR day <= ?3)
+           AND (?4 IS NULL OR instr(lower(COALESCE(json_extract(body_json,'$.provider_id'),'')),lower(?4)) > 0)
+           AND (?5 IS NULL OR instr(lower(COALESCE(json_extract(body_json,'$.model_id'),'')),lower(?5)) > 0)
+           AND (?6 IS NULL OR instr(lower(session_id),lower(?6)) > 0)",
+        params![
+            profile_id,
+            query.from,
+            query.to,
+            query.provider,
+            query.model,
+            query.session
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(nonnegative(count))
+}
+
+fn count_egress_rows(
+    connection: &Connection,
+    profile_id: &str,
+    query: UsagePageQuery<'_>,
+) -> Result<u64, StorageError> {
+    let count = connection.query_row(
+        "SELECT COUNT(*) FROM egress
+         WHERE profile_id=?1
+           AND (?2 IS NULL OR day >= ?2)
+           AND (?3 IS NULL OR day <= ?3)
+           AND (?4 IS NULL OR instr(lower(COALESCE(session_id,'')),lower(?4)) > 0)
+           AND (?5 IS NULL OR lower(json_extract(body_json,'$.source'))=lower(?5))",
+        params![
+            profile_id,
+            query.from,
+            query.to,
+            query.session,
+            query.source
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(nonnegative(count))
+}
+
+fn nonnegative(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }
 
 fn database_schema_version(connection: &Connection) -> Result<i64, StorageError> {
@@ -1265,6 +1749,193 @@ mod tests {
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].event_id, second.event_id);
         assert_eq!(store.last_sequence().expect("sequence"), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the 5k write/count/aggregate proof in one test.
+    fn append_only_usage_stream_groups_five_thousand_rows_without_ledger_rewrites() {
+        let mut store = EventStore::open_in_memory(&SecretString::from("test-only-key".to_owned()))
+            .expect("store");
+        for sequence in 1..=5_000_u64 {
+            let event = EventEnvelope::new(
+                sequence,
+                "usage-test",
+                "default",
+                "response.step_completed",
+                &json!({"tokens":{"total":3},"cost":0.000_002}),
+            )
+            .expect("event");
+            let body_json = serde_json::to_string(&json!({
+                "kind": "provider",
+                "event_id": event.event_id,
+                "at": event.wall_clock_timestamp,
+                "day_utc": "2026-08-30",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "scope_key": "session:session-1",
+                "provider_id": "test-provider",
+                "model_id": "test-model",
+                "tokens": {
+                    "input": 1,
+                    "output": 2,
+                    "reasoning": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "total": 3,
+                    "total_was_reported": true
+                },
+                "cost": {"microusd": 2, "status": "provider_reported"}
+            }))
+            .expect("usage fact");
+            store
+                .append_usage_event(
+                    &event,
+                    &[UsageFactWrite {
+                        id: &event.event_id,
+                        day: "2026-08-30",
+                        session_id: Some("session-1"),
+                        body_json: &body_json,
+                    }],
+                    &[],
+                )
+                .expect("append usage event");
+        }
+        let tool_event = EventEnvelope::new(
+            5_001,
+            "usage-test",
+            "default",
+            "tool.started",
+            &json!({"tool":"web.search"}),
+        )
+        .expect("tool event");
+        let tool_fact = serde_json::to_string(&json!({
+            "kind": "tool_call",
+            "event_id": tool_event.event_id,
+            "at": tool_event.wall_clock_timestamp,
+            "day_utc": "2026-08-30",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "scope_key": "session:session-1",
+            "provider_id": null,
+            "model_id": null,
+            "tokens": null,
+            "cost": null
+        }))
+        .expect("tool fact");
+        let egress_id = Uuid::now_v7().to_string();
+        let egress_body = serde_json::to_string(&json!({
+            "id": egress_id,
+            "at": "2026-08-30T12:00:00Z",
+            "source": "web",
+            "destination": "example.test",
+            "operation": "search",
+            "data_class": "tool arguments",
+            "size_bytes": null,
+            "purpose": "test",
+            "session_id": "session-1",
+            "scope_key": "session:session-1"
+        }))
+        .expect("egress body");
+        store
+            .append_usage_event(
+                &tool_event,
+                &[UsageFactWrite {
+                    id: &tool_event.event_id,
+                    day: "2026-08-30",
+                    session_id: Some("session-1"),
+                    body_json: &tool_fact,
+                }],
+                &[EgressWrite {
+                    id: &egress_id,
+                    day: "2026-08-30",
+                    session_id: Some("session-1"),
+                    destination: "example.test",
+                    size_bytes: None,
+                    body_json: &egress_body,
+                }],
+            )
+            .expect("append tool usage");
+
+        let full_ledger_writes: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_snapshots WHERE kind='usage-ledger-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("ledger snapshot write count");
+        assert_eq!(full_ledger_writes, 0);
+
+        let aggregates = store
+            .usage_aggregates("default", None, None)
+            .expect("SQL grouped aggregates");
+        let session = &aggregates.sessions["session-1"];
+        assert_eq!(session.provider_steps, 5_000);
+        assert_eq!(session.input_tokens, 5_000);
+        assert_eq!(session.output_tokens, 10_000);
+        assert_eq!(session.total_tokens, 15_000);
+        assert_eq!(session.reported_cost_microusd, 10_000);
+        assert_eq!(session.tool_calls, 1);
+        assert_eq!(session.egress_events, 1);
+        assert_eq!(session.unknown_egress_sizes, 1);
+        assert_eq!(session.providers, vec!["test-provider"]);
+        assert_eq!(session.models, vec!["test-model"]);
+
+        let page = store
+            .usage_page(
+                "default",
+                UsagePageQuery {
+                    limit: 25,
+                    offset: 50,
+                    from: Some("2026-08-30"),
+                    to: Some("2026-08-30"),
+                    provider: None,
+                    model: None,
+                    session: None,
+                    source: None,
+                },
+            )
+            .expect("bounded page");
+        assert_eq!(page.usage_total, 5_000);
+        assert_eq!(page.usage_facts_json.len(), 25);
+        assert_eq!(page.egress_total, 1);
+
+        let filtered = store
+            .usage_page(
+                "default",
+                UsagePageQuery {
+                    limit: 5,
+                    offset: 0,
+                    from: None,
+                    to: None,
+                    provider: Some("TEST-PROVIDER"),
+                    model: Some("test-model"),
+                    session: Some("SESSION-1"),
+                    source: Some("WEB"),
+                },
+            )
+            .expect("server-filtered page");
+        assert_eq!(filtered.usage_total, 5_000);
+        assert_eq!(filtered.usage_facts_json.len(), 5);
+        assert_eq!(filtered.egress_total, 1);
+
+        let missing = store
+            .usage_page(
+                "default",
+                UsagePageQuery {
+                    limit: 5,
+                    offset: 0,
+                    from: None,
+                    to: None,
+                    provider: Some("missing-provider"),
+                    model: None,
+                    session: None,
+                    source: Some("connector"),
+                },
+            )
+            .expect("empty filtered page");
+        assert_eq!(missing.usage_total, 0);
+        assert_eq!(missing.egress_total, 0);
     }
 
     #[test]

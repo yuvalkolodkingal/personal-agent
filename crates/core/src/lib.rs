@@ -43,7 +43,9 @@ pub use usage::{
 
 use personal_agent_contracts::proto::EventEnvelope;
 use personal_agent_runtime::{AgentRuntime, RuntimeError, RuntimeHealth};
-use personal_agent_storage::{EventStore, StorageError};
+use personal_agent_storage::{
+    EgressWrite, EventStore, StorageError, UsageFactWrite, UsagePageQuery,
+};
 pub use personal_agent_storage::{
     SupervisorActivityCheckpoint, SupervisorCheckpointUpdate, SupervisorRecoveryCheckpoint,
 };
@@ -203,6 +205,31 @@ pub struct ProfileState {
     store: EventStore,
     projection: AppProjection,
     profile_id: String,
+    usage: UsageLedger,
+    legacy_usage: UsageLedger,
+}
+
+/// Bounded provider/egress details plus SQL-rebuilt aggregates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsagePage {
+    pub ledger: UsageLedger,
+    pub usage_total: u64,
+    pub egress_total: u64,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// Detail filters for the append-only usage/egress page.
+#[derive(Clone, Copy, Debug)]
+pub struct UsagePageRequest<'a> {
+    pub limit: usize,
+    pub offset: usize,
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub source: Option<&'a str>,
 }
 
 impl ProfileState {
@@ -249,10 +276,16 @@ impl ProfileState {
         };
         let store = EventStore::open(database_path, &key)?;
         let projection = rebuild_projection_from(&store)?;
+        let legacy_usage = store
+            .runtime_snapshot("usage-ledger-v1", profile_id)?
+            .unwrap_or_default();
+        let usage = rebuild_usage_from(&store, profile_id, &legacy_usage)?;
         Ok(Self {
             store,
             projection,
             profile_id: profile_id.to_owned(),
+            usage,
+            legacy_usage,
         })
     }
 
@@ -597,14 +630,55 @@ impl ProfileState {
     ) -> Result<AppProjection, CoreError> {
         event.monotonic_sequence = self.projection.last_sequence + 1;
         event.profile_id.clone_from(&self.profile_id);
-        let mut usage = self.usage_snapshot()?;
-        usage.ingest_runtime_event(&event)?;
-        self.store.save_runtime_snapshot_and_event(
-            "usage-ledger-v1",
-            &self.profile_id,
-            &usage,
-            &event,
-        )?;
+        let mutation = self.usage.ingest_runtime_event_delta(&event)?;
+        self.usage.clear_detail_records();
+        let fact_json = mutation
+            .fact
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let usage_facts = mutation
+            .fact
+            .as_ref()
+            .zip(fact_json.as_deref())
+            .map_or_else(Vec::new, |(fact, body_json)| {
+                vec![UsageFactWrite {
+                    id: &fact.event_id,
+                    day: &fact.day_utc,
+                    session_id: Some(&fact.session_id),
+                    body_json,
+                }]
+            });
+        let egress_json = mutation
+            .egress
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let egress_id = mutation.egress.as_ref().map(|record| record.id.to_string());
+        let egress_day = mutation
+            .egress
+            .as_ref()
+            .map(|record| record.at.format("%Y-%m-%d").to_string());
+        let egress = mutation
+            .egress
+            .as_ref()
+            .zip(egress_id.as_deref())
+            .zip(egress_day.as_deref())
+            .zip(egress_json.as_deref())
+            .map_or_else(Vec::new, |(((record, id), day), body_json)| {
+                vec![EgressWrite {
+                    id,
+                    day,
+                    session_id: record.session_id.as_deref(),
+                    destination: &record.destination,
+                    size_bytes: record.size_bytes,
+                    body_json,
+                }]
+            });
+        if let Err(error) = self.store.append_usage_event(&event, &usage_facts, &egress) {
+            self.usage = rebuild_usage_from(&self.store, &self.profile_id, &self.legacy_usage)?;
+            return Err(error.into());
+        }
         self.apply_persisted_event(&event)
     }
 
@@ -613,32 +687,128 @@ impl ProfileState {
     /// # Errors
     /// Returns an encrypted storage or serialization failure.
     pub fn usage_snapshot(&self) -> Result<UsageLedger, CoreError> {
-        Ok(self
+        Ok(self.usage.aggregate_snapshot())
+    }
+
+    /// Return one bounded detail page and aggregates for the requested UTC-day
+    /// range. `from` and `to` are inclusive `YYYY-MM-DD` values.
+    ///
+    /// # Errors
+    /// Returns encrypted storage or malformed-record errors.
+    pub fn usage_page(&self, request: UsagePageRequest<'_>) -> Result<UsagePage, CoreError> {
+        let aggregates = self
             .store
-            .runtime_snapshot("usage-ledger-v1", &self.profile_id)?
-            .unwrap_or_default())
+            .usage_aggregates(&self.profile_id, request.from, request.to)?;
+        let fetch_limit = request.offset.saturating_add(request.limit);
+        let stored = self.store.usage_page(
+            &self.profile_id,
+            UsagePageQuery {
+                limit: fetch_limit,
+                offset: 0,
+                from: request.from,
+                to: request.to,
+                provider: request.provider,
+                model: request.model,
+                session: request.session,
+                source: request.source,
+            },
+        )?;
+        let mut ledger = UsageLedger::from_stored(aggregates, &[])?;
+        ledger.merge_aggregates_from(
+            &self
+                .legacy_usage
+                .aggregates_in_range(request.from, request.to),
+        );
+        let mut records = stored
+            .usage_facts_json
+            .iter()
+            .map(|body| UsageLedger::fact_from_json(body))
+            .collect::<Result<Vec<_>, _>>()?;
+        let legacy_records = self
+            .legacy_usage
+            .records
+            .iter()
+            .filter(|record| legacy_usage_matches(record, request))
+            .cloned()
+            .collect::<Vec<_>>();
+        let legacy_usage_total = u64::try_from(legacy_records.len()).unwrap_or(u64::MAX);
+        records.extend(legacy_records);
+        records.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| right.id.cmp(&left.id)));
+        ledger.records = records
+            .into_iter()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect();
+
+        let mut egress = stored
+            .egress_json
+            .iter()
+            .map(|body| serde_json::from_str(body))
+            .collect::<Result<Vec<_>, _>>()?;
+        let legacy_egress = self
+            .legacy_usage
+            .egress
+            .iter()
+            .filter(|record| legacy_egress_matches(record, request))
+            .cloned()
+            .collect::<Vec<_>>();
+        let legacy_egress_total = u64::try_from(legacy_egress.len()).unwrap_or(u64::MAX);
+        egress.extend(legacy_egress);
+        egress.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| right.id.cmp(&left.id)));
+        ledger.egress = egress
+            .into_iter()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect();
+        Ok(UsagePage {
+            ledger,
+            usage_total: stored.usage_total.saturating_add(legacy_usage_total),
+            egress_total: stored.egress_total.saturating_add(legacy_egress_total),
+            limit: request.limit,
+            offset: request.offset,
+        })
     }
 
     /// Atomically append one content-free egress event and update aggregates.
     ///
     /// # Errors
     /// Returns validation, event, serialization, or encrypted-storage failures.
+    #[allow(clippy::needless_pass_by_value)] // Existing effect gateways transfer ownership here.
     pub fn record_egress(&mut self, record: EgressRecord) -> Result<AppProjection, CoreError> {
-        let mut usage = self.usage_snapshot()?;
-        usage.record_egress(record.clone())?;
         let event = EventEnvelope::new(
             self.projection.last_sequence + 1,
             "egress-gateway",
             &self.profile_id,
             "egress.recorded",
-            &serde_json::to_value(record)?,
+            &serde_json::to_value(&record)?,
         )?;
-        self.store.save_runtime_snapshot_and_event(
-            "usage-ledger-v1",
-            &self.profile_id,
-            &usage,
-            &event,
-        )?;
+        let exists = self.usage.has_seen_egress(record.id)
+            || self
+                .store
+                .egress_exists(&self.profile_id, &record.id.to_string())?;
+        if !exists {
+            self.usage.record_egress(record.clone())?;
+            self.usage.clear_detail_records();
+        }
+        let body_json = serde_json::to_string(&record)?;
+        let id = record.id.to_string();
+        let day = record.at.format("%Y-%m-%d").to_string();
+        let rows = if exists {
+            Vec::new()
+        } else {
+            vec![EgressWrite {
+                id: &id,
+                day: &day,
+                session_id: record.session_id.as_deref(),
+                destination: &record.destination,
+                size_bytes: record.size_bytes,
+                body_json: &body_json,
+            }]
+        };
+        if let Err(error) = self.store.append_usage_event(&event, &[], &rows) {
+            self.usage = rebuild_usage_from(&self.store, &self.profile_id, &self.legacy_usage)?;
+            return Err(error.into());
+        }
         self.apply_persisted_event(&event)
     }
 
@@ -842,6 +1012,57 @@ pub fn rebuild_projection_from(store: &EventStore) -> Result<AppProjection, Core
     Ok(projection)
 }
 
+fn rebuild_usage_from(
+    store: &EventStore,
+    profile_id: &str,
+    legacy: &UsageLedger,
+) -> Result<UsageLedger, CoreError> {
+    let aggregates = store.usage_aggregates(profile_id, None, None)?;
+    let contexts = store.usage_turn_contexts(profile_id)?;
+    let newer = UsageLedger::from_stored(aggregates, &contexts)?;
+    let mut combined = legacy.clone();
+    combined.clear_detail_records();
+    combined.merge_append_only(newer)?;
+    Ok(combined)
+}
+
+fn legacy_usage_matches(record: &ProviderUsageRecord, query: UsagePageRequest<'_>) -> bool {
+    day_matches(&record.day_utc, query.from, query.to)
+        && optional_contains(record.provider_id.as_deref(), query.provider)
+        && optional_contains(record.model_id.as_deref(), query.model)
+        && optional_contains(Some(&record.session_id), query.session)
+}
+
+fn legacy_egress_matches(record: &EgressRecord, query: UsagePageRequest<'_>) -> bool {
+    day_matches(
+        &record.at.format("%Y-%m-%d").to_string(),
+        query.from,
+        query.to,
+    ) && optional_contains(record.session_id.as_deref(), query.session)
+        && query.source.is_none_or(|source| {
+            let stored = match record.source {
+                EgressSource::Web => "web",
+                EgressSource::Mcp => "mcp",
+                EgressSource::Connector => "connector",
+            };
+            stored.eq_ignore_ascii_case(source)
+        })
+}
+
+fn day_matches(day: &str, from: Option<&str>, to: Option<&str>) -> bool {
+    from.is_none_or(|from| day >= from) && to.is_none_or(|to| day <= to)
+}
+
+fn optional_contains(value: Option<&str>, needle: Option<&str>) -> bool {
+    needle.is_none_or(|needle| {
+        value.is_some_and(|value| {
+            value
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        })
+    })
+}
+
 /// Read-only diagnostics used by both desktop IPC and CLI.
 #[must_use]
 pub fn diagnostic_snapshot() -> Value {
@@ -977,6 +1198,201 @@ mod tests {
     }
 
     #[test]
+    fn append_only_usage_rebuilds_context_aggregates_and_pages_after_reopen() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("usage-profile.db");
+        let secrets = FakeSecretStore::default();
+        {
+            let mut state = ProfileState::open(&database, "default", &secrets).expect("open");
+            let mut admitted = EventEnvelope::new(
+                1,
+                "runtime",
+                "default",
+                "response.admitted",
+                &serde_json::json!({
+                    "message_id": "turn-1",
+                    "provider_id": "openai",
+                    "model_id": "gpt-test"
+                }),
+            )
+            .expect("admitted");
+            admitted.session_id = Some("session-1".into());
+            state
+                .record_runtime_event(admitted)
+                .expect("persist context");
+        }
+        {
+            let mut state = ProfileState::open(&database, "default", &secrets).expect("reopen");
+            let mut step = EventEnvelope::new(
+                1,
+                "runtime",
+                "default",
+                "response.step_completed",
+                &serde_json::json!({"tokens":{"input":7,"output":3,"total":10},"cost":0.000_042}),
+            )
+            .expect("step");
+            step.session_id = Some("session-1".into());
+            state.record_runtime_event(step).expect("persist step");
+            let snapshot = state.usage_snapshot().expect("aggregate snapshot");
+            assert_eq!(snapshot.turns["turn-1"].tokens.total, 10);
+            assert!(snapshot.turns["turn-1"].providers.contains("openai"));
+        }
+        let reopened = ProfileState::open(&database, "default", &secrets).expect("reopen again");
+        let snapshot = reopened.usage_snapshot().expect("recovered aggregate");
+        assert_eq!(snapshot.sessions["session-1"].provider_steps, 1);
+        assert_eq!(snapshot.sessions["session-1"].reported_cost_microusd, 42);
+        let page = reopened
+            .usage_page(UsagePageRequest {
+                limit: 10,
+                offset: 0,
+                from: None,
+                to: None,
+                provider: None,
+                model: None,
+                session: None,
+                source: None,
+            })
+            .expect("usage page");
+        assert_eq!(page.usage_total, 1);
+        assert_eq!(page.ledger.records[0].turn_id, "turn-1");
+        assert_eq!(page.ledger.records[0].model_id.as_deref(), Some("gpt-test"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // End-to-end compatibility proof keeps the frozen base visible.
+    fn frozen_legacy_usage_snapshot_merges_with_new_rows_without_being_rewritten() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("legacy-usage-profile.db");
+        let secrets = FakeSecretStore::default();
+        let reference = SecretReference {
+            service: "dev.personal-agent.storage".to_owned(),
+            account: "database-default".to_owned(),
+        };
+        let key = SecretString::from("legacy-usage-test-key".to_owned());
+        secrets.put(&reference, &key).expect("store profile key");
+
+        let mut legacy = UsageLedger::default();
+        let mut admitted = EventEnvelope::new(
+            1,
+            "legacy-runtime",
+            "default",
+            "response.admitted",
+            &serde_json::json!({
+                "message_id": "legacy-turn",
+                "provider_id": "legacy-provider",
+                "model_id": "legacy-model"
+            }),
+        )
+        .expect("legacy admitted");
+        admitted.session_id = Some("legacy-session".into());
+        admitted.wall_clock_timestamp = "2026-08-29T10:00:00Z".into();
+        legacy
+            .ingest_runtime_event(&admitted)
+            .expect("legacy context");
+        let mut legacy_step = EventEnvelope::new(
+            2,
+            "legacy-runtime",
+            "default",
+            "response.step_completed",
+            &serde_json::json!({"tokens":{"input":3,"output":2,"total":5},"cost":0.000_005}),
+        )
+        .expect("legacy step");
+        legacy_step.session_id = Some("legacy-session".into());
+        legacy_step.wall_clock_timestamp = "2026-08-29T10:01:00Z".into();
+        legacy
+            .ingest_runtime_event(&legacy_step)
+            .expect("legacy usage");
+        let legacy_egress = EgressRecord {
+            id: uuid::Uuid::now_v7(),
+            at: "2026-08-29T10:02:00Z".parse().expect("legacy time"),
+            source: EgressSource::Mcp,
+            destination: "legacy-mcp".into(),
+            operation: "tools.call".into(),
+            data_class: "tool arguments".into(),
+            size_bytes: Some(42),
+            purpose: "legacy user request".into(),
+            session_id: Some("legacy-session".into()),
+            scope_key: Some("session:legacy-session".into()),
+        };
+        legacy
+            .record_egress(legacy_egress.clone())
+            .expect("legacy egress");
+
+        let (legacy_body, legacy_revision) = {
+            let mut store = EventStore::open(&database, &key).expect("seed store");
+            store
+                .save_runtime_snapshot("usage-ledger-v1", "default", &legacy)
+                .expect("seed legacy ledger");
+            let body = store
+                .runtime_snapshot::<serde_json::Value>("usage-ledger-v1", "default")
+                .expect("legacy body")
+                .expect("legacy body exists");
+            let revision = store
+                .runtime_snapshot_updated_at("usage-ledger-v1", "default")
+                .expect("legacy revision")
+                .expect("legacy revision exists");
+            (body, revision)
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let mut state = ProfileState::open(&database, "default", &secrets).expect("open cutover");
+        let mut new_step = EventEnvelope::new(
+            1,
+            "runtime",
+            "default",
+            "response.step_completed",
+            &serde_json::json!({"tokens":{"input":4,"output":3,"total":7},"cost":0.000_007}),
+        )
+        .expect("new step");
+        new_step.session_id = Some("legacy-session".into());
+        new_step.wall_clock_timestamp = "2026-08-30T11:00:00Z".into();
+        state
+            .record_runtime_event(new_step)
+            .expect("append post-cutover usage");
+        state
+            .record_egress(legacy_egress.clone())
+            .expect("legacy egress retry stays idempotent");
+
+        let aggregate = state.usage_snapshot().expect("combined aggregate");
+        assert_eq!(aggregate.turns["legacy-turn"].provider_steps, 2);
+        assert_eq!(aggregate.turns["legacy-turn"].tokens.total, 12);
+        assert_eq!(aggregate.turns["legacy-turn"].reported_cost_microusd, 12);
+        assert_eq!(aggregate.sessions["legacy-session"].egress_events, 1);
+
+        let page = state
+            .usage_page(UsagePageRequest {
+                limit: 10,
+                offset: 0,
+                from: None,
+                to: None,
+                provider: Some("legacy-provider"),
+                model: None,
+                session: Some("legacy-session"),
+                source: None,
+            })
+            .expect("combined page");
+        assert_eq!(page.usage_total, 2);
+        assert_eq!(page.ledger.records.len(), 2);
+        assert_eq!(page.ledger.records[0].turn_id, "legacy-turn");
+        assert_eq!(page.ledger.records[1].turn_id, "legacy-turn");
+        assert_eq!(page.egress_total, 1);
+        assert_eq!(page.ledger.egress, vec![legacy_egress]);
+
+        let body_after = state
+            .store
+            .runtime_snapshot::<serde_json::Value>("usage-ledger-v1", "default")
+            .expect("legacy body after")
+            .expect("legacy body remains");
+        let revision_after = state
+            .store
+            .runtime_snapshot_updated_at("usage-ledger-v1", "default")
+            .expect("legacy revision after")
+            .expect("legacy revision remains");
+        assert_eq!(body_after, legacy_body);
+        assert_eq!(revision_after, legacy_revision);
+    }
+
+    #[test]
     fn profile_drop_persists_a_clean_shutdown_projection_checkpoint() {
         let temp = tempfile::tempdir().expect("temp");
         let database = temp.path().join("clean-shutdown.db");
@@ -1011,6 +1427,8 @@ mod tests {
             store,
             projection: AppProjection::default(),
             profile_id: "default".into(),
+            usage: UsageLedger::default(),
+            legacy_usage: UsageLedger::default(),
         };
         for sequence in 1..=1_000 {
             state

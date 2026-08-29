@@ -2,7 +2,7 @@
 
 use super::DesktopState;
 use chrono::Utc;
-use personal_agent_core::{EgressRecord, ProviderUsageRecord, UsageAggregate};
+use personal_agent_core::{EgressRecord, ProviderUsageRecord, UsageAggregate, UsagePageRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -18,6 +18,10 @@ pub(crate) struct UsageSnapshotView {
     sessions: BTreeMap<String, UsageAggregate>,
     days: BTreeMap<String, UsageAggregate>,
     scopes: BTreeMap<String, UsageAggregate>,
+    usage_total: u64,
+    egress_total: u64,
+    limit: usize,
+    offset: usize,
     pricing_policy: &'static str,
 }
 
@@ -46,16 +50,42 @@ pub(crate) struct UsageExportResult {
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri commands deserialize and inject owned IPC arguments.
+#[allow(clippy::too_many_arguments)] // Flat optional IPC filters remain backward-compatible.
 pub(crate) fn usage_snapshot(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    session: Option<String>,
+    source: Option<String>,
     desktop: tauri::State<'_, DesktopState>,
 ) -> Result<UsageSnapshotView, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let offset = offset.unwrap_or_default();
+    let (from, to) = normalize_range(from, to)?;
+    let provider = normalize_optional(provider);
+    let model = normalize_optional(model);
+    let session = normalize_optional(session);
+    let source = normalize_optional(source);
     let profile = desktop
         .profile
         .lock()
         .map_err(|_| "profile state lock is poisoned".to_owned())?;
-    let ledger = profile
-        .usage_snapshot()
+    let page = profile
+        .usage_page(UsagePageRequest {
+            limit,
+            offset,
+            from: from.as_deref(),
+            to: to.as_deref(),
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+            session: session.as_deref(),
+            source: source.as_deref(),
+        })
         .map_err(|error| error.to_string())?;
+    let ledger = page.ledger;
     Ok(UsageSnapshotView {
         records: ledger.records,
         egress: ledger.egress,
@@ -63,6 +93,10 @@ pub(crate) fn usage_snapshot(
         sessions: ledger.sessions,
         days: ledger.days,
         scopes: ledger.scopes,
+        usage_total: page.usage_total,
+        egress_total: page.egress_total,
+        limit: page.limit,
+        offset: page.offset,
         pricing_policy: "Only provider-reported cost is totaled. Missing or invalid cost remains explicitly unknown.",
     })
 }
@@ -78,11 +112,25 @@ pub(crate) fn usage_export(
         .profile
         .lock()
         .map_err(|_| "profile state lock is poisoned".to_owned())?;
-    let ledger = profile
-        .usage_snapshot()
+    let (from, to) = normalize_range(filter.from_day.clone(), filter.to_day.clone())?;
+    let provider = normalize_optional(filter.provider.clone());
+    let model = normalize_optional(filter.model.clone());
+    let session = normalize_optional(filter.session.clone());
+    let source = normalize_optional(filter.source.clone());
+    let page = profile
+        .usage_page(UsagePageRequest {
+            limit: usize::MAX,
+            offset: 0,
+            from: from.as_deref(),
+            to: to.as_deref(),
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+            session: session.as_deref(),
+            source: source.as_deref(),
+        })
         .map_err(|error| error.to_string())?;
     drop(profile);
-    let body = filtered_export(&ledger.records, &ledger.egress, &filter);
+    let body = filtered_export(&page.ledger.records, &page.ledger.egress, &filter);
     let directory = app
         .path()
         .download_dir()
@@ -171,6 +219,39 @@ fn optional_contains(value: Option<&str>, needle: Option<&str>) -> bool {
             .to_ascii_lowercase()
             .contains(&needle.to_ascii_lowercase())
     })
+}
+
+fn normalize_range(
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let normalize = |value: Option<String>| -> Result<Option<String>, String> {
+        let Some(value) = value.map(|value| value.trim().to_owned()) else {
+            return Ok(None);
+        };
+        if value.is_empty() {
+            return Ok(None);
+        }
+        chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+            .map_err(|_| "usage date filters must use YYYY-MM-DD".to_owned())?;
+        Ok(Some(value))
+    };
+    let from = normalize(from)?;
+    let to = normalize(to)?;
+    if from
+        .as_deref()
+        .zip(to.as_deref())
+        .is_some_and(|(from, to)| from > to)
+    {
+        return Err("usage date filter start must not be after its end".into());
+    }
+    Ok((from, to))
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

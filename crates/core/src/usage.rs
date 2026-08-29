@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use personal_agent_contracts::proto::EventEnvelope;
+use personal_agent_storage::{StoredUsageAggregate, StoredUsageAggregates};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +105,37 @@ struct TurnContext {
     scope_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UsageFactKind {
+    TurnStarted,
+    ToolCall,
+    Provider,
+}
+
+/// Flat append-only accounting fact. The stable JSON field paths are queried
+/// directly by the encrypted store's SQL aggregate recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(crate) struct UsageFact {
+    pub(crate) kind: UsageFactKind,
+    pub(crate) event_id: String,
+    pub(crate) at: DateTime<Utc>,
+    pub(crate) day_utc: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) scope_key: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) model_id: Option<String>,
+    pub(crate) tokens: Option<TokenUsage>,
+    pub(crate) cost: Option<ReportedCost>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UsageMutation {
+    pub(crate) fact: Option<UsageFact>,
+    pub(crate) egress: Option<EgressRecord>,
+}
+
 /// Encrypted accounting state. Detail lists are bounded while aggregates are
 /// retained for the lifetime of the profile.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,9 +176,17 @@ impl UsageLedger {
     /// # Errors
     /// Returns malformed-event or unsupported-ledger errors.
     pub fn ingest_runtime_event(&mut self, event: &EventEnvelope) -> Result<(), UsageError> {
+        self.ingest_runtime_event_delta(event).map(|_| ())
+    }
+
+    #[allow(clippy::too_many_lines)] // Accounting event variants stay explicit and ordered.
+    pub(crate) fn ingest_runtime_event_delta(
+        &mut self,
+        event: &EventEnvelope,
+    ) -> Result<UsageMutation, UsageError> {
         self.validate_schema()?;
         if self.seen_event_ids.contains(&event.event_id) {
-            return Ok(());
+            return Ok(UsageMutation::default());
         }
         let payload = event.payload()?;
         let session_id = event.session_id.clone().unwrap_or_else(|| "unknown".into());
@@ -159,16 +199,35 @@ impl UsageLedger {
             self.active_turns.insert(
                 session_id.clone(),
                 TurnContext {
-                    turn_id,
+                    turn_id: turn_id.clone(),
                     provider_id: text_at(&payload, &["provider_id", "providerID", "provider"])
                         .map(str::to_owned),
                     model_id: text_at(&payload, &["model_id", "modelID", "model"])
                         .map(str::to_owned),
-                    scope_key,
+                    scope_key: scope_key.clone(),
                 },
             );
             self.seen_event_ids.insert(event.event_id.clone());
-            return Ok(());
+            let context = self
+                .active_turns
+                .get(&session_id)
+                .expect("turn context was inserted");
+            return Ok(UsageMutation {
+                fact: Some(UsageFact {
+                    kind: UsageFactKind::TurnStarted,
+                    event_id: event.event_id.clone(),
+                    at,
+                    day_utc: day_string(at),
+                    session_id,
+                    turn_id,
+                    scope_key,
+                    provider_id: context.provider_id.clone(),
+                    model_id: context.model_id.clone(),
+                    tokens: None,
+                    cost: None,
+                }),
+                egress: None,
+            });
         }
         if event.r#type == "tool.started" {
             let (turn_id, scope_key) = self.active_turns.get(&session_id).map_or_else(
@@ -181,27 +240,51 @@ impl UsageLedger {
                 },
                 |context| (context.turn_id.clone(), context.scope_key.clone()),
             );
-            self.add_tool_call(&turn_id, &session_id, &day_string(at), &scope_key);
-            if let Some(egress) = runtime_tool_egress(event, &payload, at, &scope_key) {
-                self.record_egress(egress)?;
+            let day_utc = day_string(at);
+            self.add_tool_call(&turn_id, &session_id, &day_utc, &scope_key);
+            let egress = runtime_tool_egress(event, &payload, at, &scope_key);
+            if let Some(record) = egress.clone() {
+                self.record_egress(record)?;
             }
             self.seen_event_ids.insert(event.event_id.clone());
-            return Ok(());
+            return Ok(UsageMutation {
+                fact: Some(UsageFact {
+                    kind: UsageFactKind::ToolCall,
+                    event_id: event.event_id.clone(),
+                    at,
+                    day_utc,
+                    session_id,
+                    turn_id,
+                    scope_key,
+                    provider_id: None,
+                    model_id: None,
+                    tokens: None,
+                    cost: None,
+                }),
+                egress,
+            });
         }
         if event.r#type != "response.step_completed" {
-            return Ok(());
+            return Ok(UsageMutation::default());
         }
         let context = self.active_turns.get(&session_id).cloned();
         let Some(tokens_value) = payload.get("tokens") else {
             if payload.get("cost").is_none() {
-                return Ok(());
+                return Ok(UsageMutation::default());
             }
-            self.record_step(event, &payload, context.as_ref(), at, TokenUsage::default());
-            return Ok(());
+            let record =
+                self.record_step(event, &payload, context.as_ref(), at, TokenUsage::default());
+            return Ok(UsageMutation {
+                fact: Some(UsageFact::provider(record)),
+                egress: None,
+            });
         };
         let tokens = normalize_tokens(tokens_value);
-        self.record_step(event, &payload, context.as_ref(), at, tokens);
-        Ok(())
+        let record = self.record_step(event, &payload, context.as_ref(), at, tokens);
+        Ok(UsageMutation {
+            fact: Some(UsageFact::provider(record)),
+            egress: None,
+        })
     }
 
     fn record_step(
@@ -211,7 +294,7 @@ impl UsageLedger {
         context: Option<&TurnContext>,
         at: DateTime<Utc>,
         tokens: TokenUsage,
-    ) {
+    ) -> ProviderUsageRecord {
         let turn_id = context
             .map(|context| context.turn_id.clone())
             .or_else(|| {
@@ -250,11 +333,142 @@ impl UsageLedger {
         ] {
             aggregate.add_usage(&record);
         }
-        self.records.push(record);
+        self.records.push(record.clone());
         if self.records.len() > MAX_DETAIL_RECORDS {
             self.records.remove(0);
         }
         self.seen_event_ids.insert(event.event_id.clone());
+        record
+    }
+
+    pub(crate) fn from_stored(
+        aggregates: StoredUsageAggregates,
+        contexts_json: &[String],
+    ) -> Result<Self, UsageError> {
+        let mut ledger = Self {
+            turns: convert_aggregate_map(aggregates.turns),
+            sessions: convert_aggregate_map(aggregates.sessions),
+            days: convert_aggregate_map(aggregates.days),
+            scopes: convert_aggregate_map(aggregates.scopes),
+            ..Self::default()
+        };
+        for body in contexts_json {
+            let fact: UsageFact = serde_json::from_str(body)?;
+            if fact.kind != UsageFactKind::TurnStarted {
+                continue;
+            }
+            ledger.active_turns.insert(
+                fact.session_id,
+                TurnContext {
+                    turn_id: fact.turn_id,
+                    provider_id: fact.provider_id,
+                    model_id: fact.model_id,
+                    scope_key: fact.scope_key,
+                },
+            );
+            ledger.seen_event_ids.insert(fact.event_id);
+        }
+        Ok(ledger)
+    }
+
+    pub(crate) fn fact_from_json(body: &str) -> Result<ProviderUsageRecord, UsageError> {
+        let fact: UsageFact = serde_json::from_str(body)?;
+        fact.into_provider_record()
+    }
+
+    pub(crate) fn aggregate_snapshot(&self) -> Self {
+        Self {
+            schema_version: self.schema_version,
+            turns: self.turns.clone(),
+            sessions: self.sessions.clone(),
+            days: self.days.clone(),
+            scopes: self.scopes.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn clear_detail_records(&mut self) {
+        self.records.clear();
+        self.egress.clear();
+    }
+
+    pub(crate) fn has_seen_egress(&self, id: Uuid) -> bool {
+        self.seen_egress_ids.contains(&id)
+    }
+
+    pub(crate) fn merge_append_only(&mut self, newer: Self) -> Result<(), UsageError> {
+        self.validate_schema()?;
+        newer.validate_schema()?;
+        self.merge_aggregates_from(&newer);
+        self.active_turns.extend(newer.active_turns);
+        self.seen_event_ids.extend(newer.seen_event_ids);
+        self.seen_egress_ids.extend(newer.seen_egress_ids);
+        Ok(())
+    }
+
+    pub(crate) fn merge_aggregates_from(&mut self, other: &Self) {
+        merge_aggregate_maps(&mut self.turns, &other.turns);
+        merge_aggregate_maps(&mut self.sessions, &other.sessions);
+        merge_aggregate_maps(&mut self.days, &other.days);
+        merge_aggregate_maps(&mut self.scopes, &other.scopes);
+    }
+
+    pub(crate) fn aggregates_in_range(&self, from: Option<&str>, to: Option<&str>) -> Self {
+        if from.is_none() && to.is_none() {
+            return self.aggregate_snapshot();
+        }
+        let mut filtered = Self::default();
+        for record in self
+            .records
+            .iter()
+            .filter(|record| day_in_range(&record.day_utc, from, to))
+        {
+            for aggregate in [
+                filtered.turns.entry(record.turn_id.clone()).or_default(),
+                filtered
+                    .sessions
+                    .entry(record.session_id.clone())
+                    .or_default(),
+                filtered.days.entry(record.day_utc.clone()).or_default(),
+                filtered.scopes.entry(record.scope_key.clone()).or_default(),
+            ] {
+                aggregate.add_usage(record);
+            }
+        }
+        for record in self
+            .egress
+            .iter()
+            .filter(|record| day_in_range(&day_string(record.at), from, to))
+        {
+            filtered
+                .days
+                .entry(day_string(record.at))
+                .or_default()
+                .add_egress(record);
+            if let Some(session) = &record.session_id {
+                filtered
+                    .sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .add_egress(record);
+            }
+            if let Some(scope) = &record.scope_key {
+                filtered
+                    .scopes
+                    .entry(scope.clone())
+                    .or_default()
+                    .add_egress(record);
+            }
+        }
+        // Day aggregates are already lossless in a legacy ledger even when its
+        // bounded detail vectors have evicted older rows.
+        filtered.days = self
+            .days
+            .iter()
+            .filter(|(day, _)| day_in_range(day, from, to))
+            .map(|(day, aggregate)| (day.clone(), aggregate.clone()))
+            .collect();
+        filtered
     }
 
     /// Record a content-free outbound transfer idempotently.
@@ -378,6 +592,34 @@ impl UsageAggregate {
             self.unknown_egress_sizes = self.unknown_egress_sizes.saturating_add(1);
         }
     }
+
+    fn merge(&mut self, other: &Self) {
+        let had_provider_steps = self.provider_steps > 0;
+        self.provider_steps = self.provider_steps.saturating_add(other.provider_steps);
+        self.tokens.add(&other.tokens);
+        self.tokens.total_was_reported = match (had_provider_steps, other.provider_steps > 0) {
+            (true, true) => self.tokens.total_was_reported && other.tokens.total_was_reported,
+            (false, true) => other.tokens.total_was_reported,
+            (true, false) => self.tokens.total_was_reported,
+            (false, false) => false,
+        };
+        self.reported_cost_microusd = self
+            .reported_cost_microusd
+            .saturating_add(other.reported_cost_microusd);
+        self.unknown_cost_steps = self
+            .unknown_cost_steps
+            .saturating_add(other.unknown_cost_steps);
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        self.egress_events = self.egress_events.saturating_add(other.egress_events);
+        self.known_egress_bytes = self
+            .known_egress_bytes
+            .saturating_add(other.known_egress_bytes);
+        self.unknown_egress_sizes = self
+            .unknown_egress_sizes
+            .saturating_add(other.unknown_egress_sizes);
+        self.providers.extend(other.providers.iter().cloned());
+        self.models.extend(other.models.iter().cloned());
+    }
 }
 
 impl TokenUsage {
@@ -462,10 +704,96 @@ impl fmt::Display for BudgetResource {
 pub enum UsageError {
     #[error(transparent)]
     Event(#[from] personal_agent_contracts::EventError),
+    #[error("stored usage fact is not valid JSON: {0}")]
+    StoredJson(#[from] serde_json::Error),
+    #[error("stored usage fact is missing provider-accounting fields")]
+    InvalidStoredFact,
     #[error("unsupported usage ledger schema {0}")]
     UnsupportedSchema(u32),
     #[error("egress record contains an invalid descriptive field")]
     InvalidEgress,
+}
+
+impl UsageFact {
+    fn provider(record: ProviderUsageRecord) -> Self {
+        Self {
+            kind: UsageFactKind::Provider,
+            event_id: record.id.clone(),
+            at: record.at,
+            day_utc: record.day_utc.clone(),
+            session_id: record.session_id.clone(),
+            turn_id: record.turn_id.clone(),
+            scope_key: record.scope_key.clone(),
+            provider_id: record.provider_id.clone(),
+            model_id: record.model_id.clone(),
+            tokens: Some(record.tokens),
+            cost: Some(record.cost),
+        }
+    }
+
+    fn into_provider_record(self) -> Result<ProviderUsageRecord, UsageError> {
+        if self.kind != UsageFactKind::Provider {
+            return Err(UsageError::InvalidStoredFact);
+        }
+        Ok(ProviderUsageRecord {
+            id: self.event_id,
+            at: self.at,
+            day_utc: self.day_utc,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            scope_key: self.scope_key,
+            provider_id: self.provider_id,
+            model_id: self.model_id,
+            tokens: self.tokens.ok_or(UsageError::InvalidStoredFact)?,
+            cost: self.cost.ok_or(UsageError::InvalidStoredFact)?,
+        })
+    }
+}
+
+fn convert_aggregate_map(
+    values: BTreeMap<String, StoredUsageAggregate>,
+) -> BTreeMap<String, UsageAggregate> {
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key,
+                UsageAggregate {
+                    provider_steps: value.provider_steps,
+                    tokens: TokenUsage {
+                        input: value.input_tokens,
+                        output: value.output_tokens,
+                        reasoning: value.reasoning_tokens,
+                        cache_read: value.cache_read_tokens,
+                        cache_write: value.cache_write_tokens,
+                        total: value.total_tokens,
+                        total_was_reported: value.total_was_reported,
+                    },
+                    reported_cost_microusd: value.reported_cost_microusd,
+                    unknown_cost_steps: value.unknown_cost_steps,
+                    tool_calls: value.tool_calls,
+                    egress_events: value.egress_events,
+                    known_egress_bytes: value.known_egress_bytes,
+                    unknown_egress_sizes: value.unknown_egress_sizes,
+                    providers: value.providers.into_iter().collect(),
+                    models: value.models.into_iter().collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn merge_aggregate_maps(
+    target: &mut BTreeMap<String, UsageAggregate>,
+    source: &BTreeMap<String, UsageAggregate>,
+) {
+    for (key, aggregate) in source {
+        target.entry(key.clone()).or_default().merge(aggregate);
+    }
+}
+
+fn day_in_range(day: &str, from: Option<&str>, to: Option<&str>) -> bool {
+    from.is_none_or(|from| day >= from) && to.is_none_or(|to| day <= to)
 }
 
 fn normalize_tokens(value: &Value) -> TokenUsage {

@@ -57,6 +57,10 @@ export type UsageSnapshot = {
   sessions: Record<string, Aggregate>;
   days: Record<string, Aggregate>;
   scopes: Record<string, Aggregate>;
+  usage_total: number;
+  egress_total: number;
+  limit: number;
+  offset: number;
   pricing_policy: string;
 };
 
@@ -76,8 +80,14 @@ const empty: UsageSnapshot = {
   sessions: {},
   days: {},
   scopes: {},
+  usage_total: 0,
+  egress_total: 0,
+  limit: 50,
+  offset: 0,
   pricing_policy: "Only provider-reported cost is totaled.",
 };
+
+const PAGE_SIZE = 50;
 
 const emptyFilter: Filter = {
   from_day: "",
@@ -95,12 +105,29 @@ export function UsageEgress() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [offset, setOffset] = useState(0);
 
   useEffect(() => {
-    void invoke<UsageSnapshot>("usage_snapshot")
-      .then((value) => setSnapshot({ ...empty, ...value }))
-      .catch((caught) => setError(String(caught)));
-  }, []);
+    let disposed = false;
+    setError("");
+    void invoke<UsageSnapshot>("usage_snapshot", {
+      limit: PAGE_SIZE,
+      offset,
+      from: filter.from_day || null,
+      to: filter.to_day || null,
+      provider: filter.provider || null,
+      model: filter.model || null,
+      session: filter.session || null,
+      source: filter.source || null,
+    })
+      .then((value) => {
+        if (!disposed) setSnapshot({ ...empty, ...value });
+      })
+      .catch((caught) => {
+        if (!disposed) setError(String(caught));
+      });
+    return () => { disposed = true; };
+  }, [offset, filter.from_day, filter.to_day, filter.provider, filter.model, filter.session, filter.source]);
 
   const usage = useMemo(
     () => snapshot.records.filter((record) => usageMatches(record, filter)),
@@ -111,22 +138,24 @@ export function UsageEgress() {
     [snapshot.egress, filter],
   );
   const metrics = useMemo(() => {
-    const tokens = usage.reduce((total, record) => total + record.tokens.total, 0);
-    const cost = usage.reduce(
-      (total, record) => total + (record.cost.microusd ?? 0),
-      0,
-    );
-    const unknownCost = usage.filter((record) => record.cost.status === "unknown").length;
-    const knownBytes = egress.reduce(
-      (total, record) => total + (record.size_bytes ?? 0),
-      0,
-    );
-    const unknownSizes = egress.filter((record) => record.size_bytes == null).length;
+    const days = Object.values(snapshot.days);
+    const tokens = days.reduce((total, value) => total + value.tokens.total, 0);
+    const cost = days.reduce((total, value) => total + value.reported_cost_microusd, 0);
+    const unknownCost = days.reduce((total, value) => total + value.unknown_cost_steps, 0);
+    const knownBytes = days.reduce((total, value) => total + value.known_egress_bytes, 0);
+    const unknownSizes = days.reduce((total, value) => total + value.unknown_egress_sizes, 0);
     return { tokens, cost, unknownCost, knownBytes, unknownSizes };
-  }, [usage, egress]);
+  }, [snapshot.days]);
 
-  const update = (key: keyof Filter, value: string) =>
+  const update = (key: keyof Filter, value: string) => {
     setFilter((current) => ({ ...current, [key]: value }));
+    setOffset(0);
+  };
+
+  const selectTab = (next: "usage" | "egress") => {
+    setTab(next);
+    setOffset(0);
+  };
 
   const exportFiltered = async () => {
     setBusy(true);
@@ -172,7 +201,7 @@ export function UsageEgress() {
           value={formatCost(metrics.cost, metrics.unknownCost)}
           detail={metrics.unknownCost ? `${metrics.unknownCost} step(s) unknown` : "complete"}
         />
-        <Metric label="egress events" value={formatNumber(egress.length)} />
+        <Metric label="egress events" value={formatNumber(snapshot.egress_total)} />
         <Metric
           label="known outbound size"
           value={formatBytes(metrics.knownBytes)}
@@ -187,17 +216,38 @@ export function UsageEgress() {
         <label>Model<input placeholder="All models" value={filter.model} onChange={(event) => update("model", event.target.value)} /></label>
         <label>Session<input placeholder="All sessions" value={filter.session} onChange={(event) => update("session", event.target.value)} /></label>
         <label>Source<select value={filter.source} onChange={(event) => update("source", event.target.value)}><option value="">All sources</option><option value="web">Web</option><option value="mcp">MCP</option><option value="connector">Connectors</option></select></label>
-        <button onClick={() => setFilter(emptyFilter)}>Clear</button>
+        <button onClick={() => { setFilter(emptyFilter); setOffset(0); }}>Clear</button>
       </div>
 
       <nav className="usage-tabs" aria-label="Accounting view">
-        <button className={tab === "usage" ? "active" : ""} onClick={() => setTab("usage")}>Provider usage <b>{usage.length}</b></button>
-        <button className={tab === "egress" ? "active" : ""} onClick={() => setTab("egress")}>Outbound data <b>{egress.length}</b></button>
+        <button className={tab === "usage" ? "active" : ""} onClick={() => selectTab("usage")}>Provider usage <b>{snapshot.usage_total}</b></button>
+        <button className={tab === "egress" ? "active" : ""} onClick={() => selectTab("egress")}>Outbound data <b>{snapshot.egress_total}</b></button>
       </nav>
 
       {tab === "usage" ? <UsageTable records={usage} /> : <EgressTable records={egress} />}
+      <Pagination
+        offset={offset}
+        limit={snapshot.limit || PAGE_SIZE}
+        total={tab === "usage" ? snapshot.usage_total : snapshot.egress_total}
+        onOffset={setOffset}
+      />
     </section>
   );
+}
+
+function Pagination({ offset, limit, total, onOffset }: {
+  offset: number;
+  limit: number;
+  total: number;
+  onOffset: (offset: number) => void;
+}) {
+  const first = total ? offset + 1 : 0;
+  const last = Math.min(offset + limit, total);
+  return <nav className="usage-pagination" aria-label="Usage pagination">
+    <button aria-label="Previous usage page" disabled={offset === 0} onClick={() => onOffset(Math.max(0, offset - limit))}>Previous</button>
+    <span>{formatNumber(first)}–{formatNumber(last)} of {formatNumber(total)}</span>
+    <button aria-label="Next usage page" disabled={offset + limit >= total} onClick={() => onOffset(offset + limit)}>Next</button>
+  </nav>;
 }
 
 function Metric({ label, value, detail }: { label: string; value: string; detail?: string }) {
@@ -208,7 +258,7 @@ function UsageTable({ records }: { records: UsageRecord[] }) {
   if (!records.length) return <Empty text="No provider usage matches these filters." />;
   return <div className="usage-table" role="table" aria-label="Provider usage">
     <header role="row"><span>Time / scope</span><span>Provider / model</span><span>Tokens</span><span>Cost</span></header>
-    {[...records].reverse().map((record) => <article role="row" key={record.id}>
+    {records.map((record) => <article role="row" key={record.id}>
       <span><b>{new Date(record.at).toLocaleString()}</b><small>{record.scope_key} · {shortId(record.session_id)}</small></span>
       <span><b>{record.provider_id ?? "Unknown provider"}</b><small>{record.model_id ?? "Model not reported"}</small></span>
       <span><b>{formatNumber(record.tokens.total)}</b><small>in {record.tokens.input} · out {record.tokens.output} · reasoning {record.tokens.reasoning}</small></span>
@@ -221,7 +271,7 @@ function EgressTable({ records }: { records: EgressRecord[] }) {
   if (!records.length) return <Empty text="No outbound transfers match these filters." />;
   return <div className="usage-table egress-table" role="table" aria-label="Outbound data">
     <header role="row"><span>Time / source</span><span>Destination</span><span>Operation / purpose</span><span>Size</span></header>
-    {[...records].reverse().map((record) => <article role="row" key={record.id}>
+    {records.map((record) => <article role="row" key={record.id}>
       <span><b>{new Date(record.at).toLocaleString()}</b><small>{record.source}</small></span>
       <span><b>{record.destination}</b><small>{record.data_class}</small></span>
       <span><b>{record.operation}</b><small>{record.purpose}</small></span>
