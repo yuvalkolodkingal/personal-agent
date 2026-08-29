@@ -1,10 +1,12 @@
 //! Non-Linux XDG portal stub. Native Windows and macOS capability states remain
 //! explicit rather than pretending the Linux portal exists.
 
-#![allow(dead_code)] // Keep the serialized IPC schema identical to the Linux implementation.
-
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+const UNSUPPORTED_REASON: &str = "XDG Desktop Portal is available only on Linux";
+const UNSUPPORTED_REMEDIATION: &str =
+    "Use the platform-native screen capture and input backends on Windows or macOS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,8 +75,13 @@ impl WaylandPortalManager {
             kind: None,
             streams: Vec::new(),
             pipewire_transport: false,
-            detail: "XDG Desktop Portal is available only on Linux".into(),
+            detail: format!("{UNSUPPORTED_REASON}. {UNSUPPORTED_REMEDIATION}"),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn status(&self) -> PortalStatus {
+        Self::unavailable()
     }
 
     pub(crate) async fn probe(&self) -> PortalStatus {
@@ -82,7 +89,7 @@ impl WaylandPortalManager {
     }
 
     pub(crate) async fn connect(&self, _: bool, _: &str) -> Result<PortalStatus, String> {
-        Err("XDG Desktop Portal is available only on Linux".into())
+        Err(UNSUPPORTED_REASON.into())
     }
 
     pub(crate) async fn cancel(&self) -> PortalStatus {
@@ -95,5 +102,24 @@ impl WaylandPortalManager {
 
     pub(crate) async fn notify_pointer_axis(&self, _: f64, _: f64) -> Result<(), String> {
         Err("XDG RemoteDesktop is available only on Linux".into())
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_reports_an_actionable_unsupported_state() {
+        let status = WaylandPortalManager::live().status();
+
+        assert_eq!(status.interfaces.screencast_version, None);
+        assert_eq!(status.interfaces.remote_desktop_version, None);
+        assert_eq!(status.phase, PortalSessionPhase::Idle);
+        assert_eq!(status.consent, PortalConsentState::Unavailable);
+        assert_eq!(
+            status.detail,
+            format!("{UNSUPPORTED_REASON}. {UNSUPPORTED_REMEDIATION}")
+        );
     }
 }

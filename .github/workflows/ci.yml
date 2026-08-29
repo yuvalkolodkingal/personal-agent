@@ -59,6 +59,9 @@ jobs:
       - run: bun run sidecar:fetch --target=${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - name: Check desktop crate on non-Linux targets
+        if: runner.os != 'Linux'
+        run: cargo check -p personal-agent-desktop --target ${{ matrix.target }} --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --target ${{ matrix.target }} --locked
       - run: bunx tauri build --debug --no-bundle
