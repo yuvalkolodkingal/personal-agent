@@ -5,8 +5,8 @@ use personal_agent_audio::{
     transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 use personal_agent_core::{
-    CONFIG_SCHEMA, FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust,
-    PersonalAgentConfig, ProjectNode, ProjectRelation, StylePreference, TextEmbedder, parse_config,
+    FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust, PersonalAgentConfig,
+    ProjectNode, ProjectRelation, StylePreference, TextEmbedder, parse_config,
 };
 use personal_agent_platform::{OsSecretStore, SecretReference, SecretStore};
 use personal_agent_runtime::{AgentRuntime, PromptOptions, RuntimeAnswer, SessionOptions};
@@ -321,39 +321,15 @@ pub(crate) async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<V
         (
             profile.projection().clone(),
             profile
-                .events_after(0, 500)
+                .events_after(profile.projection().last_sequence.saturating_sub(100), 100)
                 .map_err(|error| error.to_string())?,
         )
     };
-    let directory = canonical_directory(&config, None)?;
-    let mut runtime = state.runtime.lock().await;
-    let mut catalog = runtime
-        .desktop_catalog(&directory)
-        .await
-        .unwrap_or_else(|error| json!({"error": error.to_string()}));
-    let models = runtime
-        .discover_models(Some(&directory))
-        .await
-        .unwrap_or_default();
-    if let Some(object) = catalog.as_object_mut() {
-        object.insert(
-            "models".to_owned(),
-            json!({"available": true, "data": models}),
-        );
-        append_memory_catalog(object, &state)?;
-    }
-    drop(runtime);
-    let schema: Value = serde_json::from_str(CONFIG_SCHEMA)
-        .map_err(|error| format!("configuration schema is invalid: {error}"))?;
     Ok(json!({
         "config": config,
-        "config_schema": schema,
         "projection": projection,
         "history": history,
-        "catalog": catalog,
-        "capabilities": Value::Null,
         "voice": voice_status_for(&state, &config),
-        "app_data": state.app_data,
     }))
 }
 
@@ -422,6 +398,7 @@ pub(crate) async fn save_config(
 #[tauri::command]
 pub(crate) async fn runtime_catalog(
     directory: Option<String>,
+    include_memory: Option<bool>,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
     let config = config_snapshot(&state)?;
@@ -435,12 +412,15 @@ pub(crate) async fn runtime_catalog(
         .discover_models(Some(&directory))
         .await
         .map_err(|error| error.to_string())?;
+    drop(runtime);
     if let Some(object) = catalog.as_object_mut() {
         object.insert(
             "models".to_owned(),
             json!({"available": true, "data": models}),
         );
-        append_memory_catalog(object, &state)?;
+        if include_memory.unwrap_or(false) {
+            append_memory_catalog(object, &state)?;
+        }
     }
     Ok(catalog)
 }

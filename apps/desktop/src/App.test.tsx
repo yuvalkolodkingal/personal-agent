@@ -221,14 +221,15 @@ describe("desktop workspace", () => {
             playback_ready: false,
             details: [],
           },
-          catalog: {
-            sessions: {
-              available: true,
-              data: [
-                { id: "ses_first", title: "First session" },
-                { id: "ses_second", title: "Second session" },
-              ],
-            },
+        });
+      if (command === "runtime_catalog")
+        return Promise.resolve({
+          sessions: {
+            available: true,
+            data: [
+              { id: "ses_first", title: "First session" },
+              { id: "ses_second", title: "Second session" },
+            ],
           },
         });
       return baseInvoke(command);
@@ -239,7 +240,9 @@ describe("desktop workspace", () => {
       await screen.findByRole("button", { name: "Select sessions" }),
     );
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select session ses_first" }),
+      await screen.findByRole("checkbox", {
+        name: "Select session ses_first",
+      }),
     );
     fireEvent.click(
       screen.getByRole("checkbox", { name: "Select session ses_second" }),
@@ -287,7 +290,10 @@ describe("desktop workspace", () => {
             playback_ready: false,
             details: [],
           },
-          catalog: { sessions: { available: true, data: sessionHistory } },
+        });
+      if (command === "runtime_catalog")
+        return Promise.resolve({
+          sessions: { available: true, data: sessionHistory },
         });
       return baseInvoke(command);
     });
@@ -307,6 +313,152 @@ describe("desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Hide older" }));
     expect(screen.getByText("Showing 12 of 25")).toBeInTheDocument();
     expect(screen.queryByText("Session 13")).not.toBeInTheDocument();
+  });
+
+  it("releases the startup shield after slim bootstrap without waiting for the catalog", async () => {
+    let resolveBootstrap!: (value: unknown) => void;
+    let resolveCatalog!: (value: unknown) => void;
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap")
+        return new Promise((resolve) => {
+          resolveBootstrap = resolve;
+        });
+      if (command === "runtime_catalog")
+        return new Promise((resolve) => {
+          resolveCatalog = resolve;
+        });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Starting your private agent",
+    );
+
+    act(() =>
+      resolveBootstrap({
+        config: fallbackConfig,
+        projection,
+        history: [],
+        voice: {
+          stt_ready: false,
+          tts_ready: false,
+          playback_ready: false,
+          details: [],
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByRole("status")).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("runtime_catalog", {
+        directory: fallbackConfig.runtime.working_directory,
+        includeMemory: false,
+      }),
+    );
+    act(() => resolveCatalog({}));
+  });
+
+  it("loads settings and memory-system data only from their lazy catalogs", async () => {
+    invoke.mockImplementation(
+      (command: string, arguments_: { includeMemory?: boolean } = {}) => {
+        if (command === "bootstrap")
+          return Promise.resolve({
+            config: fallbackConfig,
+            projection,
+            history: [],
+            voice: {
+              stt_ready: false,
+              tts_ready: false,
+              playback_ready: false,
+              details: [],
+            },
+          });
+        if (command === "runtime_catalog" && arguments_.includeMemory)
+          return Promise.resolve({
+            memories: {
+              available: true,
+              data: [
+                {
+                  id: "memory-1",
+                  content: "Remember the espresso setting",
+                  trust: "confirmed",
+                  confidence: 1,
+                },
+              ],
+            },
+            memory_styles: {
+              available: true,
+              data: [
+                {
+                  id: "style-1",
+                  description: "Use terse release notes",
+                  reviewed: true,
+                  confidence: 0.9,
+                },
+              ],
+            },
+            memory_projects: {
+              available: true,
+              data: {
+                nodes: [
+                  {
+                    id: "project-1",
+                    name: "personal-agent",
+                    kind: "repository",
+                  },
+                ],
+                relations: [],
+              },
+            },
+          });
+        if (command === "runtime_catalog")
+          return Promise.resolve({
+            provider_auth: {
+              available: true,
+              data: {
+                openai: [{ type: "oauth", label: "ChatGPT Plus / Pro" }],
+              },
+            },
+            providers: {
+              available: true,
+              data: {
+                all: [{ id: "openai", name: "OpenAI" }],
+                connected: [],
+              },
+            },
+            models: { available: true, data: [] },
+          });
+        return baseInvoke(command);
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Providers & models" }),
+    );
+    expect(await screen.findByText("ChatGPT Plus / Pro")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("runtime_catalog", {
+      directory: fallbackConfig.runtime.working_directory,
+      includeMemory: false,
+    });
+
+    fireEvent.click(
+      within(document.querySelector(".sidebar nav")!).getByRole("button", {
+        name: "Memory",
+      }),
+    );
+    expect(
+      await screen.findByText("Remember the espresso setting"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Use terse release notes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    expect(screen.getByText("personal-agent")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("runtime_catalog", {
+      includeMemory: true,
+    });
   });
 
   it("renders unknown additive runtime events by exact type and origin", async () => {
@@ -437,21 +589,22 @@ describe("desktop workspace", () => {
             playback_ready: false,
             details: [],
           },
-          catalog: {
-            models: {
-              available: true,
-              data: [
-                {
-                  provider_id: "openai",
-                  model_id: "gpt-5",
-                  local: false,
-                  reasoning: true,
-                  tool_calls: true,
-                  input_modalities: ["text"],
-                  output_modalities: ["text"],
-                },
-              ],
-            },
+        });
+      if (command === "runtime_catalog")
+        return Promise.resolve({
+          models: {
+            available: true,
+            data: [
+              {
+                provider_id: "openai",
+                model_id: "gpt-5",
+                local: false,
+                reasoning: true,
+                tool_calls: true,
+                input_modalities: ["text"],
+                output_modalities: ["text"],
+              },
+            ],
           },
         });
       return baseInvoke(command);
@@ -548,7 +701,6 @@ describe("desktop workspace", () => {
             playback_ready: true,
             details: [],
           },
-          catalog: {},
         });
       if (command === "voice_self_test")
         return Promise.resolve({
@@ -585,31 +737,32 @@ describe("desktop workspace", () => {
             playback_ready: true,
             details: [],
           },
-          catalog: {
-            provider_auth: {
-              available: true,
-              data: {
-                openai: [{ type: "oauth", label: "ChatGPT Plus / Pro" }],
+        });
+      if (command === "runtime_catalog")
+        return Promise.resolve({
+          provider_auth: {
+            available: true,
+            data: {
+              openai: [{ type: "oauth", label: "ChatGPT Plus / Pro" }],
+            },
+          },
+          providers: {
+            available: true,
+            data: { all: [{ id: "openai", name: "OpenAI" }], connected: [] },
+          },
+          models: {
+            available: true,
+            data: [
+              {
+                provider_id: "openai",
+                model_id: "gpt-5",
+                local: false,
+                reasoning: true,
+                tool_calls: true,
+                input_modalities: ["text"],
+                output_modalities: ["text"],
               },
-            },
-            providers: {
-              available: true,
-              data: { all: [{ id: "openai", name: "OpenAI" }], connected: [] },
-            },
-            models: {
-              available: true,
-              data: [
-                {
-                  provider_id: "openai",
-                  model_id: "gpt-5",
-                  local: false,
-                  reasoning: true,
-                  tool_calls: true,
-                  input_modalities: ["text"],
-                  output_modalities: ["text"],
-                },
-              ],
-            },
+            ],
           },
         });
       if (command === "provider_oauth_authorize")

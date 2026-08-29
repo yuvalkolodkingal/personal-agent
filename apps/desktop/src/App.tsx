@@ -23,7 +23,6 @@ import { SkillsAgents } from "./SkillsAgents";
 import { UsageEgress } from "./UsageEgress";
 import type {
   AppConfig,
-  Bootstrap,
   EventEnvelope,
   Projection,
   RuntimeCatalog,
@@ -61,6 +60,12 @@ const navigation = [
 ] as const;
 type Destination = (typeof navigation)[number];
 type Json = Record<string, unknown>;
+type SlimBootstrap = {
+  config: AppConfig;
+  projection: Projection;
+  history: EventEnvelope[];
+  voice: VoiceStatus;
+};
 type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
@@ -2587,10 +2592,26 @@ function DomainView({
     {},
   );
   const items = destination === "Memory" ? [] : records(history, spec.prefix);
+  useEffect(() => {
+    let disposed = false;
+    void invoke<RuntimeCatalog>("runtime_catalog", { includeMemory: true })
+      .then((next) => {
+        if (!disposed) setCatalog(next);
+      })
+      .catch((caught) => {
+        if (!disposed) setError(String(caught));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [setCatalog]);
   const refresh = async () => {
-    const bootstrap = await invoke<Bootstrap>("bootstrap");
+    const [bootstrap, nextCatalog] = await Promise.all([
+      invoke<SlimBootstrap>("bootstrap"),
+      invoke<RuntimeCatalog>("runtime_catalog", { includeMemory: true }),
+    ]);
     setHistory(bootstrap.history);
-    setCatalog(bootstrap.catalog);
+    setCatalog(nextCatalog);
     setProjection(bootstrap.projection);
   };
   const memoryAction = async (
@@ -3393,24 +3414,12 @@ export function App() {
     };
   }, []);
   useEffect(() => {
-    void invoke<Bootstrap>("bootstrap")
+    void invoke<SlimBootstrap>("bootstrap")
       .then((data) => {
         setConfig(data.config);
-        setCatalog(data.catalog);
         setProjection(data.projection);
         setHistory(data.history);
         setVoice(data.voice);
-        const projectedSession = data.projection.active_session ?? "";
-        const availableSessions = asArray(
-          resourceData(data.catalog, "sessions", []),
-        );
-        setActiveSession(
-          availableSessions.some(
-            (session) => String(session.id) === projectedSession,
-          )
-            ? projectedSession
-            : "",
-        );
         document.documentElement.dataset.theme = data.config.ui.accent;
       })
       .catch((caught) => setBootError(String(caught)))
@@ -3423,6 +3432,29 @@ export function App() {
       .catch(() => setAutostart(false));
   }, []);
   useEffect(() => {
+    if (
+      booting ||
+      !(["Chat", "Settings", "Integrations", "Diagnostics"] as Destination[]).includes(
+        active,
+      )
+    )
+      return;
+    let disposed = false;
+    void invoke<RuntimeCatalog>("runtime_catalog", {
+      directory: config.runtime.working_directory,
+      includeMemory: false,
+    })
+      .then((next) => {
+        if (!disposed) setCatalog(next);
+      })
+      .catch((caught) => {
+        if (!disposed) setBootError(String(caught));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [active, booting, config.runtime.working_directory]);
+  useEffect(() => {
     document.documentElement.style.fontSize = `${config.ui.text_scale_percent}%`;
     document.documentElement.lang = config.ui.locale;
     document.documentElement.classList.toggle(
@@ -3431,6 +3463,17 @@ export function App() {
     );
     document.documentElement.dataset.theme = config.ui.accent;
   }, [config.ui]);
+  useEffect(() => {
+    const projectedSession = projection.active_session ?? "";
+    if (!projectedSession) return;
+    const availableSessions = asArray(resourceData(catalog, "sessions", []));
+    if (
+      availableSessions.some(
+        (session) => String(session.id) === projectedSession,
+      )
+    )
+      setActiveSession((current) => current || projectedSession);
+  }, [catalog, projection.active_session]);
   useEffect(() => {
     const models = resourceData<RuntimeCapability[]>(catalog, "models", []);
     if (!models.length) return;
