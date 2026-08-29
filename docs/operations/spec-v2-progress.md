@@ -29,6 +29,12 @@
 | PERF-3 | DONE | `app_paint_precedes_deferred_gdbus_probe_in_perf_report` passes; replay `startup_native_setup` maximum is 83 µs against the 800 ms limit; desktop 61 tests pass. | `0619645` |
 | PERF-4 | DONE | Slim bootstrap releases the startup shield independently of lazy catalog loading; `App.test.tsx` 17/17, desktop frontend 73/73, and desktop Rust 61/61 pass. | `ee50bf1` |
 | FIX-27 | DONE | Exhaustive 3,584-case policy matrix and 4,096-case nested redaction corpus pass; policy line coverage is 100.00%, combined policy/tools line coverage 95.65%. | `1aeaff9` |
+| PERF-6 | DONE | The v4 database migration test creates a private encrypted backup before applying the v5 usage indexes and preserves all seeded data; storage tests and strict clippy pass. | `f77150e` |
+| PERF-7 | DONE | The 5,000-event test writes no `usage-ledger-v1` snapshots and recovers exact SQL aggregates; frozen legacy ledgers merge without rewrite, and server-filtered 50-row UI pagination passes. | `7e2627e` |
+| PERF-8 | DONE | Supervisor, scheduler, and MCP bursts persist once per 10 mutations; critical/shutdown flushes and bounded artifact formats pass. The wave gate's export-version race was reproduced, fixed, stress-tested 10 times, and folded into this task commit. | `0f5f26c` |
+| FIX-7 | DONE | The pinned multilingual E5 int8 worker passes its real 118 MB model protocol and English/Hebrew top-3 fixtures; finite-width numeric validation, memory tests, and desktop clippy pass. | `0592003` |
+| FIX-8 | DONE | `recall_index_handles_ten_thousand_memories_under_fifty_ms` materializes one FTS candidate and reports 569.228 µs; clone/deserialization, eligibility-before-limit, and approval regressions pass. | `1048c2e` |
+| FIX-9 | DONE | Trigger-audited persistence adds exactly one `memories` row with zero updates/deletes or legacy blob rewrites; transactional v5→v6 migration preserves vectors, metadata, links, and pre-existing `legacy-imported` personal data. | `efa0826` |
 
 ## Wave 1 gate
 
@@ -69,6 +75,24 @@ workspace clippy pass with warnings denied, and all workspace Rust tests pass (d
 runtime 15 passed with one pre-existing ignored live-sidecar test). Bun checks and tests pass
 (desktop 73/73), the production build completes, and the registry, pack, performance, fuzz,
 security, SBOM, and release-metadata verifiers all pass. The inherited exceptions were rerun:
+
+- Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
+- Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by
+  PERF-13 and does not exist yet.
+
+## Wave 4 gate
+
+Wave 4 passes the full §14 gate except the same two inherited baseline failures. The first full
+run exposed a real artifact-export race (`selectedVersion` could still be unset while the snapshot
+was already interactive); the exact failure was made deterministic, fixed without weakening the
+assertion, stress-tested in 10 focused runs, and folded into PERF-8 before the gate was restarted.
+
+On the clean rerun, dependency installation made no changes, the pinned OpenCode 1.18.23 sidecar
+verified, formatting and workspace clippy passed with warnings denied, and every workspace Rust
+test passed (desktop 74/74; core 37/37; memory 14/14; storage 14/14; runtime 15 passed with one
+pre-existing ignored live-sidecar test). Bun checks and tests passed (desktop 75/75), and the
+production build completed at 764.08 kB / 208.00 kB gzip. Registry, pack, performance, fuzz,
+security, SBOM, and release-metadata verification all passed. The inherited exceptions were rerun:
 
 - Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
 - Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by
