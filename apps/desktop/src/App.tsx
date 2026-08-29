@@ -1339,8 +1339,14 @@ function ChatView({
     }
   }, [config.ui.reduced_motion, messages]);
   useEffect(() => {
+    let disposed = false;
     const unlisten: Array<() => void> = [];
+    const retainUnlistener = (dispose: () => void) => {
+      if (disposed) dispose();
+      else unlisten.push(dispose);
+    };
     void listen<EventEnvelope>("runtime-event", ({ payload }) => {
+      if (disposed) return;
       onHistory(payload);
       if (payload.type === "response.started") setTurnStage("Thinking");
       if (payload.type === "reasoning.available") setTurnStage("Reasoning");
@@ -1377,23 +1383,30 @@ function ChatView({
             ),
           );
       }
-    }).then((fn) => unlisten.push(fn));
-    void listen<TurnCompletion>("runtime-turn-complete", ({ payload }) =>
-      finalizeTurn(payload),
-    ).then((fn) => unlisten.push(fn));
+    }).then(retainUnlistener);
+    void listen<TurnCompletion>(
+      "runtime-turn-complete",
+      ({ payload }) => {
+        if (!disposed) finalizeTurn(payload);
+      },
+    ).then(retainUnlistener);
     void listen<{
       state: string;
       detail?: string;
       engine?: string;
       interrupted?: boolean;
     }>("voice-state", ({ payload }) => {
+      if (disposed) return;
       setPlaybackState(payload.interrupted ? "interrupted" : payload.state);
       if (payload.interrupted)
         window.setTimeout(() => setPlaybackState("idle"), 1200);
       if (payload.state === "recovering" && payload.detail)
         setError(`Voice recovered with fallback: ${payload.detail}`);
-    }).then((fn) => unlisten.push(fn));
-    return () => unlisten.forEach((fn) => fn());
+    }).then(retainUnlistener);
+    return () => {
+      disposed = true;
+      unlisten.forEach((dispose) => dispose());
+    };
   }, [finalizeTurn, onHistory, refreshCatalog, setMessages]);
 
   useEffect(() => {
@@ -1617,8 +1630,8 @@ function ChatView({
   useEffect(() => {
     const stopCurrentActivity = () => {
       void invoke("voice_stop").catch(() => undefined);
-      if (busy) void stopTurn();
-      if (capturing) voice.cancel();
+      if (busy) void stopTurnRef.current();
+      if (capturing) voiceActionsRef.current.cancel();
     };
     window.addEventListener("personal-agent:voice-stop", stopCurrentActivity);
     return () =>
@@ -1626,7 +1639,7 @@ function ChatView({
         "personal-agent:voice-stop",
         stopCurrentActivity,
       );
-  });
+  }, [busy, capturing]);
 
   const addFiles = async (files: FileList | null) => {
     if (!files) return;

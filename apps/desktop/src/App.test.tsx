@@ -1,4 +1,5 @@
 import "@testing-library/jest-dom/vitest";
+import { StrictMode } from "react";
 import {
   act,
   cleanup,
@@ -292,6 +293,79 @@ describe("desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     expect(screen.getByText("future.additive.event")).toBeInTheDocument();
     expect(screen.getByText(/future-fixture/)).toBeInTheDocument();
+  });
+
+  it("appends each runtime delta once when ChatView remounts under StrictMode", async () => {
+    type Listener = (event: { payload: unknown }) => void;
+    const activeListeners = new Map<string, Set<Listener>>();
+    const pending: Array<{
+      name: string;
+      callback: Listener;
+      resolve: (unlisten: () => void) => void;
+    }> = [];
+    listen.mockImplementation((name: string, callback: Listener) => {
+      const registered = activeListeners.get(name) ?? new Set<Listener>();
+      registered.add(callback);
+      activeListeners.set(name, registered);
+      return new Promise<() => void>((resolve) => {
+        pending.push({ name, callback, resolve });
+      });
+    });
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(pending).toHaveLength(6));
+    await act(async () => {
+      for (const registration of pending) {
+        registration.resolve(() =>
+          activeListeners
+            .get(registration.name)
+            ?.delete(registration.callback),
+        );
+      }
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(activeListeners.get("runtime-event")).toHaveLength(1),
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), {
+      target: { value: "Stream once" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "chat_send",
+        expect.objectContaining({ text: "Stream once" }),
+      ),
+    );
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ delta: "Only one delta." }),
+    );
+    act(() => {
+      for (const callback of activeListeners.get("runtime-event") ?? []) {
+        callback({
+          payload: {
+            schema_version: 1,
+            event_id: "evt_single_delta",
+            wall_clock_timestamp: "2026-08-29T12:00:00Z",
+            monotonic_sequence: 1,
+            origin: "strict-mode-test",
+            profile_id: "default",
+            type: "response.delta",
+            payload_json: Array.from(payload),
+          },
+        });
+      }
+    });
+    await waitFor(() =>
+      expect(
+        document.querySelector(".chat-message.assistant p"),
+      ).toHaveTextContent(/^Only one delta\.$/),
+    );
   });
 
   it("submits a real chat request with runtime selection and attachment contract", async () => {
