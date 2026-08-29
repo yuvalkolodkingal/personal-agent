@@ -22,7 +22,7 @@ const RESIDENT_TICK_SECONDS: u64 = 2;
 const MAX_GOAL_TEXT_BYTES: usize = 65_536;
 const BACKGROUND_GOAL_SYSTEM_PROMPT: &str = "This is a durable background goal task, not an interactive user turn. Work only on the named goal and observable success criterion. Preserve user files and existing changes. All tools remain behind the native policy gateway. Pause for native approval before consequential or external effects. Return a concise result with verification evidence.";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingApproval {
     goal_id: Uuid,
     task_id: Uuid,
@@ -46,6 +46,13 @@ type ReplayedGoalEvents = (
     Vec<GoalActivityView>,
 );
 
+#[derive(Default)]
+struct GoalReplayState {
+    goals: BTreeMap<Uuid, Goal>,
+    approvals: PendingApprovalsByGoal,
+    activities: Vec<GoalActivityView>,
+}
+
 pub(crate) struct GoalsHostState {
     goals: tokio::sync::Mutex<BTreeMap<Uuid, ManagedGoal>>,
     resident_active: AtomicBool,
@@ -53,7 +60,7 @@ pub(crate) struct GoalsHostState {
     activities: tokio::sync::Mutex<Vec<GoalActivityView>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct GoalActivityView {
     sequence: u64,
     event_type: String,
@@ -191,10 +198,18 @@ impl GoalsHostState {
 fn replay_goal_events(
     profile: &personal_agent_core::ProfileState,
 ) -> Result<ReplayedGoalEvents, String> {
-    let mut goals = BTreeMap::new();
-    let mut approvals = PendingApprovalsByGoal::new();
-    let mut activities = Vec::new();
-    let mut after = 0;
+    replay_goal_events_with_checkpoints(profile, true)
+}
+
+fn replay_goal_events_with_checkpoints(
+    profile: &personal_agent_core::ProfileState,
+    use_checkpoints: bool,
+) -> Result<ReplayedGoalEvents, String> {
+    let (mut state, mut after) = if use_checkpoints {
+        checkpointed_goal_replay_base(profile)?.unwrap_or_default()
+    } else {
+        (GoalReplayState::default(), 0)
+    };
     loop {
         let events = profile
             .events_after(after, 1_000)
@@ -204,74 +219,164 @@ fn replay_goal_events(
         }
         for event in events {
             after = event.monotonic_sequence;
-            if !is_goal_event(&event.r#type) {
-                continue;
-            }
-            let payload = event.payload().map_err(|error| error.to_string())?;
-            if event.r#type == "goal.created" {
-                if let Ok(goal) = serde_json::from_value::<Goal>(payload.clone()) {
-                    goals.insert(goal.id, goal);
-                }
-            } else if let Some(value) = payload.get("goal")
-                && let Ok(goal) = serde_json::from_value::<Goal>(value.clone())
-            {
-                goals.insert(goal.id, goal);
-            }
-            if event.r#type == "approval.requested"
-                && let Ok(approval) = serde_json::from_value::<PendingApproval>(payload.clone())
-            {
-                approvals
-                    .entry(approval.goal_id)
-                    .or_default()
-                    .insert(approval.task_id, approval);
-            }
-            if event.r#type == "approval.resolved"
-                && let (Some(goal_id), Some(task_id)) = (
-                    payload.get("goal_id").and_then(Value::as_str),
-                    payload.get("task_id").and_then(Value::as_str),
-                )
-                && let (Ok(goal_id), Ok(task_id)) = (goal_id.parse(), task_id.parse())
-                && let Some(items) = approvals.get_mut(&goal_id)
-            {
-                items.remove(&task_id);
-            }
-            if payload
-                .get("approvals_resolved")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0
-                && let Some(goal_id) = payload
-                    .get("goal_id")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse().ok())
-            {
-                approvals.remove(&goal_id);
-            }
-            if payload
-                .get("approval_resolved")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && let (Some(goal_id), Some(task_id)) = (
-                    payload
-                        .get("goal_id")
-                        .and_then(Value::as_str)
-                        .and_then(|value| value.parse().ok()),
-                    payload
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .and_then(|value| value.parse().ok()),
-                )
-                && let Some(items) = approvals.get_mut(&goal_id)
-            {
-                items.remove(&task_id);
-            }
-            activities.push(activity_from_event(&event, &payload));
+            apply_goal_event(&mut state, &event)?;
         }
     }
-    if activities.len() > 100 {
-        activities.drain(..activities.len() - 100);
+    state.activities.sort_by_key(|activity| activity.sequence);
+    state.activities.dedup_by_key(|activity| activity.sequence);
+    if state.activities.len() > 100 {
+        state.activities.drain(..state.activities.len() - 100);
     }
-    Ok((goals, approvals, activities))
+    Ok((state.goals, state.approvals, state.activities))
+}
+
+fn checkpointed_goal_replay_base(
+    profile: &personal_agent_core::ProfileState,
+) -> Result<Option<(GoalReplayState, u64)>, String> {
+    let checkpoints = profile
+        .supervisor_recovery_checkpoints()
+        .map_err(|error| error.to_string())?;
+    if checkpoints.is_empty()
+        || checkpoints.iter().any(|checkpoint| {
+            !checkpoint.replay_base_complete
+                || checkpoint.last_sequence == 0
+                || checkpoint.latest_goal_event.is_none()
+        })
+    {
+        return Ok(None);
+    }
+
+    let mut state = GoalReplayState::default();
+    let mut after = 0;
+    for checkpoint in checkpoints {
+        let event = checkpoint
+            .latest_goal_event
+            .as_ref()
+            .expect("complete checkpoints have a latest goal event");
+        if event.monotonic_sequence != checkpoint.last_sequence {
+            return Ok(None);
+        }
+        let payload = event.payload().map_err(|error| error.to_string())?;
+        let Some(goal) = goal_from_event(event, &payload) else {
+            return Ok(None);
+        };
+        if goal.id != checkpoint.snapshot.graph.goal_id {
+            return Ok(None);
+        }
+        state.goals.insert(goal.id, goal);
+        for pending in &checkpoint.pending_approval_events {
+            let payload = pending.payload().map_err(|error| error.to_string())?;
+            let approval = serde_json::from_value::<PendingApproval>(payload)
+                .map_err(|error| error.to_string())?;
+            state
+                .approvals
+                .entry(approval.goal_id)
+                .or_default()
+                .insert(approval.task_id, approval);
+        }
+        state.activities.extend(
+            checkpoint
+                .recent_activities
+                .into_iter()
+                .map(activity_from_checkpoint),
+        );
+        after = after.max(checkpoint.last_sequence);
+    }
+    Ok(Some((state, after)))
+}
+
+fn apply_goal_event(state: &mut GoalReplayState, event: &EventEnvelope) -> Result<(), String> {
+    if !is_goal_event(&event.r#type) {
+        return Ok(());
+    }
+    let payload = event.payload().map_err(|error| error.to_string())?;
+    if let Some(goal) = goal_from_event(event, &payload) {
+        state.goals.insert(goal.id, goal);
+    }
+    apply_approval_event(&mut state.approvals, event, &payload);
+    state.activities.push(activity_from_event(event, &payload));
+    Ok(())
+}
+
+fn goal_from_event(event: &EventEnvelope, payload: &Value) -> Option<Goal> {
+    if event.r#type == "goal.created" {
+        serde_json::from_value(payload.clone()).ok().or_else(|| {
+            payload
+                .get("goal")
+                .and_then(|goal| serde_json::from_value(goal.clone()).ok())
+        })
+    } else {
+        payload
+            .get("goal")
+            .and_then(|goal| serde_json::from_value(goal.clone()).ok())
+    }
+}
+
+fn apply_approval_event(
+    approvals: &mut PendingApprovalsByGoal,
+    event: &EventEnvelope,
+    payload: &Value,
+) {
+    if event.r#type == "approval.requested"
+        && let Ok(approval) = serde_json::from_value::<PendingApproval>(payload.clone())
+    {
+        approvals
+            .entry(approval.goal_id)
+            .or_default()
+            .insert(approval.task_id, approval);
+    }
+    if event.r#type == "approval.resolved"
+        && let (Some(goal_id), Some(task_id)) = (
+            payload.get("goal_id").and_then(Value::as_str),
+            payload.get("task_id").and_then(Value::as_str),
+        )
+        && let (Ok(goal_id), Ok(task_id)) = (goal_id.parse(), task_id.parse())
+        && let Some(items) = approvals.get_mut(&goal_id)
+    {
+        items.remove(&task_id);
+    }
+    if payload
+        .get("approvals_resolved")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        && let Some(goal_id) = payload
+            .get("goal_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+    {
+        approvals.remove(&goal_id);
+    }
+    if payload
+        .get("approval_resolved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && let (Some(goal_id), Some(task_id)) = (
+            payload
+                .get("goal_id")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok()),
+            payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok()),
+        )
+        && let Some(items) = approvals.get_mut(&goal_id)
+    {
+        items.remove(&task_id);
+    }
+}
+
+fn activity_from_checkpoint(
+    activity: personal_agent_core::SupervisorActivityCheckpoint,
+) -> GoalActivityView {
+    GoalActivityView {
+        sequence: activity.sequence,
+        event_type: activity.event_type,
+        goal_id: activity.goal_id.and_then(|value| value.parse().ok()),
+        task_id: activity.task_id.and_then(|value| value.parse().ok()),
+        timestamp: activity.timestamp,
+    }
 }
 
 fn is_goal_event(event_type: &str) -> bool {
@@ -1339,6 +1444,80 @@ mod tests {
         assert!(bounded_text("  ", "goal", 10).is_err());
         assert!(bounded_text("eleven bytes", "goal", 5).is_err());
         assert_eq!(bounded_text(" goal ", "goal", 10).unwrap(), "goal");
+    }
+
+    #[test]
+    fn goal_recovery_is_identical_with_and_without_supervisor_checkpoints() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("goal-replay-checkpoint.db");
+        let mut profile =
+            personal_agent_core::ProfileState::open(&database, "default", &TestSecrets)
+                .expect("profile");
+
+        let mut first = Goal::new("Recover efficiently", vec!["state matches".into()], "test");
+        first.plan_revision = 1;
+        let mut first_supervisor = DurableSupervisor::new(
+            task_graph(&first, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("first supervisor");
+        profile
+            .record_supervisor_event(first_supervisor.snapshot(), "goal.created", &json!(first))
+            .expect("create first goal");
+        let task_id = first_supervisor.ready_tasks()[0];
+        first_supervisor.start(task_id).expect("start task");
+        first.status = WorkStatus::Running;
+        profile
+            .record_supervisor_event(
+                first_supervisor.snapshot(),
+                "task.started",
+                &json!({"goal": first, "goal_id": first.id, "task_id": task_id}),
+            )
+            .expect("start event");
+        first_supervisor
+            .wait_for_approval(task_id, "confirm test effect")
+            .expect("wait for approval");
+        let approval = PendingApproval {
+            goal_id: first.id,
+            task_id,
+            session_id: "test-session".into(),
+            request_id: "test-request".into(),
+            reason: "confirm test effect".into(),
+            requested_at: Utc::now(),
+        };
+        let mut approval_payload = serde_json::to_value(&approval).expect("approval payload");
+        approval_payload
+            .as_object_mut()
+            .expect("approval object")
+            .insert("goal".into(), json!(first));
+        profile
+            .record_supervisor_event(
+                first_supervisor.snapshot(),
+                "approval.requested",
+                &approval_payload,
+            )
+            .expect("approval event");
+
+        let mut second = Goal::new("Preserve ordering", vec!["timeline matches".into()], "test");
+        second.plan_revision = 1;
+        let second_supervisor = DurableSupervisor::new(
+            task_graph(&second, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("second supervisor");
+        profile
+            .record_supervisor_event(second_supervisor.snapshot(), "goal.created", &json!(second))
+            .expect("create second goal");
+
+        let full = replay_goal_events_with_checkpoints(&profile, false).expect("full replay");
+        let checkpointed =
+            replay_goal_events_with_checkpoints(&profile, true).expect("checkpoint replay");
+        assert_eq!(checkpointed, full);
+        assert_eq!(checkpointed.0.len(), 2);
+        assert_eq!(checkpointed.1[&first.id][&task_id], approval);
+        assert_eq!(checkpointed.2.len(), 4);
     }
 
     #[tokio::test]

@@ -13,6 +13,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 4;
+const PROJECTION_CHECKPOINT_KIND: &str = "projection.checkpoint";
+const PROJECTION_CHECKPOINT_ID: &str = "projection.checkpoint";
+const SUPERVISOR_SNAPSHOT_KIND: &str = "agent-supervisor";
+const SUPERVISOR_RECENT_EVENT_LIMIT: usize = 100;
 
 /// Storage failure with enough context for diagnostics and recovery.
 #[derive(Debug, Error)]
@@ -40,6 +44,47 @@ pub enum StorageError {
 /// Owned encrypted store. Database access never crosses the native-core boundary.
 pub struct EventStore {
     connection: Connection,
+}
+
+/// Durable application projection plus the last event included in it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ProjectionCheckpoint<T> {
+    /// Serialized application-owned projection state.
+    pub projection_snapshot_blob: T,
+    /// Highest event sequence incorporated into the projection.
+    pub last_sequence: u64,
+}
+
+/// Content-free goal activity retained with a supervisor recovery base.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SupervisorActivityCheckpoint {
+    /// Event sequence used for stable global ordering.
+    pub sequence: u64,
+    /// Goal/task transition type.
+    pub event_type: String,
+    /// Goal identifier when the event exposes one.
+    pub goal_id: Option<String>,
+    /// Task identifier when the event exposes one.
+    pub task_id: Option<String>,
+    /// Original event timestamp.
+    pub timestamp: String,
+}
+
+/// Existing supervisor snapshot enriched with its event replay boundary.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct SupervisorRecoveryCheckpoint {
+    /// Complete task-supervisor state at the checkpoint.
+    pub snapshot: personal_agent_agent::SupervisorSnapshot,
+    /// Highest goal event represented by this checkpoint.
+    pub last_sequence: u64,
+    /// Latest event carrying the complete goal definition.
+    pub latest_goal_event: Option<EventEnvelope>,
+    /// Approval requests that were unresolved at the checkpoint.
+    pub pending_approval_events: Vec<EventEnvelope>,
+    /// Bounded activity summaries used to rebuild the recent timeline.
+    pub recent_activities: Vec<SupervisorActivityCheckpoint>,
+    /// False for legacy bare snapshots that require one full replay to migrate.
+    pub replay_base_complete: bool,
 }
 
 impl EventStore {
@@ -200,6 +245,41 @@ impl EventStore {
         Ok(u64::try_from(value).unwrap_or_default())
     }
 
+    /// Persist a rebuildable application projection and its replay boundary.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn save_projection_checkpoint<T: serde::Serialize>(
+        &mut self,
+        projection_snapshot_blob: &T,
+        last_sequence: u64,
+    ) -> Result<(), StorageError> {
+        let checkpoint = ProjectionCheckpoint {
+            projection_snapshot_blob,
+            last_sequence,
+        };
+        save_snapshot(
+            &mut self.connection,
+            PROJECTION_CHECKPOINT_KIND,
+            PROJECTION_CHECKPOINT_ID,
+            &checkpoint,
+        )
+    }
+
+    /// Load the latest application projection checkpoint, if one exists.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn projection_checkpoint<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<ProjectionCheckpoint<T>>, StorageError> {
+        load_snapshot(
+            &self.connection,
+            PROJECTION_CHECKPOINT_KIND,
+            PROJECTION_CHECKPOINT_ID,
+        )
+    }
+
     /// Persist a content-free migration run report inside the encrypted store.
     ///
     /// # Errors
@@ -346,11 +426,28 @@ impl EventStore {
         &mut self,
         snapshot: &personal_agent_agent::SupervisorSnapshot,
     ) -> Result<(), StorageError> {
+        let id = snapshot.graph.goal_id.to_string();
+        let checkpoint = self
+            .supervisor_recovery_checkpoint(snapshot.graph.goal_id)?
+            .map_or_else(
+                || SupervisorRecoveryCheckpoint {
+                    snapshot: snapshot.clone(),
+                    last_sequence: 0,
+                    latest_goal_event: None,
+                    pending_approval_events: Vec::new(),
+                    recent_activities: Vec::new(),
+                    replay_base_complete: false,
+                },
+                |mut checkpoint| {
+                    checkpoint.snapshot.clone_from(snapshot);
+                    checkpoint
+                },
+            );
         save_snapshot(
             &mut self.connection,
-            "agent-supervisor",
-            &snapshot.graph.goal_id.to_string(),
-            snapshot,
+            SUPERVISOR_SNAPSHOT_KIND,
+            &id,
+            &checkpoint,
         )
     }
 
@@ -362,7 +459,40 @@ impl EventStore {
         &self,
         goal_id: uuid::Uuid,
     ) -> Result<Option<personal_agent_agent::SupervisorSnapshot>, StorageError> {
-        load_snapshot(&self.connection, "agent-supervisor", &goal_id.to_string())
+        Ok(self
+            .supervisor_recovery_checkpoint(goal_id)?
+            .map(|checkpoint| checkpoint.snapshot))
+    }
+
+    /// Load one enriched task-supervisor recovery checkpoint.
+    ///
+    /// Legacy bare snapshots are returned with `replay_base_complete = false`
+    /// so callers safely fall back to a full event replay once.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn supervisor_recovery_checkpoint(
+        &self,
+        goal_id: uuid::Uuid,
+    ) -> Result<Option<SupervisorRecoveryCheckpoint>, StorageError> {
+        load_supervisor_checkpoint(&self.connection, &goal_id.to_string())
+    }
+
+    /// Load all task-supervisor recovery checkpoints in stable goal-ID order.
+    ///
+    /// # Errors
+    /// Returns JSON or database errors.
+    pub fn supervisor_recovery_checkpoints(
+        &self,
+    ) -> Result<Vec<SupervisorRecoveryCheckpoint>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT body_json FROM runtime_snapshots WHERE kind=?1 ORDER BY id")?;
+        let bodies =
+            statement.query_map([SUPERVISOR_SNAPSHOT_KIND], |row| row.get::<_, String>(0))?;
+        bodies
+            .map(|body| decode_supervisor_checkpoint(&body?))
+            .collect()
     }
 
     /// Atomically persist a supervisor transition and its append-only projection event.
@@ -374,12 +504,28 @@ impl EventStore {
         snapshot: &personal_agent_agent::SupervisorSnapshot,
         event: &EventEnvelope,
     ) -> Result<(), StorageError> {
-        self.save_runtime_snapshot_and_event(
-            "agent-supervisor",
-            &snapshot.graph.goal_id.to_string(),
-            snapshot,
-            event,
-        )
+        validate_event(event)?;
+        let sequence = i64::try_from(event.monotonic_sequence)
+            .map_err(|_| StorageError::SequenceOutOfRange(event.monotonic_sequence))?;
+        let id = snapshot.graph.goal_id.to_string();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = load_supervisor_checkpoint(&tx, &id)?;
+        let checkpoint = evolve_supervisor_checkpoint(previous, snapshot, event)?;
+        let body = serde_json::to_string(&checkpoint)?;
+        tx.execute(
+            "INSERT INTO runtime_snapshots(kind,id,body_json,updated_at)
+             VALUES (?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(kind,id) DO UPDATE SET body_json=excluded.body_json, updated_at=excluded.updated_at",
+            params![SUPERVISOR_SNAPSHOT_KIND, id, body],
+        )?;
+        tx.execute(
+            "INSERT INTO events(monotonic_sequence,event_id,profile_id,event_type,wall_clock_timestamp,envelope) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![sequence, event.event_id, event.profile_id, event.r#type, event.wall_clock_timestamp, event.encode_to_vec()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Atomically persist the complete scheduler snapshot.
@@ -521,6 +667,142 @@ impl EventStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn validate_event(event: &EventEnvelope) -> Result<(), StorageError> {
+    if event.schema_version != personal_agent_contracts::EVENT_SCHEMA_VERSION {
+        return Err(StorageError::UnsupportedEventSchema(event.schema_version));
+    }
+    i64::try_from(event.monotonic_sequence)
+        .map(|_| ())
+        .map_err(|_| StorageError::SequenceOutOfRange(event.monotonic_sequence))
+}
+
+fn load_supervisor_checkpoint(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<SupervisorRecoveryCheckpoint>, StorageError> {
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body_json FROM runtime_snapshots WHERE kind=?1 AND id=?2",
+            params![SUPERVISOR_SNAPSHOT_KIND, id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    body.map(|body| decode_supervisor_checkpoint(&body))
+        .transpose()
+}
+
+fn decode_supervisor_checkpoint(body: &str) -> Result<SupervisorRecoveryCheckpoint, StorageError> {
+    if let Ok(checkpoint) = serde_json::from_str(body) {
+        return Ok(checkpoint);
+    }
+    let snapshot = serde_json::from_str(body)?;
+    Ok(SupervisorRecoveryCheckpoint {
+        snapshot,
+        last_sequence: 0,
+        latest_goal_event: None,
+        pending_approval_events: Vec::new(),
+        recent_activities: Vec::new(),
+        replay_base_complete: false,
+    })
+}
+
+fn evolve_supervisor_checkpoint(
+    previous: Option<SupervisorRecoveryCheckpoint>,
+    snapshot: &personal_agent_agent::SupervisorSnapshot,
+    event: &EventEnvelope,
+) -> Result<SupervisorRecoveryCheckpoint, StorageError> {
+    let mut checkpoint = previous.unwrap_or_else(|| SupervisorRecoveryCheckpoint {
+        snapshot: snapshot.clone(),
+        last_sequence: 0,
+        latest_goal_event: None,
+        pending_approval_events: Vec::new(),
+        recent_activities: Vec::new(),
+        replay_base_complete: event.r#type == "goal.created",
+    });
+    checkpoint.snapshot.clone_from(snapshot);
+    checkpoint.last_sequence = event.monotonic_sequence;
+    checkpoint.latest_goal_event = Some(event.clone());
+
+    let payload: serde_json::Value = serde_json::from_slice(&event.payload_json)?;
+    let task_id = payload.get("task_id").and_then(serde_json::Value::as_str);
+    if event.r#type == "approval.requested" {
+        if let Some(task_id) = task_id {
+            checkpoint
+                .pending_approval_events
+                .retain(|pending| event_task_id(pending).as_deref() != Some(task_id));
+            checkpoint.pending_approval_events.push(event.clone());
+        } else {
+            checkpoint.replay_base_complete = false;
+        }
+    }
+    if event.r#type == "approval.resolved"
+        || payload
+            .get("approval_resolved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let Some(task_id) = task_id {
+            checkpoint
+                .pending_approval_events
+                .retain(|pending| event_task_id(pending).as_deref() != Some(task_id));
+        } else if event.r#type == "approval.resolved" {
+            checkpoint.replay_base_complete = false;
+        }
+    }
+    if payload
+        .get("approvals_resolved")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        checkpoint.pending_approval_events.clear();
+    }
+
+    checkpoint
+        .recent_activities
+        .push(supervisor_activity(event, &payload));
+    if checkpoint.recent_activities.len() > SUPERVISOR_RECENT_EVENT_LIMIT {
+        let excess = checkpoint.recent_activities.len() - SUPERVISOR_RECENT_EVENT_LIMIT;
+        checkpoint.recent_activities.drain(..excess);
+    }
+    Ok(checkpoint)
+}
+
+fn event_task_id(event: &EventEnvelope) -> Option<String> {
+    event.task_id.clone().or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&event.payload_json)
+            .ok()?
+            .get("task_id")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
+fn supervisor_activity(
+    event: &EventEnvelope,
+    payload: &serde_json::Value,
+) -> SupervisorActivityCheckpoint {
+    SupervisorActivityCheckpoint {
+        sequence: event.monotonic_sequence,
+        event_type: event.r#type.clone(),
+        goal_id: event.goal_id.clone().or_else(|| {
+            payload
+                .get("goal_id")
+                .or_else(|| payload.get("id"))
+                .or_else(|| payload.pointer("/goal/id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }),
+        task_id: event.task_id.clone().or_else(|| {
+            payload
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }),
+        timestamp: event.wall_clock_timestamp.clone(),
     }
 }
 
@@ -729,6 +1011,51 @@ mod tests {
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].event_id, second.event_id);
         assert_eq!(store.last_sequence().expect("sequence"), 2);
+    }
+
+    #[test]
+    fn projection_checkpoint_reopens_with_fewer_than_one_hundred_rows_to_replay() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("projection-checkpoint.db");
+        let key = SecretString::from("test-only-key".to_owned());
+        {
+            let mut store = EventStore::open(&database, &key).expect("store");
+            for sequence in 1..=10_000 {
+                let event = EventEnvelope::new(
+                    sequence,
+                    "checkpoint-test",
+                    "default",
+                    "message.user",
+                    &json!({"sequence": sequence}),
+                )
+                .expect("event");
+                store.append(&event).expect("append");
+                if sequence % 1_000 == 0 {
+                    store
+                        .save_projection_checkpoint(&json!({"last_sequence": sequence}), sequence)
+                        .expect("checkpoint");
+                }
+            }
+        }
+
+        let reopened = EventStore::open(&database, &key).expect("reopen");
+        let checkpoint = reopened
+            .projection_checkpoint::<serde_json::Value>()
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        let replayed_rows = reopened
+            .after(checkpoint.last_sequence, 100)
+            .expect("tail")
+            .len();
+        assert!(
+            replayed_rows < 100,
+            "checkpoint recovery replayed {replayed_rows} rows"
+        );
+        assert_eq!(checkpoint.last_sequence, 10_000);
+        assert_eq!(
+            checkpoint.projection_snapshot_blob,
+            json!({"last_sequence": 10_000})
+        );
     }
 
     #[test]

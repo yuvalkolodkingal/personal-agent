@@ -44,10 +44,13 @@ pub use usage::{
 use personal_agent_contracts::proto::EventEnvelope;
 use personal_agent_runtime::{AgentRuntime, RuntimeError, RuntimeHealth};
 use personal_agent_storage::{EventStore, StorageError};
+pub use personal_agent_storage::{SupervisorActivityCheckpoint, SupervisorRecoveryCheckpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use thiserror::Error;
+
+const PROJECTION_CHECKPOINT_INTERVAL: u64 = 1_000;
 
 /// Rebuildable UI projection derived exclusively from events.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -256,6 +259,28 @@ impl ProfileState {
         &self.projection
     }
 
+    /// Persist the current application projection for a clean-shutdown replay boundary.
+    ///
+    /// # Errors
+    /// Returns an encrypted storage or serialization failure.
+    pub fn checkpoint_projection(&mut self) -> Result<(), CoreError> {
+        self.store
+            .save_projection_checkpoint(&self.projection, self.projection.last_sequence)?;
+        Ok(())
+    }
+
+    fn apply_persisted_event(&mut self, event: &EventEnvelope) -> Result<AppProjection, CoreError> {
+        self.projection.apply(event)?;
+        if self
+            .projection
+            .last_sequence
+            .is_multiple_of(PROJECTION_CHECKPOINT_INTERVAL)
+        {
+            self.checkpoint_projection()?;
+        }
+        Ok(self.projection.clone())
+    }
+
     /// Load the encrypted durable memory index for this profile.
     ///
     /// # Errors
@@ -337,6 +362,16 @@ impl ProfileState {
         Ok(self.store.supervisor_snapshot(goal_id)?)
     }
 
+    /// Load all enriched supervisor snapshots used as goal-replay bases.
+    ///
+    /// # Errors
+    /// Returns an encrypted storage or serialization failure.
+    pub fn supervisor_recovery_checkpoints(
+        &self,
+    ) -> Result<Vec<SupervisorRecoveryCheckpoint>, CoreError> {
+        Ok(self.store.supervisor_recovery_checkpoints()?)
+    }
+
     /// Persist a recovered supervisor snapshot without inventing a domain transition.
     ///
     /// # Errors
@@ -359,17 +394,21 @@ impl ProfileState {
         event_type: &str,
         payload: &Value,
     ) -> Result<AppProjection, CoreError> {
-        let event = EventEnvelope::new(
+        let mut event = EventEnvelope::new(
             self.projection.last_sequence + 1,
             "goal-supervisor",
             &self.profile_id,
             event_type,
             payload,
         )?;
+        event.goal_id = Some(snapshot.graph.goal_id.to_string());
+        event.task_id = payload
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         self.store
             .save_supervisor_snapshot_and_event(snapshot, &event)?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Load encrypted artifact-library and whiteboard metadata.
@@ -418,8 +457,7 @@ impl ProfileState {
             workspace,
             &event,
         )?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Store immutable artifact content in the encrypted content-addressed blob store.
@@ -456,8 +494,7 @@ impl ProfileState {
             &serde_json::json!({"text": text}),
         )?;
         self.store.append(&event)?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Persist the normalized runtime health state without exposing its endpoint.
@@ -481,8 +518,7 @@ impl ProfileState {
             }),
         )?;
         self.store.append(&event)?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Persist process-start recovery state in the encrypted event stream.
@@ -502,8 +538,7 @@ impl ProfileState {
             &serde_json::json!({"previous_unclean_run": previous_unclean_run}),
         )?;
         self.store.append(&event)?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Persist one normalized runtime event with a profile-global monotonic
@@ -526,8 +561,7 @@ impl ProfileState {
             &usage,
             &event,
         )?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Load encrypted provider accounting and content-free egress state.
@@ -561,8 +595,7 @@ impl ProfileState {
             &usage,
             &event,
         )?;
-        self.projection.apply(&event)?;
-        Ok(self.projection.clone())
+        self.apply_persisted_event(&event)
     }
 
     /// Return persisted events for history/timeline rendering. Secrets remain
@@ -606,6 +639,14 @@ impl ProfileState {
         self.store.record_migration_report(&report)?;
         self.projection = rebuild_projection_from(&self.store)?;
         Ok(report)
+    }
+}
+
+impl Drop for ProfileState {
+    fn drop(&mut self) {
+        let _ = self
+            .store
+            .save_projection_checkpoint(&self.projection, self.projection.last_sequence);
     }
 }
 
@@ -683,6 +724,8 @@ impl<R: AgentRuntime> Core<R> {
     /// Returns a runtime shutdown error.
     pub async fn stop(&mut self) -> Result<(), CoreError> {
         self.runtime.stop().await?;
+        self.store
+            .save_projection_checkpoint(&self.projection, self.projection.last_sequence)?;
         Ok(())
     }
 
@@ -694,6 +737,14 @@ impl<R: AgentRuntime> Core<R> {
     pub fn record(&mut self, event: &EventEnvelope) -> Result<(), CoreError> {
         self.store.append(event)?;
         self.projection.apply(event)?;
+        if self
+            .projection
+            .last_sequence
+            .is_multiple_of(PROJECTION_CHECKPOINT_INTERVAL)
+        {
+            self.store
+                .save_projection_checkpoint(&self.projection, self.projection.last_sequence)?;
+        }
         Ok(())
     }
 
@@ -719,8 +770,21 @@ impl<R: AgentRuntime> Core<R> {
 ///
 /// Returns a storage or event projection error.
 pub fn rebuild_projection_from(store: &EventStore) -> Result<AppProjection, CoreError> {
-    let mut projection = AppProjection::default();
-    let mut after = 0;
+    let last_event_sequence = store.last_sequence()?;
+    let checkpoint = store.projection_checkpoint::<AppProjection>()?;
+    let (mut projection, mut after) = checkpoint.map_or_else(
+        || (AppProjection::default(), 0),
+        |checkpoint| {
+            let snapshot = checkpoint.projection_snapshot_blob;
+            if snapshot.last_sequence == checkpoint.last_sequence
+                && checkpoint.last_sequence <= last_event_sequence
+            {
+                (snapshot, checkpoint.last_sequence)
+            } else {
+                (AppProjection::default(), 0)
+            }
+        },
+    );
     loop {
         let batch = store.after(after, 512)?;
         if batch.is_empty() {
@@ -866,6 +930,56 @@ mod tests {
         assert!(reopened.projection().runtime_healthy);
         assert_eq!(reopened.projection().unclean_shutdowns, 1);
         assert!(reopened.projection().recovered_unclean_run);
+    }
+
+    #[test]
+    fn profile_drop_persists_a_clean_shutdown_projection_checkpoint() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("clean-shutdown.db");
+        let secrets = FakeSecretStore::default();
+        {
+            let mut state = ProfileState::open(&database, "default", &secrets).expect("open");
+            state.submit_user_message("checkpoint me").expect("event");
+        }
+        let reference = SecretReference {
+            service: "dev.personal-agent.storage".to_owned(),
+            account: "database-default".to_owned(),
+        };
+        let key = secrets.get(&reference).expect("stored key");
+        let store = EventStore::open(&database, &key).expect("reopen storage");
+        let checkpoint = store
+            .projection_checkpoint::<AppProjection>()
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.last_sequence, 1);
+        assert_eq!(checkpoint.projection_snapshot_blob.last_sequence, 1);
+        assert_eq!(
+            checkpoint.projection_snapshot_blob.active_profile,
+            "default"
+        );
+    }
+
+    #[test]
+    fn profile_state_checkpoints_each_thousand_events() {
+        let store =
+            EventStore::open_in_memory(&SecretString::from("test-key".to_owned())).expect("store");
+        let mut state = ProfileState {
+            store,
+            projection: AppProjection::default(),
+            profile_id: "default".into(),
+        };
+        for sequence in 1..=1_000 {
+            state
+                .submit_user_message(&format!("message {sequence}"))
+                .expect("event");
+        }
+        let checkpoint = state
+            .store
+            .projection_checkpoint::<AppProjection>()
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.last_sequence, 1_000);
+        assert_eq!(checkpoint.projection_snapshot_blob, state.projection);
     }
 
     #[test]
