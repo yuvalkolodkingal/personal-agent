@@ -25,6 +25,10 @@
 | A-8 | DONE | `cargo test -p personal-agent-desktop connector_oauth::tests::loopback_callback_accepts_request_in_one_byte_chunks -- --exact --nocapture` → 1 passed, 0 failed. | `a97c4f0` |
 | PERF-1 | DONE | `python scripts/verify-performance.py` → verified extended deterministic replay distributions; perf unit tests 2 passed, 0 failed; diagnostics now emits phase and turn first-delta data. SPEC Files-line omission: the required turn path also needed `api.rs`. | `e864cb8` |
 | RUN-0 | BLOCKED-EXTERNAL / BLOCKED-CONTRADICTION | Two source patches and the PTY skip handoff are in `patches/opencode/`; fork selection is fail-closed. GitHub fork/release/CI require a valid credential. The requested before-hook patch contradicts pristine v1.18.23, which already short-circuits sync throws and async rejections (`exit=Failure`, executor count 0). | `1ac32c2` |
+| PERF-2 | DONE | 10,000-event reopen test replays fewer than 100 rows; checkpoint/full goal recovery equivalence passes; storage 8, core 35, and desktop 61 tests pass. | `b0fc9e0` |
+| PERF-3 | DONE | `app_paint_precedes_deferred_gdbus_probe_in_perf_report` passes; replay `startup_native_setup` maximum is 83 µs against the 800 ms limit; desktop 61 tests pass. | `0619645` |
+| PERF-4 | DONE | Slim bootstrap releases the startup shield independently of lazy catalog loading; `App.test.tsx` 17/17, desktop frontend 73/73, and desktop Rust 61/61 pass. | `ee50bf1` |
+| FIX-27 | DONE | Exhaustive 3,584-case policy matrix and 4,096-case nested redaction corpus pass; policy line coverage is 100.00%, combined policy/tools line coverage 95.65%. | `1aeaff9` |
 
 ## Wave 1 gate
 
@@ -56,3 +60,16 @@ gh repo fork anomalyco/opencode --clone=false --remote=false
 PERSONAL_AGENT_OPENCODE_SOURCE=fork bun run sidecar:fetch
 PERSONAL_AGENT_OPENCODE_SOURCE=fork cargo test --workspace --locked
 ```
+
+## Wave 3 gate
+
+Wave 3 passes the full §14 gate except the same two inherited baseline failures. Dependency
+installation made no changes, the pinned OpenCode 1.18.23 sidecar verified, formatting and
+workspace clippy pass with warnings denied, and all workspace Rust tests pass (desktop 61/61;
+runtime 15 passed with one pre-existing ignored live-sidecar test). Bun checks and tests pass
+(desktop 73/73), the production build completes, and the registry, pack, performance, fuzz,
+security, SBOM, and release-metadata verifiers all pass. The inherited exceptions were rerun:
+
+- Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
+- Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by
+  PERF-13 and does not exist yet.
