@@ -5,7 +5,7 @@ use prost::Message;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,11 +14,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const BASELINE_SCHEMA_VERSION: i64 = 4;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const PROJECTION_CHECKPOINT_KIND: &str = "projection.checkpoint";
 const PROJECTION_CHECKPOINT_ID: &str = "projection.checkpoint";
 const SUPERVISOR_SNAPSHOT_KIND: &str = "agent-supervisor";
 const SUPERVISOR_RECENT_EVENT_LIMIT: usize = 100;
+const LEGACY_MEMORY_INDEX_KIND: &str = "memory-index";
+const LEGACY_MEMORY_SYSTEM_KIND: &str = "memory-system-v2";
+const MEMORY_MODEL_KIND: &str = "memory-model-v1";
+const MEMORY_SYSTEM_METADATA_KIND: &str = "memory-system-metadata-v3";
 
 /// Storage failure with enough context for diagnostics and recovery.
 #[derive(Debug, Error)]
@@ -29,6 +33,8 @@ pub enum StorageError {
     Decode(#[from] prost::DecodeError),
     #[error("stored migration payload is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("stored memory row is invalid: {0}")]
+    Memory(#[from] personal_agent_memory::MemoryError),
     #[error("SQLCipher support is unavailable in this build")]
     SqlCipherUnavailable,
     #[error("event schema version {0} is not supported")]
@@ -54,6 +60,16 @@ pub enum StorageError {
     UnsupportedDatabaseSchema(i64),
     #[error("a file-backed database is required to back up schema version {0} before migration")]
     MigrationBackupRequired(i64),
+    #[error("memory {id} belongs to profile {existing_profile}, not {requested_profile}")]
+    MemoryProfileCollision {
+        id: String,
+        existing_profile: String,
+        requested_profile: String,
+    },
+    #[error("stored memory row metadata disagrees with its body: {0}")]
+    MemoryRowMismatch(String),
+    #[error("stored provenance links disagree with memory row: {0}")]
+    MemoryLinksMismatch(String),
 }
 
 /// Owned encrypted store. Database access never crosses the native-core boundary.
@@ -275,6 +291,7 @@ impl EventStore {
             let next_version = migrated_version + 1;
             match next_version {
                 5 => migrate_to_v5(&tx)?,
+                6 => migrate_to_v6(&tx)?,
                 _ => return Err(StorageError::UnsupportedDatabaseSchema(migrated_version)),
             }
             migrated_version = next_version;
@@ -915,7 +932,7 @@ impl EventStore {
         load_snapshot(&self.connection, "automation-scheduler", profile_id)
     }
 
-    /// Atomically persist the provenance-first memory index and vectors.
+    /// Atomically synchronize independently writable memory/vector rows.
     ///
     /// # Errors
     /// Returns JSON or database errors.
@@ -924,10 +941,25 @@ impl EventStore {
         profile_id: &str,
         snapshot: &personal_agent_memory::MemoryStore,
     ) -> Result<(), StorageError> {
-        save_snapshot(&mut self.connection, "memory-index", profile_id, snapshot)
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        sync_memory_rows(&tx, profile_id, snapshot)?;
+        save_snapshot_in_transaction(
+            &tx,
+            MEMORY_MODEL_KIND,
+            profile_id,
+            &snapshot.embedding_model,
+        )?;
+        tx.execute(
+            "DELETE FROM runtime_snapshots WHERE kind=?1 AND id=?2",
+            params![LEGACY_MEMORY_INDEX_KIND, profile_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
-    /// Load the memory snapshot for a profile; absence is `Ok(None)`.
+    /// Load row-backed memory state for a profile; absence is `Ok(None)`.
     ///
     /// # Errors
     /// Returns JSON or database errors.
@@ -935,10 +967,10 @@ impl EventStore {
         &self,
         profile_id: &str,
     ) -> Result<Option<personal_agent_memory::MemoryStore>, StorageError> {
-        load_snapshot(&self.connection, "memory-index", profile_id)
+        load_memory_store(&self.connection, profile_id)
     }
 
-    /// Atomically persist the complete namespaced memory system.
+    /// Atomically synchronize memory rows plus the smaller namespace/style/project metadata.
     ///
     /// # Errors
     /// Returns JSON or database errors.
@@ -947,15 +979,35 @@ impl EventStore {
         profile_id: &str,
         snapshot: &personal_agent_memory::PersistentMemory,
     ) -> Result<(), StorageError> {
-        save_snapshot(
-            &mut self.connection,
-            "memory-system-v2",
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        sync_memory_rows(&tx, profile_id, &snapshot.store)?;
+        save_snapshot_in_transaction(
+            &tx,
+            MEMORY_MODEL_KIND,
             profile_id,
-            snapshot,
-        )
+            &snapshot.store.embedding_model,
+        )?;
+        save_snapshot_in_transaction(
+            &tx,
+            MEMORY_SYSTEM_METADATA_KIND,
+            profile_id,
+            &snapshot.storage_metadata(),
+        )?;
+        tx.execute(
+            "DELETE FROM runtime_snapshots WHERE kind IN (?1,?2) AND id=?3",
+            params![
+                LEGACY_MEMORY_INDEX_KIND,
+                LEGACY_MEMORY_SYSTEM_KIND,
+                profile_id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
-    /// Load the complete namespaced memory system; absence is `Ok(None)`.
+    /// Load the row-backed namespaced memory system; absence is `Ok(None)`.
     ///
     /// # Errors
     /// Returns JSON or database errors.
@@ -963,7 +1015,18 @@ impl EventStore {
         &self,
         profile_id: &str,
     ) -> Result<Option<personal_agent_memory::PersistentMemory>, StorageError> {
-        load_snapshot(&self.connection, "memory-system-v2", profile_id)
+        let metadata = load_snapshot::<personal_agent_memory::PersistentMemoryMetadata>(
+            &self.connection,
+            MEMORY_SYSTEM_METADATA_KIND,
+            profile_id,
+        )?;
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let store = load_memory_store(&self.connection, profile_id)?.unwrap_or_default();
+        Ok(Some(
+            personal_agent_memory::PersistentMemory::from_storage_parts(store, metadata),
+        ))
     }
 
     /// Persist an application-owned encrypted runtime snapshot.
@@ -1330,6 +1393,16 @@ fn migrate_to_v5(tx: &Transaction<'_>) -> Result<(), StorageError> {
     tx.execute(
         "INSERT INTO schema_migrations(version, applied_at)
          VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        [5_i64],
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v6(tx: &Transaction<'_>) -> Result<(), StorageError> {
+    migrate_legacy_memory_snapshots(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version, applied_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         [SCHEMA_VERSION],
     )?;
     Ok(())
@@ -1506,6 +1579,249 @@ fn supervisor_activity(
         }),
         timestamp: event.wall_clock_timestamp.clone(),
     }
+}
+
+fn sync_memory_rows(
+    connection: &Connection,
+    profile_id: &str,
+    snapshot: &personal_agent_memory::MemoryStore,
+) -> Result<(), StorageError> {
+    let rows = snapshot
+        .storage_rows()
+        .into_iter()
+        .map(|row| {
+            let id = row.id().to_string();
+            let trust = row.trust_label().to_owned();
+            let body = serde_json::to_string(&row)?;
+            Ok((id, (trust, body, row)))
+        })
+        .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
+
+    let existing = {
+        let mut statement = connection.prepare(
+            "SELECT id, trust, body_json FROM memories
+             WHERE profile_id=?1
+               AND trust IN (
+                 'trusted_user','reviewed_inference','proposed_inference',
+                 'background_observation','recalled','rejected'
+               )
+             ORDER BY id",
+        )?;
+        statement
+            .query_map([profile_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()?
+    };
+
+    for stale_id in existing.keys().filter(|id| !rows.contains_key(*id)) {
+        connection.execute("DELETE FROM memory_links WHERE memory_id=?1", [stale_id])?;
+        connection.execute(
+            "DELETE FROM memories WHERE id=?1 AND profile_id=?2",
+            params![stale_id, profile_id],
+        )?;
+    }
+
+    for (id, (trust, body, row)) in rows {
+        let changed = match existing.get(&id) {
+            Some((stored_trust, stored_body)) if stored_trust == &trust && stored_body == &body => {
+                false
+            }
+            Some(_) => {
+                connection.execute(
+                    "UPDATE memories SET trust=?1, body_json=?2 WHERE id=?3 AND profile_id=?4",
+                    params![trust, body, id, profile_id],
+                )?;
+                true
+            }
+            None => {
+                let existing_profile = connection
+                    .query_row(
+                        "SELECT profile_id FROM memories WHERE id=?1",
+                        [&id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(existing_profile) = existing_profile {
+                    return Err(StorageError::MemoryProfileCollision {
+                        id,
+                        existing_profile,
+                        requested_profile: profile_id.to_owned(),
+                    });
+                }
+                connection.execute(
+                    "INSERT INTO memories(id,profile_id,trust,body_json) VALUES (?1,?2,?3,?4)",
+                    params![id, profile_id, trust, body],
+                )?;
+                true
+            }
+        };
+        if changed {
+            connection.execute("DELETE FROM memory_links WHERE memory_id=?1", [&id])?;
+            for source_event_id in row.source_event_ids() {
+                connection.execute(
+                    "INSERT OR IGNORE INTO memory_links(memory_id,source_event_id) VALUES (?1,?2)",
+                    params![id, source_event_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_memory_store(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<Option<personal_agent_memory::MemoryStore>, StorageError> {
+    let embedding_model = load_snapshot::<personal_agent_memory::EmbeddingModel>(
+        connection,
+        MEMORY_MODEL_KIND,
+        profile_id,
+    )?;
+    let stored_rows = {
+        let mut statement = connection.prepare(
+            "SELECT id, trust, body_json FROM memories
+             WHERE profile_id=?1
+               AND trust IN (
+                 'trusted_user','reviewed_inference','proposed_inference',
+                 'background_observation','recalled','rejected'
+               )
+             ORDER BY id",
+        )?;
+        statement
+            .query_map([profile_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if embedding_model.is_none() && stored_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rows = Vec::with_capacity(stored_rows.len());
+    for (stored_id, stored_trust, body) in stored_rows {
+        let row: personal_agent_memory::MemoryStorageRow = serde_json::from_str(&body)?;
+        if row.id().to_string() != stored_id || row.trust_label() != stored_trust {
+            return Err(StorageError::MemoryRowMismatch(stored_id));
+        }
+        let stored_links = {
+            let mut statement = connection.prepare(
+                "SELECT source_event_id FROM memory_links WHERE memory_id=?1 ORDER BY source_event_id",
+            )?;
+            statement
+                .query_map([&stored_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
+        let expected_links = row
+            .source_event_ids()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if stored_links != expected_links {
+            return Err(StorageError::MemoryLinksMismatch(stored_id));
+        }
+        rows.push(row);
+    }
+    let store = personal_agent_memory::MemoryStore::from_storage_rows(
+        embedding_model.unwrap_or_default(),
+        rows,
+    )?;
+    Ok(Some(store))
+}
+
+fn save_snapshot_in_transaction<T: serde::Serialize>(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    snapshot: &T,
+) -> Result<(), StorageError> {
+    let body = serde_json::to_string(snapshot)?;
+    connection.execute(
+        "INSERT INTO runtime_snapshots(kind,id,body_json,updated_at)
+         VALUES (?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(kind,id) DO UPDATE SET
+           body_json=excluded.body_json,
+           updated_at=excluded.updated_at
+         WHERE runtime_snapshots.body_json <> excluded.body_json",
+        params![kind, id, body],
+    )?;
+    Ok(())
+}
+
+fn migrate_legacy_memory_snapshots(connection: &Connection) -> Result<(), StorageError> {
+    let legacy_systems = {
+        let mut statement = connection.prepare(
+            "SELECT id, body_json, updated_at FROM runtime_snapshots
+             WHERE kind=?1 ORDER BY id",
+        )?;
+        statement
+            .query_map([LEGACY_MEMORY_SYSTEM_KIND], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let legacy_indexes = {
+        let mut statement = connection.prepare(
+            "SELECT id, body_json, updated_at FROM runtime_snapshots
+             WHERE kind=?1 ORDER BY id",
+        )?;
+        statement
+            .query_map([LEGACY_MEMORY_INDEX_KIND], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut stores = BTreeMap::<String, (String, personal_agent_memory::MemoryStore)>::new();
+    for (profile_id, body, updated_at) in legacy_systems {
+        let system: personal_agent_memory::PersistentMemory = serde_json::from_str(&body)?;
+        let (store, metadata) = system.into_storage_parts();
+        save_snapshot_in_transaction(
+            connection,
+            MEMORY_SYSTEM_METADATA_KIND,
+            &profile_id,
+            &metadata,
+        )?;
+        stores.insert(profile_id, (updated_at, store));
+    }
+    for (profile_id, body, updated_at) in legacy_indexes {
+        let store: personal_agent_memory::MemoryStore = serde_json::from_str(&body)?;
+        let replace = stores
+            .get(&profile_id)
+            .is_none_or(|(stored_at, _)| updated_at.as_str() >= stored_at.as_str());
+        if replace {
+            stores.insert(profile_id, (updated_at, store));
+        }
+    }
+    for (profile_id, (_, store)) in stores {
+        sync_memory_rows(connection, &profile_id, &store)?;
+        save_snapshot_in_transaction(
+            connection,
+            MEMORY_MODEL_KIND,
+            &profile_id,
+            &store.embedding_model,
+        )?;
+    }
+    connection.execute(
+        "DELETE FROM runtime_snapshots WHERE kind IN (?1,?2)",
+        params![LEGACY_MEMORY_INDEX_KIND, LEGACY_MEMORY_SYSTEM_KIND],
+    )?;
+    Ok(())
 }
 
 fn save_snapshot<T: serde::Serialize>(
@@ -1984,10 +2300,10 @@ mod tests {
     }
 
     #[test]
-    fn v4_database_is_backed_up_then_migrated_to_v5_with_data_intact() {
+    fn v4_database_is_backed_up_then_migrated_to_v6_with_data_intact() {
         let temp = tempfile::tempdir().expect("temp");
         let database = temp.path().join("profile.db");
-        let backup = migration_backup_path(&database, 4, 5);
+        let backup = migration_backup_path(&database, 4, SCHEMA_VERSION);
         let key = SecretString::from("test-only-key".to_owned());
         let event = EventEnvelope::new(
             1,
@@ -2022,7 +2338,7 @@ mod tests {
             tx.commit().expect("commit v4 database");
         }
 
-        let migrated = EventStore::open(&database, &key).expect("migrate v4 to v5");
+        let migrated = EventStore::open(&database, &key).expect("migrate v4 to v6");
         assert!(backup.is_file(), "pre-migration backup was not created");
         #[cfg(unix)]
         {
@@ -2046,12 +2362,12 @@ mod tests {
         let migration_rows: i64 = migrated
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (4, 5)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (4, 5, 6)",
                 [],
                 |row| row.get(0),
             )
             .expect("migration rows");
-        assert_eq!(migration_rows, 2);
+        assert_eq!(migration_rows, 3);
         let usage_index: i64 = migrated
             .connection
             .query_row(
@@ -2277,6 +2593,211 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn write_one_memory_inserts_one_row_without_full_store_rewrite() {
+        let mut store = EventStore::open_in_memory(&SecretString::from("test-only-key".to_owned()))
+            .expect("store");
+        let mut memory = personal_agent_memory::PersistentMemory::default();
+        let namespace = personal_agent_memory::MemoryNamespace::Profile("default".into());
+        let first = personal_agent_memory::Memory::explicit_user(
+            "Atlas uses Rust",
+            personal_agent_memory::MemoryTier::Project,
+            "event-1",
+        );
+        memory
+            .remember(namespace.clone(), first, None)
+            .expect("first memory");
+        store
+            .save_persistent_memory_snapshot("default", &memory)
+            .expect("seed one row");
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TABLE memory_write_audit(action TEXT NOT NULL);
+                 CREATE TEMP TRIGGER memory_insert_audit AFTER INSERT ON memories BEGIN
+                   INSERT INTO memory_write_audit(action) VALUES ('insert');
+                 END;
+                 CREATE TEMP TRIGGER memory_update_audit AFTER UPDATE ON memories BEGIN
+                   INSERT INTO memory_write_audit(action) VALUES ('update');
+                 END;
+                 CREATE TEMP TRIGGER memory_delete_audit AFTER DELETE ON memories BEGIN
+                   INSERT INTO memory_write_audit(action) VALUES ('delete');
+                 END;",
+            )
+            .expect("write audit triggers");
+
+        let second = personal_agent_memory::Memory::explicit_user(
+            "The workspace is private",
+            personal_agent_memory::MemoryTier::Semantic,
+            "event-2",
+        );
+        let second_id = second.id;
+        memory
+            .remember(namespace, second, None)
+            .expect("second memory");
+        store
+            .save_persistent_memory_snapshot("default", &memory)
+            .expect("write one memory");
+
+        let actions = store
+            .connection
+            .prepare("SELECT action, COUNT(*) FROM memory_write_audit GROUP BY action")
+            .expect("audit query")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("audit rows")
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .expect("audit map");
+        assert_eq!(actions.get("insert"), Some(&1));
+        assert_eq!(actions.get("update"), None);
+        assert_eq!(actions.get("delete"), None);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE profile_id='default'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("memory row count"),
+            2
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id=?1",
+                    [second_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("new row count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_snapshots WHERE kind IN (?1,?2)",
+                    params![LEGACY_MEMORY_INDEX_KIND, LEGACY_MEMORY_SYSTEM_KIND],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy full-store rewrites"),
+            0
+        );
+        assert_eq!(
+            store
+                .memory_snapshot("default")
+                .expect("load rows")
+                .expect("memory exists"),
+            memory.store
+        );
+    }
+
+    #[test]
+    fn v5_memory_blobs_migrate_to_rows_on_first_open() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("memory-v5.db");
+        let backup = migration_backup_path(&database, 5, SCHEMA_VERSION);
+        let key = SecretString::from("test-only-key".to_owned());
+        let namespace = personal_agent_memory::MemoryNamespace::Profile("default".into());
+        let remembered = personal_agent_memory::Memory::explicit_user(
+            "Migration keeps row provenance",
+            personal_agent_memory::MemoryTier::Semantic,
+            "legacy-event",
+        );
+        let imported_body = serde_json::to_string(&json!({
+            "origin": "legacy-migration",
+            "markdown": "personal history that must survive"
+        }))
+        .expect("legacy imported body");
+        {
+            let mut legacy = personal_agent_memory::PersistentMemory::default();
+            legacy
+                .remember(namespace.clone(), remembered.clone(), None)
+                .expect("legacy memory");
+            let mut store = EventStore::open(&database, &key).expect("create database");
+            store
+                .save_runtime_snapshot(LEGACY_MEMORY_SYSTEM_KIND, "default", &legacy)
+                .expect("legacy memory system");
+            store
+                .save_runtime_snapshot(LEGACY_MEMORY_INDEX_KIND, "default", &legacy.store)
+                .expect("legacy memory index");
+            store
+                .connection
+                .execute(
+                    "INSERT INTO memories(id,profile_id,trust,body_json)
+                     VALUES ('legacy-imported-record','default','legacy-imported',?1)",
+                    [&imported_body],
+                )
+                .expect("coexisting legacy import row");
+            store
+                .connection
+                .execute("DELETE FROM schema_migrations WHERE version=6", [])
+                .expect("remove v6 marker");
+            store
+                .connection
+                .pragma_update(None, "user_version", 5_i64)
+                .expect("mark v5");
+        }
+
+        let mut migrated = EventStore::open(&database, &key).expect("first v6 open");
+        assert!(backup.is_file(), "pre-migration backup was not created");
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id=?1",
+                    [remembered.id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("migrated memories"),
+            1
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_links WHERE memory_id=?1",
+                    [remembered.id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("migrated links"),
+            1
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_snapshots WHERE kind IN (?1,?2)",
+                    params![LEGACY_MEMORY_INDEX_KIND, LEGACY_MEMORY_SYSTEM_KIND],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("removed legacy blobs"),
+            0
+        );
+        let persistent = migrated
+            .persistent_memory_snapshot("default")
+            .expect("load migrated system")
+            .expect("migrated system exists");
+        assert_eq!(persistent.export_namespace(&namespace), vec![remembered]);
+        migrated
+            .save_persistent_memory_snapshot("default", &persistent)
+            .expect("post-migration row save");
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT trust,body_json FROM memories WHERE id='legacy-imported-record'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("legacy imported row survives"),
+            ("legacy-imported".to_owned(), imported_body)
+        );
     }
 
     #[test]

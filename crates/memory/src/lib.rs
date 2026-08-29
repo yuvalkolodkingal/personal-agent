@@ -82,6 +82,10 @@ pub enum MemoryError {
     MissingNamespace,
     #[error("project graph node does not exist: {0}")]
     MissingProjectNode(Uuid),
+    #[error("stored memory row appears more than once: {0}")]
+    DuplicateStorageRow(Uuid),
+    #[error("stored memory row has vector provenance without a vector")]
+    UnexpectedEmbeddingProvenance,
 }
 
 /// Explicit isolation boundary for global, profile, project, and conversation memory.
@@ -157,6 +161,54 @@ pub struct Memory {
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub conflicts_with: Vec<Uuid>,
+}
+
+/// One independently durable memory row. Active facts carry their optional
+/// vector beside the fact while rejected proposals remain as content-free
+/// tombstones for audit and deduplication.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemoryStorageRow {
+    Active {
+        memory: Memory,
+        embedding: Option<Vec<f32>>,
+        embedding_model_id: Option<String>,
+    },
+    Rejected {
+        id: Uuid,
+    },
+}
+
+impl MemoryStorageRow {
+    #[must_use]
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Active { memory, .. } => memory.id,
+            Self::Rejected { id } => *id,
+        }
+    }
+
+    #[must_use]
+    pub fn trust_label(&self) -> &'static str {
+        match self {
+            Self::Active { memory, .. } => match memory.trust {
+                MemoryTrust::TrustedUser => "trusted_user",
+                MemoryTrust::ReviewedInference => "reviewed_inference",
+                MemoryTrust::ProposedInference => "proposed_inference",
+                MemoryTrust::BackgroundObservation => "background_observation",
+                MemoryTrust::Recalled => "recalled",
+            },
+            Self::Rejected { .. } => "rejected",
+        }
+    }
+
+    #[must_use]
+    pub fn source_event_ids(&self) -> &[String] {
+        match self {
+            Self::Active { memory, .. } => &memory.source_event_ids,
+            Self::Rejected { .. } => &[],
+        }
+    }
 }
 
 impl Memory {
@@ -1005,6 +1057,70 @@ impl MemoryStore {
         self.memories.values().cloned().collect()
     }
 
+    /// Materialize independently writable rows for encrypted storage.
+    #[must_use]
+    pub fn storage_rows(&self) -> Vec<MemoryStorageRow> {
+        let mut rows = self
+            .memories
+            .values()
+            .map(|memory| MemoryStorageRow::Active {
+                memory: memory.clone(),
+                embedding: self.embeddings.get(&memory.id).cloned(),
+                embedding_model_id: self
+                    .embeddings
+                    .contains_key(&memory.id)
+                    .then(|| self.stored_embedding_model_id(memory.id).to_owned()),
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.rejected
+                .iter()
+                .copied()
+                .map(|id| MemoryStorageRow::Rejected { id }),
+        );
+        rows.sort_by_key(MemoryStorageRow::id);
+        rows
+    }
+
+    /// Rebuild the in-memory recall store from independently persisted rows.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate IDs or malformed vector provenance.
+    pub fn from_storage_rows(
+        embedding_model: EmbeddingModel,
+        rows: Vec<MemoryStorageRow>,
+    ) -> Result<Self, MemoryError> {
+        let mut store = Self::new(embedding_model);
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let id = row.id();
+            if !seen.insert(id) {
+                return Err(MemoryError::DuplicateStorageRow(id));
+            }
+            match row {
+                MemoryStorageRow::Active {
+                    memory,
+                    embedding,
+                    embedding_model_id,
+                } => match (embedding, embedding_model_id) {
+                    (Some(embedding), Some(model_id)) => {
+                        store.upsert_labeled(memory, Some(embedding), &model_id)?;
+                    }
+                    (None, None) => store.upsert(memory, None)?,
+                    (Some(_), None) => return Err(MemoryError::MissingEmbeddingProvenance),
+                    (None, Some(_)) => {
+                        return Err(MemoryError::UnexpectedEmbeddingProvenance);
+                    }
+                },
+                MemoryStorageRow::Rejected { id } => {
+                    store.rejected.insert(id);
+                }
+            }
+        }
+        Ok(store)
+    }
+
     /// Delete one memory and remove its links from surviving records.
     ///
     /// # Errors
@@ -1032,6 +1148,17 @@ impl Default for MemoryStore {
     fn default() -> Self {
         Self::new(EmbeddingModel::default())
     }
+}
+
+/// Non-fact state for the namespace-aware memory system. Keeping this metadata
+/// separate prevents a single fact mutation from serializing every memory and
+/// vector again.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PersistentMemoryMetadata {
+    scopes: BTreeMap<Uuid, MemoryNamespace>,
+    style: BTreeMap<Uuid, StylePreference>,
+    project_nodes: BTreeMap<Uuid, ProjectNode>,
+    project_relations: Vec<ProjectRelation>,
 }
 
 /// Namespace-aware memory, writing style, and project graph index. This wraps
@@ -1066,6 +1193,44 @@ impl PersistentMemory {
             style: BTreeMap::new(),
             project_nodes: BTreeMap::new(),
             project_relations: Vec::new(),
+        }
+    }
+
+    /// Split row-backed facts from the smaller namespace/style/project metadata.
+    #[must_use]
+    pub fn into_storage_parts(self) -> (MemoryStore, PersistentMemoryMetadata) {
+        (
+            self.store,
+            PersistentMemoryMetadata {
+                scopes: self.scopes,
+                style: self.style,
+                project_nodes: self.project_nodes,
+                project_relations: self.project_relations,
+            },
+        )
+    }
+
+    /// Clone the non-fact metadata persisted separately from memory rows.
+    #[must_use]
+    pub fn storage_metadata(&self) -> PersistentMemoryMetadata {
+        PersistentMemoryMetadata {
+            scopes: self.scopes.clone(),
+            style: self.style.clone(),
+            project_nodes: self.project_nodes.clone(),
+            project_relations: self.project_relations.clone(),
+        }
+    }
+
+    /// Reconstitute the namespace-aware system from row-backed facts and its
+    /// independently persisted metadata.
+    #[must_use]
+    pub fn from_storage_parts(store: MemoryStore, metadata: PersistentMemoryMetadata) -> Self {
+        Self {
+            store,
+            scopes: metadata.scopes,
+            style: metadata.style,
+            project_nodes: metadata.project_nodes,
+            project_relations: metadata.project_relations,
         }
     }
 
@@ -1431,6 +1596,32 @@ mod tests {
         assert_eq!(results[0].memory.id, exact.id);
         store.delete(related.id).expect("delete");
         assert!(store.get(exact.id).unwrap().conflicts_with.is_empty());
+    }
+
+    #[test]
+    fn independently_persisted_rows_roundtrip_vectors_and_rejection_tombstones() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 2,
+            ..EmbeddingModel::default()
+        });
+        let active = Memory::explicit_user("Atlas uses Rust", MemoryTier::Project, "event-1");
+        store
+            .upsert_labeled(active, Some(vec![1.0, 0.0]), E5_SMALL_INT8_MODEL_ID)
+            .expect("active memory");
+        let rejected = Memory::proposed(
+            "Atlas might use Python",
+            MemoryTier::Project,
+            vec!["event-2".into()],
+            0.4,
+        );
+        let rejected_id = rejected.id;
+        store.upsert(rejected, None).expect("proposal");
+        store.reject(rejected_id).expect("reject proposal");
+
+        let restored =
+            MemoryStore::from_storage_rows(store.embedding_model.clone(), store.storage_rows())
+                .expect("restore rows");
+        assert_eq!(restored, store);
     }
 
     #[test]

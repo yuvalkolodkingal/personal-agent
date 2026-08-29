@@ -26,8 +26,9 @@ pub use conversation::{
     ListeningMode, MessageDispatch, MicrophonePrivacy, ModelSelection, StopEffects,
 };
 pub use personal_agent_memory::{
-    FeatureHashEmbedder, Memory, MemoryNamespace, MemoryStore, MemoryTier, MemoryTrust,
-    PersistentMemory, ProjectNode, ProjectRelation, RecallResult, StylePreference, TextEmbedder,
+    FeatureHashEmbedder, Memory, MemoryNamespace, MemoryStorageRow, MemoryStore, MemoryTier,
+    MemoryTrust, PersistentMemory, PersistentMemoryMetadata, ProjectNode, ProjectRelation,
+    RecallResult, StylePreference, TextEmbedder,
 };
 pub use release::{
     ExportDisposition, PersonalDataDisposition, ReleaseArtifact, ReleaseChannel, ReleaseError,
@@ -356,8 +357,6 @@ impl ProfileState {
     ) -> Result<(), CoreError> {
         self.store
             .save_persistent_memory_snapshot(&self.profile_id, memory)?;
-        self.store
-            .save_memory_snapshot(&self.profile_id, &memory.store)?;
         Ok(())
     }
 
