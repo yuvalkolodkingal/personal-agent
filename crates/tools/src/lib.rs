@@ -497,7 +497,11 @@ fn is_base64_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
     use personal_agent_policy::{Effect, Idempotency, Risk};
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     struct ReadTool {
         descriptor: ToolDescriptor,
     }
@@ -628,6 +632,214 @@ mod tests {
         }
     }
 
+    fn fuzz_padding(state: &mut u64) -> String {
+        let length = usize::try_from(*state & 31).unwrap_or_default();
+        (0..length)
+            .map(|_| {
+                *state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'a' + u8::try_from((*state >> 32) % 26).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn redaction_fuzz_keeps_mutated_secret_shapes_out_of_nested_output() {
+        let secret_shapes = [
+            ["AK", "IA1234567890ABCDEF"].concat(),
+            ["s", "k-abcdefghijklmnopqrst"].concat(),
+            ["gh", "p_fixture-token"].concat(),
+            ["github_", "pat_fixture-token"].concat(),
+            ["xox", "b-fixture"].concat(),
+            ["ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"].concat(),
+            [
+                "-----BE",
+                "GIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----",
+            ]
+            .concat(),
+            ["token=", "0123456789abcdef0123456789abcdef"].concat(),
+            ["secret: ", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"].concat(),
+            ["password = ", "abcd_EFGH-ijklmnop_QRST-uvwxyz123456"].concat(),
+        ];
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+
+        for iteration in 0..4_096 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let secret =
+                &secret_shapes[usize::try_from(state).unwrap_or_default() % secret_shapes.len()];
+            let prefix = fuzz_padding(&mut state);
+            let suffix = fuzz_padding(&mut state);
+            let embedded = format!("{prefix}{secret}{suffix}");
+            let value = match state & 3 {
+                0 => Value::String(embedded),
+                1 => serde_json::json!([{"ordinary": embedded}]),
+                2 => serde_json::json!({"outer":{"inner":embedded}}),
+                _ => serde_json::json!({"items":[0, true, {"value":embedded}]}),
+            };
+
+            let serialized = serde_json::to_string(&redact_secrets(value)).expect("serialize");
+            assert!(
+                !serialized.contains(secret),
+                "secret survived fuzz iteration {iteration}: {secret}"
+            );
+            assert!(serialized.contains("[REDACTED]"));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CheckpointBehavior {
+        Present,
+        Missing,
+        Error,
+    }
+
+    struct CheckpointProbeTool {
+        descriptor: ToolDescriptor,
+        behavior: CheckpointBehavior,
+        checkpoint_calls: Arc<AtomicUsize>,
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolImplementation for CheckpointProbeTool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        fn validate_input(&self, input: &Value) -> Result<(), ToolError> {
+            if input.is_object() {
+                Ok(())
+            } else {
+                Err(ToolError::InvalidInput("object required".into()))
+            }
+        }
+
+        async fn checkpoint(&self, _: &ToolCall) -> Result<Option<String>, ToolError> {
+            self.checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                CheckpointBehavior::Present => Ok(Some("before".into())),
+                CheckpointBehavior::Missing => Ok(None),
+                CheckpointBehavior::Error => {
+                    Err(ToolError::Execution("checkpoint fixture failed".into()))
+                }
+            }
+        }
+
+        async fn execute(&self, _: &ToolCall) -> Result<Value, ToolError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"value":"after"}))
+        }
+
+        async fn verify(&self, _: &ToolCall, _: &Value) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    fn checkpoint_descriptor() -> ToolDescriptor {
+        ToolDescriptor {
+            id: "file.fixture.checkpoint".into(),
+            version: "1.0.0".into(),
+            description: "checkpoint fixture".into(),
+            scopes: ["file.write".into()].into(),
+            risk: Risk::Reversible,
+            effect: Effect::LocalWrite,
+            idempotency: Idempotency::WithKey,
+            reversible: true,
+            zones_read: [DataZone::TrustedLocalState].into(),
+            zones_written: [DataZone::TrustedLocalState].into(),
+            user_presence: false,
+        }
+    }
+
+    fn checkpoint_call(checkpoint_available: bool) -> ToolCall {
+        ToolCall {
+            call_id: Uuid::now_v7(),
+            goal_id: Uuid::now_v7(),
+            task_id: None,
+            tool_id: "file.fixture.checkpoint".into(),
+            target: "registered-workspace/file".into(),
+            input: serde_json::json!({}),
+            input_zones: [DataZone::UserInstruction].into(),
+            granted_scopes: ["file.write".into()].into(),
+            estimated_cost_usd: 0.0,
+            background: false,
+            user_present: true,
+            checkpoint_available,
+        }
+    }
+
+    fn checkpoint_gateway(
+        behavior: CheckpointBehavior,
+    ) -> (ToolGateway, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let mut gateway = ToolGateway::new(4_096);
+        gateway.register(Arc::new(CheckpointProbeTool {
+            descriptor: checkpoint_descriptor(),
+            behavior,
+            checkpoint_calls: Arc::clone(&checkpoint_calls),
+            execute_calls: Arc::clone(&execute_calls),
+        }));
+        (gateway, checkpoint_calls, execute_calls)
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_denies_reversible_mutation_without_checkpoint_coverage() {
+        let (mut gateway, checkpoint_calls, execute_calls) =
+            checkpoint_gateway(CheckpointBehavior::Present);
+
+        assert!(
+            matches!(gateway.call(checkpoint_call(false), &[]).await, Err(ToolError::Denied(message)) if message.contains("checkpoint"))
+        );
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+        assert!(gateway.audits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_rejects_missing_required_checkpoint_before_execution() {
+        let (mut gateway, checkpoint_calls, execute_calls) =
+            checkpoint_gateway(CheckpointBehavior::Missing);
+
+        assert!(
+            matches!(gateway.call(checkpoint_call(true), &[]).await, Err(ToolError::Execution(message)) if message.contains("checkpoint implementation returned no checkpoint"))
+        );
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+        assert!(gateway.audits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_propagates_checkpoint_errors_before_execution() {
+        let (mut gateway, checkpoint_calls, execute_calls) =
+            checkpoint_gateway(CheckpointBehavior::Error);
+
+        assert!(
+            matches!(gateway.call(checkpoint_call(true), &[]).await, Err(ToolError::Execution(message)) if message == "checkpoint fixture failed")
+        );
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+        assert!(gateway.audits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_executes_only_after_receiving_required_checkpoint() {
+        let (mut gateway, checkpoint_calls, execute_calls) =
+            checkpoint_gateway(CheckpointBehavior::Present);
+
+        let output = gateway
+            .call(checkpoint_call(true), &[])
+            .await
+            .expect("checkpointed call");
+        assert_eq!(output.rollback_id.as_deref(), Some("before"));
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.audits().len(), 1);
+    }
+
     struct ReversibleTool {
         descriptor: ToolDescriptor,
         state: Arc<Mutex<String>>,
@@ -742,7 +954,7 @@ mod tests {
             zones_written: [DataZone::TrustedLocalState].into(),
             user_presence: false,
         };
-        let mut gateway = ToolGateway::new(4096);
+        let mut gateway = ToolGateway::new(4_096);
         gateway.register(Arc::new(ReadTool { descriptor }));
         let call = ToolCall {
             call_id: Uuid::now_v7(),

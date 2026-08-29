@@ -212,6 +212,32 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+
+    const EFFECTS: [Effect; 7] = [
+        Effect::Observe,
+        Effect::LocalWrite,
+        Effect::ExternalWrite,
+        Effect::Communication,
+        Effect::Commerce,
+        Effect::Security,
+        Effect::Power,
+    ];
+    const RISKS: [Risk; 4] = [
+        Risk::Read,
+        Risk::Reversible,
+        Risk::Consequential,
+        Risk::Irreversible,
+    ];
+    const ZONES: [DataZone; 7] = [
+        DataZone::UserInstruction,
+        DataZone::TrustedLocalState,
+        DataZone::PrivateMemory,
+        DataZone::Secret,
+        DataZone::ConnectorData,
+        DataZone::UntrustedContent,
+        DataZone::AgentGenerated,
+    ];
 
     fn descriptor(effect: Effect, risk: Risk) -> ToolDescriptor {
         ToolDescriptor {
@@ -229,23 +255,41 @@ mod tests {
         }
     }
 
+    fn context<'a>(
+        goal_id: Uuid,
+        task_id: Option<Uuid>,
+        tool: &'a ToolDescriptor,
+        target: &'a str,
+        active_input_zones: &'a BTreeSet<DataZone>,
+        granted_scopes: &'a BTreeSet<String>,
+    ) -> CallContext<'a> {
+        CallContext {
+            goal_id,
+            task_id,
+            tool,
+            target,
+            active_input_zones,
+            granted_scopes,
+            estimated_cost_usd: 0.0,
+            background: false,
+            user_present: true,
+            checkpoint_available: true,
+        }
+    }
+
     #[test]
     fn communications_always_ask_without_consent() {
         let tool = descriptor(Effect::Communication, Risk::Consequential);
         let scopes = ["mail.send".into()].into();
         let zones = [DataZone::UserInstruction].into();
-        let call = CallContext {
-            goal_id: Uuid::now_v7(),
-            task_id: None,
-            tool: &tool,
-            target: "alice@example.com",
-            active_input_zones: &zones,
-            granted_scopes: &scopes,
-            estimated_cost_usd: 0.0,
-            background: false,
-            user_present: true,
-            checkpoint_available: true,
-        };
+        let call = context(
+            Uuid::now_v7(),
+            None,
+            &tool,
+            "alice@example.com",
+            &zones,
+            &scopes,
+        );
         assert!(matches!(
             PolicyEngine.decide(&call, &[]),
             PolicyDecision::Ask { .. }
@@ -258,21 +302,256 @@ mod tests {
         tool.zones_read.insert(DataZone::Secret);
         let scopes = ["mail.send".into()].into();
         let zones = [DataZone::UntrustedContent].into();
-        let call = CallContext {
-            goal_id: Uuid::now_v7(),
-            task_id: None,
-            tool: &tool,
-            target: "keychain",
-            active_input_zones: &zones,
-            granted_scopes: &scopes,
-            estimated_cost_usd: 0.0,
-            background: false,
-            user_present: true,
-            checkpoint_available: true,
-        };
+        let call = context(Uuid::now_v7(), None, &tool, "keychain", &zones, &scopes);
         assert!(matches!(
             PolicyEngine.decide(&call, &[]),
             PolicyDecision::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn every_effect_risk_and_zone_combination_matches_the_documented_decision() {
+        let scopes = ["mail.send".into()].into();
+        let goal_id = Uuid::now_v7();
+        let mut checked = 0;
+
+        for effect in EFFECTS {
+            for risk in RISKS {
+                for zone_mask in 0..(1_usize << ZONES.len()) {
+                    let zones = ZONES
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, zone)| {
+                            (zone_mask & (1 << index) != 0).then_some(*zone)
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let mut tool = descriptor(effect, risk);
+                    tool.reversible = risk == Risk::Reversible;
+                    tool.zones_read.clone_from(&zones);
+                    let call = context(goal_id, None, &tool, "fixture", &zones, &scopes);
+
+                    let is_cross_zone = zones.contains(&DataZone::UntrustedContent)
+                        && (zones.contains(&DataZone::Secret)
+                            || zones.contains(&DataZone::PrivateMemory)
+                            || matches!(
+                                effect,
+                                Effect::Communication | Effect::Commerce | Effect::Security
+                            ));
+                    let is_always_confirm = matches!(
+                        effect,
+                        Effect::Communication | Effect::Commerce | Effect::Security | Effect::Power
+                    ) || matches!(
+                        risk,
+                        Risk::Consequential | Risk::Irreversible
+                    ) || (effect == Effect::ExternalWrite
+                        && !tool.reversible);
+                    let expected = if is_cross_zone {
+                        PolicyDecision::Ask {
+                            reason: "untrusted content is controlling a cross-zone action".into(),
+                        }
+                    } else if is_always_confirm {
+                        PolicyDecision::Ask {
+                            reason: "consequential effects require explicit scoped consent".into(),
+                        }
+                    } else {
+                        PolicyDecision::Allow {
+                            reason: "bounded policy permits read-only or reversible local work"
+                                .into(),
+                            consent_id: None,
+                        }
+                    };
+
+                    assert_eq!(
+                        PolicyEngine.decide(&call, &[]),
+                        expected,
+                        "effect={effect:?} risk={risk:?} zones={zones:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+
+        assert_eq!(checked, EFFECTS.len() * RISKS.len() * (1 << ZONES.len()));
+    }
+
+    #[test]
+    fn policy_gate_precedence_and_consent_cover_every_decide_branch() {
+        let goal_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let zones = [DataZone::UserInstruction].into();
+        let scopes = ["mail.send".into()].into();
+        let no_scopes = BTreeSet::new();
+        let mut tool = descriptor(Effect::LocalWrite, Risk::Reversible);
+        tool.reversible = true;
+        tool.user_presence = true;
+
+        let missing_scope = context(goal_id, Some(task_id), &tool, "draft", &zones, &no_scopes);
+        assert_eq!(
+            PolicyEngine.decide(&missing_scope, &[]),
+            PolicyDecision::Deny {
+                reason: "tool requires capability scopes not granted to this task".into(),
+            }
+        );
+
+        let mut missing_presence = context(goal_id, Some(task_id), &tool, "draft", &zones, &scopes);
+        missing_presence.user_present = false;
+        assert_eq!(
+            PolicyEngine.decide(&missing_presence, &[]),
+            PolicyDecision::Deny {
+                reason: "this tool requires the user to be present".into(),
+            }
+        );
+
+        let mut missing_checkpoint =
+            context(goal_id, Some(task_id), &tool, "draft", &zones, &scopes);
+        missing_checkpoint.checkpoint_available = false;
+        assert_eq!(
+            PolicyEngine.decide(&missing_checkpoint, &[]),
+            PolicyDecision::Deny {
+                reason: "a checkpoint is required before the first reversible mutation".into(),
+            }
+        );
+
+        let consent_id = Uuid::now_v7();
+        let mut consequential_tool = descriptor(Effect::Communication, Risk::Consequential);
+        consequential_tool.user_presence = false;
+        let consequential_call = context(
+            goal_id,
+            Some(task_id),
+            &consequential_tool,
+            "alice@example.com",
+            &zones,
+            &scopes,
+        );
+        let grant = ConsentGrant {
+            id: consent_id,
+            goal_id,
+            task_id: Some(task_id),
+            tool_ids: [consequential_tool.id.clone()].into(),
+            effects: [consequential_tool.effect].into(),
+            target_patterns: ["alice@example.com".into()].into(),
+            expires_at: Utc::now() + Duration::hours(1),
+            maximum_calls: 1,
+            calls_used: 0,
+            cost_ceiling_usd: Some(1.0),
+            background: false,
+            revoked: false,
+        };
+        assert_eq!(
+            PolicyEngine.decide(&consequential_call, &[grant]),
+            PolicyDecision::Allow {
+                reason: "covered by scoped consent".into(),
+                consent_id: Some(consent_id),
+            }
+        );
+    }
+
+    #[test]
+    fn consent_grant_expiry_count_and_cost_boundaries_are_closed() {
+        let goal_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let tool = descriptor(Effect::Commerce, Risk::Consequential);
+        let zones = [DataZone::UserInstruction].into();
+        let scopes = ["mail.send".into()].into();
+        let mut call = context(goal_id, Some(task_id), &tool, "orders/42", &zones, &scopes);
+        call.background = true;
+        call.estimated_cost_usd = 10.0;
+        let base = ConsentGrant {
+            id: Uuid::now_v7(),
+            goal_id,
+            task_id: Some(task_id),
+            tool_ids: [tool.id.clone()].into(),
+            effects: [tool.effect].into(),
+            target_patterns: ["orders/*".into()].into(),
+            expires_at: Utc::now() + Duration::hours(1),
+            maximum_calls: 2,
+            calls_used: 1,
+            cost_ceiling_usd: Some(10.0),
+            background: true,
+            revoked: false,
+        };
+
+        assert!(base.covers(&call), "the inclusive cost ceiling must cover");
+
+        let mut expired = base.clone();
+        expired.expires_at = Utc::now() - Duration::nanoseconds(1);
+        assert!(!expired.covers(&call));
+
+        let mut at_call_limit = base.clone();
+        at_call_limit.calls_used = at_call_limit.maximum_calls;
+        assert!(!at_call_limit.covers(&call));
+
+        call.estimated_cost_usd = 10.000_001;
+        assert!(!base.covers(&call));
+        call.estimated_cost_usd = f64::NAN;
+        assert!(!base.covers(&call));
+
+        let mut unlimited_cost = base.clone();
+        unlimited_cost.cost_ceiling_usd = None;
+        call.estimated_cost_usd = f64::MAX;
+        assert!(unlimited_cost.covers(&call));
+    }
+
+    #[test]
+    fn consent_grant_rejects_every_mismatched_dimension() {
+        let goal_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let tool = descriptor(Effect::Communication, Risk::Consequential);
+        let zones = [DataZone::UserInstruction].into();
+        let scopes = ["mail.send".into()].into();
+        let mut call = context(
+            goal_id,
+            Some(task_id),
+            &tool,
+            "alice@example.com",
+            &zones,
+            &scopes,
+        );
+        let base = ConsentGrant {
+            id: Uuid::now_v7(),
+            goal_id,
+            task_id: Some(task_id),
+            tool_ids: [tool.id.clone()].into(),
+            effects: [tool.effect].into(),
+            target_patterns: ["alice@example.com".into()].into(),
+            expires_at: Utc::now() + Duration::hours(1),
+            maximum_calls: 1,
+            calls_used: 0,
+            cost_ceiling_usd: Some(1.0),
+            background: false,
+            revoked: false,
+        };
+
+        let mut variants = Vec::new();
+        let mut revoked = base.clone();
+        revoked.revoked = true;
+        variants.push(revoked);
+        let mut wrong_goal = base.clone();
+        wrong_goal.goal_id = Uuid::now_v7();
+        variants.push(wrong_goal);
+        let mut wrong_task = base.clone();
+        wrong_task.task_id = Some(Uuid::now_v7());
+        variants.push(wrong_task);
+        let mut wrong_tool = base.clone();
+        wrong_tool.tool_ids = ["other.tool".into()].into();
+        variants.push(wrong_tool);
+        let mut wrong_effect = base.clone();
+        wrong_effect.effects = [Effect::Observe].into();
+        variants.push(wrong_effect);
+        let mut wrong_target = base.clone();
+        wrong_target.target_patterns = ["bob@example.com".into()].into();
+        variants.push(wrong_target);
+        for variant in &variants {
+            assert!(!variant.covers(&call));
+        }
+
+        call.background = true;
+        assert!(!base.covers(&call));
+        call.background = false;
+        assert!(base.covers(&call));
+
+        let mut any_task = base;
+        any_task.task_id = None;
+        assert!(any_task.covers(&call));
     }
 }
