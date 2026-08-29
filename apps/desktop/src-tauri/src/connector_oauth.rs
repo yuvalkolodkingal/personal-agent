@@ -486,14 +486,33 @@ async fn await_callback(
 }
 
 async fn read_callback(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
     expected_state: &str,
 ) -> Result<SecretString, String> {
     let mut bytes = vec![0_u8; CALLBACK_LIMIT];
-    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut bytes))
-        .await
-        .map_err(|_| "OAuth callback request timed out".to_owned())?
-        .map_err(|_| "OAuth callback request could not be read".to_owned())?;
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut read = 0;
+        loop {
+            if bytes[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(read);
+            }
+            if read == CALLBACK_LIMIT {
+                return Err("OAuth callback request exceeded the 16 KiB limit".to_owned());
+            }
+            let received = stream
+                .read(&mut bytes[read..])
+                .await
+                .map_err(|_| "OAuth callback request could not be read".to_owned())?;
+            if received == 0 {
+                return Err(
+                    "OAuth callback request ended before its headers were complete".to_owned(),
+                );
+            }
+            read += received;
+        }
+    })
+    .await
+    .map_err(|_| "OAuth callback request timed out".to_owned())??;
     let request = std::str::from_utf8(&bytes[..read])
         .map_err(|_| "OAuth callback request was invalid".to_owned())?;
     let target = request
@@ -599,6 +618,22 @@ mod tests {
         let code = callback_request("/oauth/callback?code=private-code&state=expected-state")
             .await
             .unwrap();
+        assert_eq!(code.expose_secret(), "private-code");
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_accepts_request_in_one_byte_chunks() {
+        let (mut client, mut server) = tokio::io::duplex(1);
+        let request =
+            b"GET /oauth/callback?code=private-code&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let writer = tokio::spawn(async move {
+            for byte in request {
+                client.write_all(std::slice::from_ref(byte)).await.unwrap();
+            }
+        });
+
+        let code = read_callback(&mut server, "expected-state").await.unwrap();
+        writer.await.unwrap();
         assert_eq!(code.expose_secret(), "private-code");
     }
 
