@@ -23,6 +23,8 @@
 | A-6 | DONE | `cargo test -p personal-agent-desktop shutdown_timeout_stops_sidecar_while_lifecycle_lock_is_held -- --nocapture` → 1 passed, 0 failed; desktop suite 57 passed. | `d7be93f` |
 | A-7 | DONE | `cargo test -p personal-agent-desktop concurrent_connector_saves_remain_atomic -- --nocapture` → 1 passed, 0 failed; desktop suite 56 passed at task boundary. | `f487811` |
 | A-8 | DONE | `cargo test -p personal-agent-desktop connector_oauth::tests::loopback_callback_accepts_request_in_one_byte_chunks -- --exact --nocapture` → 1 passed, 0 failed. | `a97c4f0` |
+| PERF-1 | DONE | `python scripts/verify-performance.py` → verified extended deterministic replay distributions; perf unit tests 2 passed, 0 failed; diagnostics now emits phase and turn first-delta data. SPEC Files-line omission: the required turn path also needed `api.rs`. | `e864cb8` |
+| RUN-0 | BLOCKED-EXTERNAL / BLOCKED-CONTRADICTION | Two source patches and the PTY skip handoff are in `patches/opencode/`; fork selection is fail-closed. GitHub fork/release/CI require a valid credential. The requested before-hook patch contradicts pristine v1.18.23, which already short-circuits sync throws and async rejections (`exit=Failure`, executor count 0). | `1ac32c2` |
 
 ## Wave 1 gate
 
@@ -34,3 +36,23 @@ release-metadata verifiers passed. The inherited failures remain:
 
 - Windows cross-check: target standard library unavailable (`E0463`).
 - Bundle-size verifier: file is introduced by PERF-13 and does not exist yet.
+
+## Wave 2 gate
+
+Wave 2 passes the full gate except the two inherited baseline failures. `bun run sidecar:fetch`
+again verifies upstream 1.18.23, workspace clippy passes with warnings denied, all workspace Rust
+tests pass (desktop 59/59; runtime 15 passed with one pre-existing ignored test), Bun tests pass
+(desktop 70/70), the production build completes, and all performance/fuzz/security, registry,
+pack, and release-metadata checks pass. The inherited exceptions remain the unavailable Windows
+standard-library target and the PERF-13 bundle-size verifier that has not been introduced yet.
+
+RUN-0 human handoff:
+
+```sh
+gh auth login -h github.com
+gh repo fork anomalyco/opencode --clone=false --remote=false
+# Apply patches/opencode/0001 and 0003 to v1.18.23, publish six fork artifacts,
+# record their hashes, verify /doc, set fork.ready=true, then:
+PERSONAL_AGENT_OPENCODE_SOURCE=fork bun run sidecar:fetch
+PERSONAL_AGENT_OPENCODE_SOURCE=fork cargo test --workspace --locked
+```
