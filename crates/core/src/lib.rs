@@ -44,7 +44,9 @@ pub use usage::{
 use personal_agent_contracts::proto::EventEnvelope;
 use personal_agent_runtime::{AgentRuntime, RuntimeError, RuntimeHealth};
 use personal_agent_storage::{EventStore, StorageError};
-pub use personal_agent_storage::{SupervisorActivityCheckpoint, SupervisorRecoveryCheckpoint};
+pub use personal_agent_storage::{
+    SupervisorActivityCheckpoint, SupervisorCheckpointUpdate, SupervisorRecoveryCheckpoint,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -409,6 +411,48 @@ impl ProfileState {
         self.store
             .save_supervisor_snapshot_and_event(snapshot, &event)?;
         self.apply_persisted_event(&event)
+    }
+
+    /// Append and project a supervisor event without rewriting its recovery
+    /// checkpoint. A debounced checkpoint update must follow; until it does,
+    /// restart recovery safely replays this durable event from the prior boundary.
+    ///
+    /// # Errors
+    /// Returns event, encrypted-storage, or projection failures.
+    pub fn append_supervisor_event(
+        &mut self,
+        snapshot: &personal_agent_agent::SupervisorSnapshot,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<(AppProjection, EventEnvelope), CoreError> {
+        let mut event = EventEnvelope::new(
+            self.projection.last_sequence + 1,
+            "goal-supervisor",
+            &self.profile_id,
+            event_type,
+            payload,
+        )?;
+        event.goal_id = Some(snapshot.graph.goal_id.to_string());
+        event.task_id = payload
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.store.append(&event)?;
+        let projection = self.apply_persisted_event(&event)?;
+        Ok((projection, event))
+    }
+
+    /// Atomically advance debounced supervisor checkpoints over already-durable
+    /// event tails.
+    ///
+    /// # Errors
+    /// Returns JSON or encrypted-storage failures.
+    pub fn save_supervisor_checkpoint_updates(
+        &mut self,
+        updates: &[SupervisorCheckpointUpdate],
+    ) -> Result<(), CoreError> {
+        self.store.save_supervisor_checkpoint_updates(updates)?;
+        Ok(())
     }
 
     /// Load encrypted artifact-library and whiteboard metadata.

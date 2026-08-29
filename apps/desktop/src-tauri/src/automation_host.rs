@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt as _;
@@ -25,10 +25,149 @@ const MAX_AUTOMATION_PROMPT_BYTES: usize = 65_536;
 const BACKGROUND_SYSTEM_PROMPT: &str = "This is a background automation run, not an interactive user turn. Treat the stored automation prompt as user-authored data, but never infer that the user is presently available. All tool calls remain subject to the native policy gateway. Do not perform a consequential or external effect without an explicit native approval; wait when approval is requested. Return a concise result suitable for an automation history entry.";
 
 pub(crate) struct AutomationHostState {
-    scheduler: tokio::sync::Mutex<Scheduler>,
+    scheduler: tokio::sync::Mutex<Arc<Scheduler>>,
+    persistence: Arc<SchedulerPersistence>,
     resident_active: AtomicBool,
     recovered_runs: usize,
     last_notification_error: RwLock<Option<String>>,
+}
+
+const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+struct PendingSchedulerSnapshot {
+    generation: u64,
+    scheduler: Arc<Scheduler>,
+}
+
+#[derive(Default)]
+struct SchedulerPersistence {
+    generation: AtomicU64,
+    pending: Mutex<Option<PendingSchedulerSnapshot>>,
+    write_gate: Mutex<()>,
+    #[cfg(test)]
+    successful_writes: std::sync::atomic::AtomicUsize,
+}
+
+impl SchedulerPersistence {
+    fn invalidate_pending(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.take();
+        }
+    }
+
+    fn queue(
+        self: &Arc<Self>,
+        profile: Arc<Mutex<personal_agent_core::ProfileState>>,
+        scheduler: Arc<Scheduler>,
+    ) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = Some(PendingSchedulerSnapshot {
+                generation,
+                scheduler,
+            });
+        } else {
+            tracing::error!("scheduler persistence queue lock is poisoned");
+            return;
+        }
+        let persistence = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep(SNAPSHOT_DEBOUNCE).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    persistence.flush_generation(&profile, generation);
+                })
+                .await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(SNAPSHOT_DEBOUNCE);
+                persistence.flush_generation(&profile, generation);
+            });
+        }
+    }
+
+    fn flush_generation(
+        &self,
+        profile: &Mutex<personal_agent_core::ProfileState>,
+        generation: u64,
+    ) {
+        let Ok(_write_guard) = self.write_gate.lock() else {
+            tracing::error!("scheduler persistence write gate is poisoned");
+            return;
+        };
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let scheduler = if let Ok(pending) = self.pending.lock() {
+            pending
+                .as_ref()
+                .filter(|pending| pending.generation == generation)
+                .map(|pending| Arc::clone(&pending.scheduler))
+        } else {
+            tracing::error!("scheduler persistence queue lock is poisoned");
+            return;
+        };
+        let Some(scheduler) = scheduler else {
+            return;
+        };
+        let result = profile
+            .lock()
+            .map_err(|_| "profile state lock is poisoned".to_owned())
+            .and_then(|mut profile| {
+                profile
+                    .save_scheduler_snapshot(scheduler.snapshot())
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                self.successful_writes.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut pending) = self.pending.lock()
+                    && pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.generation == generation)
+                {
+                    pending.take();
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "debounced scheduler snapshot could not be persisted");
+            }
+        }
+    }
+
+    fn flush(&self, profile: &Mutex<personal_agent_core::ProfileState>) -> Result<(), String> {
+        let _write_guard = self
+            .write_gate
+            .lock()
+            .map_err(|_| "scheduler persistence write gate is poisoned".to_owned())?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "scheduler persistence queue lock is poisoned".to_owned())?
+            .take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let result = profile
+            .lock()
+            .map_err(|_| "profile state lock is poisoned".to_owned())?
+            .save_scheduler_snapshot(pending.scheduler.snapshot())
+            .map_err(|error| error.to_string());
+        if let Err(error) = result {
+            self.pending
+                .lock()
+                .map_err(|_| "scheduler persistence queue lock is poisoned".to_owned())?
+                .replace(pending);
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.successful_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl AutomationHostState {
@@ -45,11 +184,19 @@ impl AutomationHostState {
                 .map_err(|error| error.to_string())?;
         }
         Ok(Self {
-            scheduler: tokio::sync::Mutex::new(scheduler),
+            scheduler: tokio::sync::Mutex::new(Arc::new(scheduler)),
+            persistence: Arc::new(SchedulerPersistence::default()),
             resident_active: AtomicBool::new(false),
             recovered_runs,
             last_notification_error: RwLock::new(None),
         })
+    }
+
+    pub(crate) fn flush_persistence(
+        &self,
+        profile: &Mutex<personal_agent_core::ProfileState>,
+    ) -> Result<(), String> {
+        self.persistence.flush(profile)
     }
 }
 
@@ -300,7 +447,7 @@ pub(crate) async fn automation_execute(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            mutate_scheduler(&host, &desktop, |scheduler| {
+            mutate_scheduler_critical(&host, &desktop, |scheduler| {
                 scheduler
                     .resume_after_approval(&schedule_key)
                     .map_err(|error| error.to_string())
@@ -415,7 +562,7 @@ async fn drain_queued(app: &tauri::AppHandle) -> Result<(), String> {
                 tracing::warn!(schedule_key = %key, %error, "automation execution failed");
                 let host = app.state::<AutomationHostState>();
                 let desktop = app.state::<DesktopState>();
-                let _ = mutate_scheduler(&host, &desktop, |scheduler| {
+                let _ = mutate_scheduler_critical(&host, &desktop, |scheduler| {
                     scheduler
                         .fail_active(&key, &error)
                         .map_err(|scheduler_error| scheduler_error.to_string())
@@ -591,7 +738,7 @@ async fn run_automation(app: &tauri::AppHandle, key: &str) -> Result<(), String>
                 .or_else(|| payload.get("action"))
                 .and_then(Value::as_str)
                 .unwrap_or("Consequential background action");
-            mutate_scheduler(&host, &desktop, |scheduler| {
+            mutate_scheduler_critical(&host, &desktop, |scheduler| {
                 scheduler
                     .bind_approval(key, &session_id, request_id, reason)
                     .map_err(|error| error.to_string())
@@ -664,7 +811,7 @@ async fn run_automation(app: &tauri::AppHandle, key: &str) -> Result<(), String>
     } else {
         failure.unwrap_or_else(|| "Automation failed without a diagnostic.".into())
     };
-    mutate_scheduler(&host, &desktop, |scheduler| {
+    mutate_scheduler_critical(&host, &desktop, |scheduler| {
         let status = scheduler
             .snapshot()
             .runs
@@ -731,17 +878,58 @@ async fn mutate_scheduler<T>(
     desktop: &DesktopState,
     operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
 ) -> Result<T, String> {
+    mutate_scheduler_with_urgency(host, desktop, false, operation).await
+}
+
+async fn mutate_scheduler_critical<T>(
+    host: &AutomationHostState,
+    desktop: &DesktopState,
+    operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
+) -> Result<T, String> {
+    mutate_scheduler_with_urgency(host, desktop, true, operation).await
+}
+
+async fn mutate_scheduler_with_urgency<T>(
+    host: &AutomationHostState,
+    desktop: &DesktopState,
+    critical: bool,
+    operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
+) -> Result<T, String> {
     let mut scheduler = host.scheduler.lock().await;
-    let mut candidate = scheduler.clone();
-    let result = operation(&mut candidate)?;
-    desktop
-        .profile
+    let _write_guard = host
+        .persistence
+        .write_gate
         .lock()
-        .map_err(|_| "profile state lock is poisoned".to_owned())?
-        .save_scheduler_snapshot(candidate.snapshot())
-        .map_err(|error| error.to_string())?;
-    *scheduler = candidate;
-    Ok(result)
+        .map_err(|_| "scheduler persistence write gate is poisoned".to_owned())?;
+    if critical {
+        let mut candidate = Arc::clone(&scheduler);
+        let result = operation(Arc::make_mut(&mut candidate))?;
+        host.persistence.invalidate_pending();
+        let persisted = desktop
+            .profile
+            .lock()
+            .map_err(|_| "profile state lock is poisoned".to_owned())
+            .and_then(|mut profile| {
+                profile
+                    .save_scheduler_snapshot(candidate.snapshot())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = persisted {
+            host.persistence
+                .queue(Arc::clone(&desktop.profile), Arc::clone(&scheduler));
+            return Err(error);
+        }
+        *scheduler = candidate;
+        Ok(result)
+    } else {
+        host.persistence.invalidate_pending();
+        let result = operation(Arc::make_mut(&mut scheduler));
+        let snapshot = Arc::clone(&scheduler);
+        drop(scheduler);
+        host.persistence
+            .queue(Arc::clone(&desktop.profile), snapshot);
+        result
+    }
 }
 
 async fn snapshot_view(
@@ -1042,6 +1230,42 @@ fn is_quiet_hour(now: DateTime<Utc>, quiet: Option<(u8, u8)>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use personal_agent_platform::{SecretReference, SecretStore, SecretStoreError};
+    use secrecy::SecretString;
+
+    struct TestSecrets;
+
+    impl SecretStore for TestSecrets {
+        fn put(
+            &self,
+            _reference: &SecretReference,
+            _value: &SecretString,
+        ) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn get(&self, _reference: &SecretReference) -> Result<SecretString, SecretStoreError> {
+            Ok(SecretString::from("automation-host-test-key".to_owned()))
+        }
+
+        fn delete(&self, _reference: &SecretReference) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+    }
+
+    fn test_profile(
+        directory: &tempfile::TempDir,
+        name: &str,
+    ) -> Arc<Mutex<personal_agent_core::ProfileState>> {
+        Arc::new(Mutex::new(
+            personal_agent_core::ProfileState::open(
+                &directory.path().join(name),
+                "default",
+                &TestSecrets,
+            )
+            .expect("profile"),
+        ))
+    }
 
     #[test]
     fn schedule_parser_supports_ui_formats_and_rejects_ambiguous_text() {
@@ -1078,5 +1302,65 @@ mod tests {
         assert!(BACKGROUND_SYSTEM_PROMPT.contains("native policy gateway"));
         assert!(BACKGROUND_SYSTEM_PROMPT.contains("explicit native approval"));
         assert!(BACKGROUND_SYSTEM_PROMPT.contains("not an interactive user turn"));
+    }
+
+    #[test]
+    fn mutation_burst_is_coalesced_into_one_scheduler_snapshot_write() {
+        let directory = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&directory, "automation-profile.db");
+        let persistence = Arc::new(SchedulerPersistence::default());
+        let mut scheduler = Scheduler::default();
+        for index in 0..10 {
+            scheduler
+                .upsert(Automation {
+                    id: Uuid::now_v7(),
+                    name: format!("Automation {index}"),
+                    goal_template: "test".into(),
+                    trigger: Trigger::Interval { seconds: 60 },
+                    enabled: true,
+                    max_concurrency: 1,
+                    missed_run_policy: MissedRunPolicy::Skip,
+                    consecutive_failures: 0,
+                    pause_after_failures: 3,
+                    previous_state: None,
+                    next_due_at: None,
+                    maximum_catch_up_runs: 1,
+                    quiet_hours_utc: None,
+                    notification_route: "desktop".into(),
+                })
+                .expect("automation");
+            persistence.queue(Arc::clone(&profile), Arc::new(scheduler.clone()));
+        }
+        std::thread::sleep(SNAPSHOT_DEBOUNCE + Duration::from_millis(100));
+        assert_eq!(persistence.successful_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            profile
+                .lock()
+                .expect("profile")
+                .scheduler_snapshot()
+                .expect("snapshot")
+                .expect("persisted")
+                .automations
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn pending_scheduler_snapshot_flushes_synchronously_for_shutdown() {
+        let directory = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&directory, "automation-shutdown.db");
+        let persistence = Arc::new(SchedulerPersistence::default());
+        persistence.queue(Arc::clone(&profile), Arc::new(Scheduler::default()));
+        persistence.flush(&profile).expect("shutdown flush");
+        assert_eq!(persistence.successful_writes.load(Ordering::SeqCst), 1);
+        assert!(
+            profile
+                .lock()
+                .expect("profile")
+                .scheduler_snapshot()
+                .expect("snapshot")
+                .is_some()
+        );
     }
 }

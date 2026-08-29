@@ -34,6 +34,11 @@ pub enum StorageError {
     UnsupportedEventSchema(u32),
     #[error("event sequence is outside SQLite's signed integer range: {0}")]
     SequenceOutOfRange(u64),
+    #[error("supervisor checkpoint event belongs to goal {event_goal}, expected {snapshot_goal}")]
+    SupervisorGoalMismatch {
+        event_goal: String,
+        snapshot_goal: String,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("export or backup destination already exists: {0}")]
@@ -94,6 +99,19 @@ pub struct SupervisorRecoveryCheckpoint {
     pub recent_activities: Vec<SupervisorActivityCheckpoint>,
     /// False for legacy bare snapshots that require one full replay to migrate.
     pub replay_base_complete: bool,
+}
+
+/// One latest supervisor snapshot plus the already-appended events it incorporates.
+///
+/// Events are appended before a debounced checkpoint write. If the process stops
+/// between those operations, replay starts from the older checkpoint and consumes
+/// the durable tail, so no transition is lost.
+#[derive(Clone, Debug)]
+pub struct SupervisorCheckpointUpdate {
+    /// Latest in-memory state after applying every event in this update.
+    pub snapshot: personal_agent_agent::SupervisorSnapshot,
+    /// Already-durable events incorporated by `snapshot`, in any order.
+    pub events: Vec<EventEnvelope>,
 }
 
 impl EventStore {
@@ -512,6 +530,74 @@ impl EventStore {
             "INSERT INTO events(monotonic_sequence,event_id,profile_id,event_type,wall_clock_timestamp,envelope) VALUES (?1,?2,?3,?4,?5,?6)",
             params![sequence, event.event_id, event.profile_id, event.r#type, event.wall_clock_timestamp, event.encode_to_vec()],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically advance one or more supervisor recovery checkpoints over events
+    /// that were already appended to the event log.
+    ///
+    /// This is the write side of debounced supervisor persistence: domain events
+    /// remain immediately durable, while a burst updates each snapshot row once.
+    ///
+    /// # Errors
+    /// Returns schema, sequence, JSON, or database errors.
+    pub fn save_supervisor_checkpoint_updates(
+        &mut self,
+        updates: &[SupervisorCheckpointUpdate],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for update in updates {
+            let id = update.snapshot.graph.goal_id.to_string();
+            let mut checkpoint = load_supervisor_checkpoint(&tx, &id)?;
+            let mut events = update.events.iter().collect::<Vec<_>>();
+            events.sort_by_key(|event| event.monotonic_sequence);
+            let mut advanced = false;
+            for event in events {
+                validate_event(event)?;
+                if event.goal_id.as_deref() != Some(id.as_str()) {
+                    return Err(StorageError::SupervisorGoalMismatch {
+                        event_goal: event.goal_id.clone().unwrap_or_else(|| "<missing>".into()),
+                        snapshot_goal: id.clone(),
+                    });
+                }
+                if checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| event.monotonic_sequence <= checkpoint.last_sequence)
+                {
+                    continue;
+                }
+                checkpoint = Some(evolve_supervisor_checkpoint(
+                    checkpoint,
+                    &update.snapshot,
+                    event,
+                )?);
+                advanced = true;
+            }
+            let mut checkpoint = checkpoint.unwrap_or_else(|| SupervisorRecoveryCheckpoint {
+                snapshot: update.snapshot.clone(),
+                last_sequence: 0,
+                latest_goal_event: None,
+                pending_approval_events: Vec::new(),
+                recent_activities: Vec::new(),
+                replay_base_complete: false,
+            });
+            if advanced || update.events.is_empty() {
+                checkpoint.snapshot.clone_from(&update.snapshot);
+            }
+            let body = serde_json::to_string(&checkpoint)?;
+            tx.execute(
+                "INSERT INTO runtime_snapshots(kind,id,body_json,updated_at)
+                 VALUES (?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 ON CONFLICT(kind,id) DO UPDATE SET body_json=excluded.body_json, updated_at=excluded.updated_at",
+                params![SUPERVISOR_SNAPSHOT_KIND, id, body],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1127,7 +1213,43 @@ fn materialize_migration_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use personal_agent_agent::{DurableSupervisor, ExecutionZone, Task, TaskGraph, WorkStatus};
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn test_supervisor() -> DurableSupervisor {
+        let goal_id = Uuid::now_v7();
+        let task = Task {
+            id: Uuid::now_v7(),
+            goal_id,
+            parent_task_id: None,
+            title: "durable task".into(),
+            assigned_agent: "executor".into(),
+            workspace: None,
+            browser_profile: None,
+            tool_scopes: BTreeSet::new(),
+            risk: "read".into(),
+            execution_zone: ExecutionZone::Isolated,
+            max_attempts: 3,
+            attempt: 0,
+            idempotency_key: None,
+            checkpoint_id: None,
+            status: WorkStatus::Queued,
+            progress: 0,
+            output: None,
+        };
+        DurableSupervisor::new(
+            TaskGraph {
+                goal_id,
+                revision: 1,
+                tasks: BTreeMap::from([(task.id, task)]),
+                edges: vec![],
+            },
+            3,
+            3,
+        )
+        .expect("supervisor")
+    }
 
     #[test]
     fn append_and_resume_events() {
@@ -1374,6 +1496,61 @@ mod tests {
     }
 
     #[test]
+    fn stale_debounced_supervisor_write_cannot_regress_a_newer_checkpoint() {
+        let mut store = EventStore::open_in_memory(&SecretString::from("test-only-key".to_owned()))
+            .expect("store");
+        let mut supervisor = test_supervisor();
+        let old_snapshot = supervisor.snapshot().clone();
+        let task_id = supervisor.ready_tasks()[0];
+        supervisor.start(task_id).expect("start task");
+        let new_snapshot = supervisor.snapshot().clone();
+        let goal_id = new_snapshot.graph.goal_id;
+        let mut first = EventEnvelope::new(
+            1,
+            "goal-supervisor",
+            "default",
+            "goal.created",
+            &json!({"goal_id": goal_id}),
+        )
+        .expect("first event");
+        first.goal_id = Some(goal_id.to_string());
+        let mut second = EventEnvelope::new(
+            2,
+            "goal-supervisor",
+            "default",
+            "task.started",
+            &json!({"goal_id": goal_id, "task_id": task_id}),
+        )
+        .expect("second event");
+        second.goal_id = Some(goal_id.to_string());
+        second.task_id = Some(task_id.to_string());
+        store.append(&first).expect("append first");
+        store.append(&second).expect("append second");
+        store
+            .save_supervisor_checkpoint_updates(&[SupervisorCheckpointUpdate {
+                snapshot: new_snapshot,
+                events: vec![first.clone(), second],
+            }])
+            .expect("new checkpoint");
+        store
+            .save_supervisor_checkpoint_updates(&[SupervisorCheckpointUpdate {
+                snapshot: old_snapshot,
+                events: vec![first],
+            }])
+            .expect("stale retry is idempotent");
+
+        let checkpoint = store
+            .supervisor_recovery_checkpoint(goal_id)
+            .expect("checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.last_sequence, 2);
+        assert_eq!(
+            checkpoint.snapshot.graph.tasks[&task_id].status,
+            WorkStatus::Running
+        );
+    }
+
+    #[test]
     fn blobs_deduplicate_and_backup_reopens_with_the_same_key() {
         let temp = tempfile::tempdir().expect("temp");
         let source = temp.path().join("profile.db");
@@ -1433,39 +1610,11 @@ mod tests {
 
     #[test]
     fn durable_runtime_snapshots_survive_database_restart() {
-        use personal_agent_agent::{DurableSupervisor, ExecutionZone, Task, TaskGraph, WorkStatus};
-        use std::collections::{BTreeMap, BTreeSet};
-
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("durable.db");
         let key = SecretString::from("test-only-key".to_owned());
-        let goal_id = Uuid::now_v7();
-        let task = Task {
-            id: Uuid::now_v7(),
-            goal_id,
-            parent_task_id: None,
-            title: "durable task".into(),
-            assigned_agent: "executor".into(),
-            workspace: None,
-            browser_profile: None,
-            tool_scopes: BTreeSet::new(),
-            risk: "read".into(),
-            execution_zone: ExecutionZone::Isolated,
-            max_attempts: 3,
-            attempt: 0,
-            idempotency_key: None,
-            checkpoint_id: None,
-            status: WorkStatus::Queued,
-            progress: 0,
-            output: None,
-        };
-        let graph = TaskGraph {
-            goal_id,
-            revision: 1,
-            tasks: BTreeMap::from([(task.id, task)]),
-            edges: vec![],
-        };
-        let supervisor = DurableSupervisor::new(graph, 3, 3).expect("supervisor");
+        let supervisor = test_supervisor();
+        let goal_id = supervisor.snapshot().graph.goal_id;
         {
             let mut store = EventStore::open(&path, &key).expect("store");
             store

@@ -44,9 +44,7 @@ describe("artifact workspace", () => {
         version: 1,
         media_type: "text/plain",
         byte_length: 11,
-        content_base64: "aGVsbG8gd29ybGQ=",
         text: "hello world",
-        terminal_safe_text: "hello world",
         source_links: [],
       });
       return Promise.resolve(populated);
@@ -76,23 +74,19 @@ describe("artifact workspace", () => {
       pin: true,
     }));
     expect(await screen.findByText("Artifact created in encrypted storage.")).toBeInTheDocument();
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("artifact_content", {
+      artifactId: artifact.id,
+      version: 1,
+      format: "text",
+    }));
   });
 
   it("requires exact confirmations for export and deletion", async () => {
     invoke.mockImplementation((command: string) => {
       if (command === "artifact_snapshot") return Promise.resolve(populated);
-      if (command === "artifact_content") return Promise.resolve({
-        artifact_id: artifact.id,
-        title: artifact.title,
-        kind: artifact.kind,
-        version: 1,
-        media_type: "text/plain",
-        byte_length: 11,
-        content_base64: "aGVsbG8gd29ybGQ=",
-        text: "hello world",
-        terminal_safe_text: "hello world",
-        source_links: [],
-      });
+      // Keep preview loading unresolved so export cannot accidentally depend on
+      // artifact_content racing ahead of the user's click.
+      if (command === "artifact_content") return new Promise(() => {});
       if (command === "artifact_export") return Promise.resolve("/tmp/report.txt");
       return Promise.resolve({ artifacts: [], cards: [], order: [], focused: null });
     });
@@ -120,5 +114,40 @@ describe("artifact workspace", () => {
       artifactId: artifact.id,
       confirmed: true,
     })));
+  });
+
+  it("requests only the raw representation for binary previews", async () => {
+    const imageArtifact = {
+      ...artifact,
+      title: "Diagram",
+      kind: "image",
+      versions: [{ ...artifact.versions[0], media_type: "image/png" }],
+    };
+    invoke.mockImplementation((command: string) => {
+      if (command === "artifact_snapshot") {
+        return Promise.resolve({ artifacts: [imageArtifact], cards: [], order: [], focused: null });
+      }
+      if (command === "artifact_content") {
+        return Promise.resolve({
+          artifact_id: imageArtifact.id,
+          title: imageArtifact.title,
+          kind: imageArtifact.kind,
+          version: 1,
+          media_type: "image/png",
+          byte_length: 8,
+          content_base64: "iVBORw0KGgo=",
+          source_links: [],
+        });
+      }
+      return Promise.resolve({ artifacts: [], cards: [], order: [], focused: null });
+    });
+
+    render(<ArtifactsWorkspace />);
+    expect(await screen.findByRole("img", { name: "Diagram" })).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("artifact_content", {
+      artifactId: imageArtifact.id,
+      version: 1,
+      format: "raw",
+    });
   });
 });

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -20,6 +21,7 @@ const MAXIMUM_PARALLELISM: usize = 2;
 const MAXIMUM_DELEGATION_DEPTH: usize = 3;
 const RESIDENT_TICK_SECONDS: u64 = 2;
 const MAX_GOAL_TEXT_BYTES: usize = 65_536;
+const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(250);
 const BACKGROUND_GOAL_SYSTEM_PROMPT: &str = "This is a durable background goal task, not an interactive user turn. Work only on the named goal and observable success criterion. Preserve user files and existing changes. All tools remain behind the native policy gateway. Pause for native approval before consequential or external effects. Return a concise result with verification evidence.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,10 +56,169 @@ struct GoalReplayState {
 }
 
 pub(crate) struct GoalsHostState {
-    goals: tokio::sync::Mutex<BTreeMap<Uuid, ManagedGoal>>,
+    goals: tokio::sync::Mutex<BTreeMap<Uuid, Arc<ManagedGoal>>>,
+    persistence: Arc<GoalPersistence>,
     resident_active: AtomicBool,
     recovered_tasks: usize,
     activities: tokio::sync::Mutex<Vec<GoalActivityView>>,
+}
+
+struct PendingGoalCheckpoint {
+    snapshot: personal_agent_agent::SupervisorSnapshot,
+    events: Vec<EventEnvelope>,
+}
+
+#[derive(Default)]
+struct GoalPersistence {
+    generation: AtomicU64,
+    pending: Mutex<BTreeMap<Uuid, PendingGoalCheckpoint>>,
+    write_gate: Mutex<()>,
+    #[cfg(test)]
+    successful_writes: std::sync::atomic::AtomicUsize,
+}
+
+impl GoalPersistence {
+    fn queue(
+        self: &Arc<Self>,
+        profile: Arc<Mutex<personal_agent_core::ProfileState>>,
+        snapshot: personal_agent_agent::SupervisorSnapshot,
+        event: EventEnvelope,
+        critical: bool,
+    ) -> Result<(), String> {
+        let generation = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| "goal persistence queue lock is poisoned".to_owned())?;
+            let entry =
+                pending
+                    .entry(snapshot.graph.goal_id)
+                    .or_insert_with(|| PendingGoalCheckpoint {
+                        snapshot: snapshot.clone(),
+                        events: Vec::new(),
+                    });
+            entry.snapshot = snapshot;
+            entry.events.push(event);
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        if critical {
+            return self.flush(&profile);
+        }
+        let persistence = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep(SNAPSHOT_DEBOUNCE).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    persistence.flush_generation(&profile, generation);
+                })
+                .await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(SNAPSHOT_DEBOUNCE);
+                persistence.flush_generation(&profile, generation);
+            });
+        }
+        Ok(())
+    }
+
+    fn take_generation(&self, generation: u64) -> Option<BTreeMap<Uuid, PendingGoalCheckpoint>> {
+        let mut pending = self.pending.lock().ok()?;
+        (self.generation.load(Ordering::SeqCst) == generation)
+            .then(|| std::mem::take(&mut *pending))
+    }
+
+    fn updates(
+        pending: &BTreeMap<Uuid, PendingGoalCheckpoint>,
+    ) -> Vec<personal_agent_core::SupervisorCheckpointUpdate> {
+        pending
+            .values()
+            .map(|pending| personal_agent_core::SupervisorCheckpointUpdate {
+                snapshot: pending.snapshot.clone(),
+                events: pending.events.clone(),
+            })
+            .collect()
+    }
+
+    fn restore_pending(&self, failed: BTreeMap<Uuid, PendingGoalCheckpoint>) {
+        let Ok(mut pending) = self.pending.lock() else {
+            tracing::error!("goal persistence queue lock is poisoned after a failed write");
+            return;
+        };
+        for (goal_id, mut failed) in failed {
+            if let Some(newer) = pending.remove(&goal_id) {
+                failed.events.extend(newer.events);
+                failed.events.sort_by_key(|event| event.monotonic_sequence);
+                failed.events.dedup_by_key(|event| event.monotonic_sequence);
+                failed.snapshot = newer.snapshot;
+            }
+            pending.insert(goal_id, failed);
+        }
+    }
+
+    fn flush_generation(
+        &self,
+        profile: &Mutex<personal_agent_core::ProfileState>,
+        generation: u64,
+    ) {
+        let Ok(_write_guard) = self.write_gate.lock() else {
+            tracing::error!("goal persistence write gate is poisoned");
+            return;
+        };
+        let Some(pending) = self.take_generation(generation) else {
+            return;
+        };
+        let updates = Self::updates(&pending);
+        let result = profile
+            .lock()
+            .map_err(|_| "profile state lock is poisoned".to_owned())
+            .and_then(|mut profile| {
+                profile
+                    .save_supervisor_checkpoint_updates(&updates)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                self.successful_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(error) => {
+                tracing::error!(%error, "debounced goal snapshots could not be persisted");
+                self.restore_pending(pending);
+            }
+        }
+    }
+
+    fn flush(&self, profile: &Mutex<personal_agent_core::ProfileState>) -> Result<(), String> {
+        let _write_guard = self
+            .write_gate
+            .lock()
+            .map_err(|_| "goal persistence write gate is poisoned".to_owned())?;
+        let pending = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| "goal persistence queue lock is poisoned".to_owned())?;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            std::mem::take(&mut *pending)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let updates = Self::updates(&pending);
+        let result = profile
+            .lock()
+            .map_err(|_| "profile state lock is poisoned".to_owned())?
+            .save_supervisor_checkpoint_updates(&updates)
+            .map_err(|error| error.to_string());
+        if let Err(error) = result {
+            self.restore_pending(pending);
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.successful_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -179,19 +340,27 @@ impl GoalsHostState {
             };
             goals.insert(
                 goal.id,
-                ManagedGoal {
+                Arc::new(ManagedGoal {
                     goal: goal.clone(),
                     supervisor,
                     approvals: approvals.remove(&goal.id).unwrap_or_default(),
-                },
+                }),
             );
         }
         Ok(Self {
             goals: tokio::sync::Mutex::new(goals),
+            persistence: Arc::new(GoalPersistence::default()),
             resident_active: AtomicBool::new(false),
             recovered_tasks,
             activities: tokio::sync::Mutex::new(activities),
         })
+    }
+
+    pub(crate) fn flush_persistence(
+        &self,
+        profile: &Mutex<personal_agent_core::ProfileState>,
+    ) -> Result<(), String> {
+        self.persistence.flush(profile)
     }
 }
 
@@ -247,7 +416,10 @@ fn checkpointed_goal_replay_base(
     }
 
     let mut state = GoalReplayState::default();
-    let mut after = 0;
+    // Recovery replays from the oldest per-goal checkpoint. A newer checkpoint
+    // for one goal cannot prove that another goal has no durable, debounced
+    // tail before that global sequence.
+    let mut after = u64::MAX;
     for checkpoint in checkpoints {
         let event = checkpoint
             .latest_goal_event
@@ -280,7 +452,7 @@ fn checkpointed_goal_replay_base(
                 .into_iter()
                 .map(activity_from_checkpoint),
         );
-        after = after.max(checkpoint.last_sequence);
+        after = after.min(checkpoint.last_sequence);
     }
     Ok(Some((state, after)))
 }
@@ -512,9 +684,14 @@ pub(crate) async fn goals_execute(
                 supervisor,
                 approvals: BTreeMap::new(),
             };
-            let projection =
-                persist_managed(&desktop, &managed, "goal.created", json!(goal.clone()))?;
-            host.goals.lock().await.insert(goal.id, managed);
+            let projection = persist_managed(
+                &host,
+                &desktop,
+                &managed,
+                "goal.created",
+                json!(goal.clone()),
+            )?;
+            host.goals.lock().await.insert(goal.id, Arc::new(managed));
             record_activity(&host, &projection, "goal.created", Some(goal.id), None).await;
             (
                 projection,
@@ -794,9 +971,9 @@ async fn mutate_goal<T>(
         .get(&goal_id)
         .cloned()
         .ok_or_else(|| "goal not found".to_owned())?;
-    let (result, details) = operation(&mut candidate)?;
+    let (result, details) = operation(Arc::make_mut(&mut candidate))?;
     let payload = transition_payload(&candidate, details);
-    let projection = persist_managed(desktop, &candidate, event_type, payload.clone())?;
+    let projection = persist_managed(host, desktop, &candidate, event_type, payload.clone())?;
     goals.insert(goal_id, candidate);
     drop(goals);
     record_activity(
@@ -811,17 +988,44 @@ async fn mutate_goal<T>(
 }
 
 fn persist_managed(
+    host: &GoalsHostState,
     desktop: &DesktopState,
     managed: &ManagedGoal,
     event_type: &str,
     payload: Value,
 ) -> Result<personal_agent_core::AppProjection, String> {
-    desktop
+    let snapshot = managed.supervisor.snapshot().clone();
+    let (projection, event) = desktop
         .profile
         .lock()
         .map_err(|_| "profile state lock is poisoned".to_owned())?
-        .record_supervisor_event(managed.supervisor.snapshot(), event_type, &payload)
-        .map_err(|error| error.to_string())
+        .append_supervisor_event(&snapshot, event_type, &payload)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = host.persistence.queue(
+        Arc::clone(&desktop.profile),
+        snapshot,
+        event,
+        is_critical_goal_transition(event_type),
+    ) {
+        // The event is already durable and is the recovery authority. Keep the
+        // resident state aligned with it; restart replay remains correct even if
+        // advancing the optimization checkpoint must wait for shutdown/retry.
+        tracing::error!(%error, %event_type, "goal checkpoint could not be queued or flushed");
+    }
+    Ok(projection)
+}
+
+fn is_critical_goal_transition(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "approval.requested"
+            | "approval.resolved"
+            | "task.completed"
+            | "task.failed"
+            | "task.cancelled"
+            | "goal.completed"
+            | "goal.cancelled"
+    )
 }
 
 fn transition_payload(managed: &ManagedGoal, details: Value) -> Value {
@@ -1415,6 +1619,20 @@ mod tests {
         }
     }
 
+    fn test_profile(
+        directory: &tempfile::TempDir,
+        name: &str,
+    ) -> Arc<Mutex<personal_agent_core::ProfileState>> {
+        Arc::new(Mutex::new(
+            personal_agent_core::ProfileState::open(
+                &directory.path().join(name),
+                "default",
+                &TestSecrets,
+            )
+            .expect("profile"),
+        ))
+    }
+
     #[test]
     fn task_graph_is_sequential_and_bounded() {
         let mut goal = Goal::new(
@@ -1518,6 +1736,281 @@ mod tests {
         assert_eq!(checkpointed.0.len(), 2);
         assert_eq!(checkpointed.1[&first.id][&task_id], approval);
         assert_eq!(checkpointed.2.len(), 4);
+    }
+
+    #[test]
+    fn newer_other_goal_checkpoint_cannot_hide_an_unflushed_goal_tail() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("goal-interleaved-checkpoints.db");
+        let mut profile =
+            personal_agent_core::ProfileState::open(&database, "default", &TestSecrets)
+                .expect("profile");
+
+        let mut first = Goal::new(
+            "Recover the unflushed tail",
+            vec!["running state survives".into()],
+            "test",
+        );
+        first.plan_revision = 1;
+        let mut first_supervisor = DurableSupervisor::new(
+            task_graph(&first, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("first supervisor");
+        let first_created = profile
+            .append_supervisor_event(first_supervisor.snapshot(), "goal.created", &json!(first))
+            .expect("append first goal")
+            .1;
+        profile
+            .save_supervisor_checkpoint_updates(&[
+                personal_agent_core::SupervisorCheckpointUpdate {
+                    snapshot: first_supervisor.snapshot().clone(),
+                    events: vec![first_created],
+                },
+            ])
+            .expect("checkpoint first goal");
+
+        let first_task = first_supervisor.ready_tasks()[0];
+        first_supervisor
+            .start(first_task)
+            .expect("start first task");
+        first.status = WorkStatus::Running;
+        let first_tail = profile
+            .append_supervisor_event(
+                first_supervisor.snapshot(),
+                "task.started",
+                &json!({
+                    "goal": first,
+                    "goal_id": first.id,
+                    "task_id": first_task,
+                }),
+            )
+            .expect("append uncheckpointed first-goal tail")
+            .1;
+
+        let mut second = Goal::new(
+            "Flush a newer checkpoint",
+            vec!["checkpoint is newer".into()],
+            "test",
+        );
+        second.plan_revision = 1;
+        let second_supervisor = DurableSupervisor::new(
+            task_graph(&second, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("second supervisor");
+        let second_created = profile
+            .append_supervisor_event(second_supervisor.snapshot(), "goal.created", &json!(second))
+            .expect("append second goal")
+            .1;
+        assert!(second_created.monotonic_sequence > first_tail.monotonic_sequence);
+        profile
+            .save_supervisor_checkpoint_updates(&[
+                personal_agent_core::SupervisorCheckpointUpdate {
+                    snapshot: second_supervisor.snapshot().clone(),
+                    events: vec![second_created],
+                },
+            ])
+            .expect("checkpoint newer second goal");
+
+        let full = replay_goal_events_with_checkpoints(&profile, false).expect("full replay");
+        let checkpointed =
+            replay_goal_events_with_checkpoints(&profile, true).expect("checkpoint replay");
+        assert_eq!(checkpointed, full);
+        assert_eq!(checkpointed.0[&first.id].status, WorkStatus::Running);
+        assert_eq!(checkpointed.2.len(), 3);
+        assert_eq!(
+            checkpointed
+                .2
+                .iter()
+                .map(|activity| activity.sequence)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "events already represented by newer checkpoints remain deduplicated"
+        );
+    }
+
+    #[test]
+    fn mutation_burst_writes_one_complete_goal_checkpoint_and_critical_flushes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&temp, "goal-debounce.db");
+        let mut goal = Goal::new("Coalesce safely", vec!["all events survive".into()], "test");
+        goal.plan_revision = 1;
+        let supervisor = DurableSupervisor::new(
+            task_graph(&goal, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("supervisor");
+        let task_id = supervisor.ready_tasks()[0];
+        let persistence = Arc::new(GoalPersistence::default());
+        for index in 0..10 {
+            let event_type = if index == 0 {
+                "goal.created"
+            } else if index == 9 {
+                "approval.requested"
+            } else {
+                "goal.updated"
+            };
+            let payload = json!({
+                "goal": goal,
+                "goal_id": goal.id,
+                "task_id": task_id,
+                "index": index,
+            });
+            let event = profile
+                .lock()
+                .expect("profile")
+                .append_supervisor_event(supervisor.snapshot(), event_type, &payload)
+                .expect("append event")
+                .1;
+            persistence
+                .queue(
+                    Arc::clone(&profile),
+                    supervisor.snapshot().clone(),
+                    event,
+                    index == 9,
+                )
+                .expect("queue checkpoint");
+        }
+        assert_eq!(
+            persistence.successful_writes.load(Ordering::SeqCst),
+            1,
+            "the approval transition flushes the entire burst once"
+        );
+        let checkpoints = profile
+            .lock()
+            .expect("profile")
+            .supervisor_recovery_checkpoints()
+            .expect("checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].last_sequence, 10);
+        assert_eq!(checkpoints[0].recent_activities.len(), 10);
+        assert_eq!(checkpoints[0].pending_approval_events.len(), 1);
+        assert!(checkpoints[0].replay_base_complete);
+    }
+
+    #[test]
+    fn pending_goal_checkpoint_flushes_synchronously_for_shutdown() {
+        let temp = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&temp, "goal-shutdown.db");
+        let mut goal = Goal::new("Flush safely", vec!["checkpoint exists".into()], "test");
+        goal.plan_revision = 1;
+        let supervisor = DurableSupervisor::new(
+            task_graph(&goal, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("supervisor");
+        let event = profile
+            .lock()
+            .expect("profile")
+            .append_supervisor_event(supervisor.snapshot(), "goal.created", &json!(goal))
+            .expect("append event")
+            .1;
+        let persistence = Arc::new(GoalPersistence::default());
+        persistence
+            .queue(
+                Arc::clone(&profile),
+                supervisor.snapshot().clone(),
+                event,
+                false,
+            )
+            .expect("queue checkpoint");
+        persistence.flush(&profile).expect("shutdown flush");
+        assert_eq!(persistence.successful_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            profile
+                .lock()
+                .expect("profile")
+                .supervisor_recovery_checkpoints()
+                .expect("checkpoints")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn critical_goal_flush_waits_for_an_inflight_checkpoint_writer() {
+        let temp = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&temp, "goal-write-gate.db");
+        let mut goal = Goal::new(
+            "Serialize checkpoint writes",
+            vec!["tail retained".into()],
+            "test",
+        );
+        goal.plan_revision = 1;
+        let supervisor = DurableSupervisor::new(
+            task_graph(&goal, temp.path().to_str().unwrap()),
+            MAXIMUM_PARALLELISM,
+            MAXIMUM_DELEGATION_DEPTH,
+        )
+        .expect("supervisor");
+        let event = profile
+            .lock()
+            .expect("profile")
+            .append_supervisor_event(supervisor.snapshot(), "goal.created", &json!(goal))
+            .expect("append event")
+            .1;
+        let persistence = Arc::new(GoalPersistence::default());
+        let write_guard = persistence.write_gate.lock().expect("write gate");
+        let writer = {
+            let persistence = Arc::clone(&persistence);
+            let profile = Arc::clone(&profile);
+            let snapshot = supervisor.snapshot().clone();
+            std::thread::spawn(move || persistence.queue(profile, snapshot, event, true))
+        };
+
+        for _ in 0..1_000 {
+            if persistence
+                .pending
+                .lock()
+                .expect("pending checkpoints")
+                .contains_key(&goal.id)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            persistence
+                .pending
+                .lock()
+                .expect("pending checkpoints")
+                .contains_key(&goal.id),
+            "critical batch reached the write gate"
+        );
+        assert!(
+            !writer.is_finished(),
+            "critical flush overtook the writer gate"
+        );
+        assert_eq!(persistence.successful_writes.load(Ordering::SeqCst), 0);
+
+        drop(write_guard);
+        writer
+            .join()
+            .expect("critical writer thread")
+            .expect("critical checkpoint flush");
+        assert_eq!(persistence.successful_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn approvals_and_terminal_transitions_are_critical() {
+        for event_type in [
+            "approval.requested",
+            "approval.resolved",
+            "task.completed",
+            "task.failed",
+            "task.cancelled",
+            "goal.completed",
+            "goal.cancelled",
+        ] {
+            assert!(is_critical_goal_transition(event_type), "{event_type}");
+        }
+        assert!(!is_critical_goal_transition("task.started"));
     }
 
     #[tokio::test]

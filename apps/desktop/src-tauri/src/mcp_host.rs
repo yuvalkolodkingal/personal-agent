@@ -24,6 +24,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
@@ -31,12 +32,127 @@ use uuid::Uuid;
 
 pub(crate) struct McpHostState {
     path: PathBuf,
-    manager: Mutex<McpManager>,
+    manager: Mutex<Arc<McpManager>>,
+    persistence: Arc<McpPersistence>,
     oauth_attempts: Mutex<OAuthAttemptRegistry>,
 }
 
 const MCP_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(330);
 const MCP_OAUTH_ATTEMPT_TTL: Duration = Duration::from_secs(360);
+const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+struct PendingMcpSnapshot {
+    generation: u64,
+    manager: Arc<McpManager>,
+}
+
+#[derive(Default)]
+struct McpPersistence {
+    generation: AtomicU64,
+    pending: Mutex<Option<PendingMcpSnapshot>>,
+    write_gate: Mutex<()>,
+    #[cfg(test)]
+    successful_writes: std::sync::atomic::AtomicUsize,
+}
+
+impl McpPersistence {
+    fn invalidate_pending(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.take();
+        }
+    }
+
+    fn queue(self: &Arc<Self>, path: PathBuf, manager: Arc<McpManager>) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = Some(PendingMcpSnapshot {
+                generation,
+                manager,
+            });
+        } else {
+            tracing::error!("MCP persistence queue lock is poisoned");
+            return;
+        }
+        let persistence = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep(SNAPSHOT_DEBOUNCE).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    persistence.flush_generation(&path, generation);
+                })
+                .await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(SNAPSHOT_DEBOUNCE);
+                persistence.flush_generation(&path, generation);
+            });
+        }
+    }
+
+    fn flush_generation(&self, path: &Path, generation: u64) {
+        let Ok(_write_guard) = self.write_gate.lock() else {
+            tracing::error!("MCP persistence write gate is poisoned");
+            return;
+        };
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let manager = if let Ok(pending) = self.pending.lock() {
+            pending
+                .as_ref()
+                .filter(|pending| pending.generation == generation)
+                .map(|pending| Arc::clone(&pending.manager))
+        } else {
+            tracing::error!("MCP persistence queue lock is poisoned");
+            return;
+        };
+        let Some(manager) = manager else {
+            return;
+        };
+        match persist_manager(path, &manager) {
+            Ok(()) => {
+                #[cfg(test)]
+                self.successful_writes.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut pending) = self.pending.lock()
+                    && pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.generation == generation)
+                {
+                    pending.take();
+                }
+            }
+            Err(error) => tracing::error!(%error, "debounced MCP snapshot could not be persisted"),
+        }
+    }
+
+    fn flush(&self, path: &Path) -> Result<(), String> {
+        let _write_guard = self
+            .write_gate
+            .lock()
+            .map_err(|_| "MCP persistence write gate is poisoned".to_owned())?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "MCP persistence queue lock is poisoned".to_owned())?
+            .take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        if let Err(error) = persist_manager(path, &pending.manager) {
+            self.pending
+                .lock()
+                .map_err(|_| "MCP persistence queue lock is poisoned".to_owned())?
+                .replace(pending);
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.successful_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct OAuthAttemptRegistry {
@@ -73,47 +189,64 @@ impl McpHostState {
         manager.recover_after_restart();
         let state = Self {
             path,
-            manager: Mutex::new(manager),
+            manager: Mutex::new(Arc::new(manager)),
+            persistence: Arc::new(McpPersistence::default()),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
         };
         Ok(state)
     }
 
-    fn save(&self, manager: &McpManager) -> Result<(), String> {
+    fn ensure_persistence_parent(&self) -> Result<(), String> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| "MCP state path has no parent".to_owned())?;
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let bytes = serde_json::to_vec_pretty(manager).map_err(|error| error.to_string())?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(".manager-")
-            .suffix(".json.tmp")
-            .tempfile_in(parent)
-            .map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        temporary
-            .as_file()
-            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .map_err(|error| error.to_string())?;
-        temporary
-            .write_all(&bytes)
-            .map_err(|error| error.to_string())?;
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|error| error.to_string())?;
-        temporary
-            .persist(&self.path)
-            .map_err(|error| error.error.to_string())?;
-        #[cfg(unix)]
-        fs::set_permissions(
-            &self.path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
+        fs::create_dir_all(parent).map_err(|error| error.to_string())
     }
+
+    pub(crate) fn flush_persistence(&self) -> Result<(), String> {
+        self.persistence.flush(&self.path)
+    }
+}
+
+impl Drop for McpHostState {
+    fn drop(&mut self) {
+        if let Err(error) = self.flush_persistence() {
+            tracing::error!(%error, "MCP snapshot could not be flushed while dropping host state");
+        }
+    }
+}
+
+fn persist_manager(path: &Path, manager: &McpManager) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "MCP state path has no parent".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(manager).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".manager-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -348,7 +481,7 @@ pub(crate) async fn mcp_manager_execute(
             server_id,
             operation_digest,
         } => {
-            with_manager(&host, |manager| {
+            with_manager_critical(&host, |manager| {
                 let (_, display) = manager.install_consent_preview(server_id)?;
                 let consent = consent(operation_digest, display);
                 manager.install(server_id, &consent, &mut NativePackageAdapter)
@@ -367,7 +500,7 @@ pub(crate) async fn mcp_manager_execute(
             server_id,
             operation_digest,
         } => {
-            with_manager(&host, |manager| {
+            with_manager_critical(&host, |manager| {
                 let (_, display) = manager.update_consent_preview(server_id)?;
                 manager.apply_update(
                     server_id,
@@ -389,7 +522,7 @@ pub(crate) async fn mcp_manager_execute(
             server_id,
             operation_digest,
         } => {
-            with_manager(&host, |manager| {
+            with_manager_critical(&host, |manager| {
                 let (_, display) = manager.rollback_consent_preview(server_id)?;
                 manager.rollback(
                     server_id,
@@ -412,7 +545,7 @@ pub(crate) async fn mcp_manager_execute(
             server_id,
             operation_digest,
         } => {
-            with_manager(&host, |manager| {
+            with_manager_critical(&host, |manager| {
                 let (_, display) = manager.uninstall_consent_preview(server_id)?;
                 manager.uninstall(
                     server_id,
@@ -431,7 +564,7 @@ pub(crate) async fn mcp_manager_execute(
             project_scopes,
             agent_scopes,
         } => {
-            with_manager(&host, |manager| {
+            with_manager_critical(&host, |manager| {
                 manager.set_scopes(
                     server_id,
                     project_scopes.into_iter().collect(),
@@ -440,7 +573,7 @@ pub(crate) async fn mcp_manager_execute(
             })?;
         }
         ManagerAction::SetPermission { server_id, rule } => {
-            with_manager(&host, |manager| manager.set_permission(server_id, rule))?;
+            with_manager_critical(&host, |manager| manager.set_permission(server_id, rule))?;
         }
         ManagerAction::TestTool {
             server_id,
@@ -456,7 +589,7 @@ pub(crate) async fn mcp_manager_execute(
             {
                 return Err("MCP tool approval no longer matches the displayed request".into());
             }
-            let route = with_manager(&host, |manager| {
+            let prepare = |manager: &mut McpManager| {
                 manager.prepare_tool_call(
                     server_id,
                     &tool,
@@ -466,7 +599,12 @@ pub(crate) async fn mcp_manager_execute(
                         ..InvocationContext::default()
                     },
                 )
-            })?;
+            };
+            let route = if approval_digest.is_some() {
+                with_manager_critical(&host, prepare)?
+            } else {
+                with_manager(&host, prepare)?
+            };
             match route {
                 ToolRoute::ApprovalRequired(_) => {
                     result.operation_preview = Some(OperationPreview {
@@ -588,15 +726,48 @@ fn with_manager<T>(
     host: &McpHostState,
     operation: impl FnOnce(&mut McpManager) -> Result<T, personal_agent_mcp_manager::ManagerError>,
 ) -> Result<T, String> {
+    host.ensure_persistence_parent()?;
     let mut manager = host
         .manager
         .lock()
         .map_err(|_| "MCP manager lock is poisoned".to_owned())?;
-    let mut candidate = manager.clone();
-    let outcome = operation(&mut candidate);
-    host.save(&candidate)?;
-    *manager = candidate;
+    let _write_guard = host
+        .persistence
+        .write_gate
+        .lock()
+        .map_err(|_| "MCP persistence write gate is poisoned".to_owned())?;
+    host.persistence.invalidate_pending();
+    let outcome = operation(Arc::make_mut(&mut manager));
+    let snapshot = Arc::clone(&manager);
+    drop(manager);
+    host.persistence.queue(host.path.clone(), snapshot);
     outcome.map_err(|error| error.to_string())
+}
+
+fn with_manager_critical<T>(
+    host: &McpHostState,
+    operation: impl FnOnce(&mut McpManager) -> Result<T, personal_agent_mcp_manager::ManagerError>,
+) -> Result<T, String> {
+    host.ensure_persistence_parent()?;
+    let mut manager = host
+        .manager
+        .lock()
+        .map_err(|_| "MCP manager lock is poisoned".to_owned())?;
+    let _write_guard = host
+        .persistence
+        .write_gate
+        .lock()
+        .map_err(|_| "MCP persistence write gate is poisoned".to_owned())?;
+    let mut candidate = Arc::clone(&manager);
+    let outcome = operation(Arc::make_mut(&mut candidate)).map_err(|error| error.to_string())?;
+    host.persistence.invalidate_pending();
+    if let Err(error) = persist_manager(&host.path, &candidate) {
+        host.persistence
+            .queue(host.path.clone(), Arc::clone(&manager));
+        return Err(error);
+    }
+    *manager = candidate;
+    Ok(outcome)
 }
 
 fn read_manager<T>(
@@ -1512,7 +1683,8 @@ mod tests {
         fs::write(&blocker, b"file").unwrap();
         let host = McpHostState {
             path: blocker.join("manager.json"),
-            manager: Mutex::new(McpManager::default()),
+            manager: Mutex::new(Arc::new(McpManager::default())),
+            persistence: Arc::new(McpPersistence::default()),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
         };
         let result = with_manager(&host, |manager| {
@@ -1520,6 +1692,64 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(host.manager.lock().unwrap().snapshot().servers.is_empty());
+    }
+
+    #[test]
+    fn critical_persistence_failure_does_not_commit_in_memory_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager_path = directory.path().join("manager.json");
+        fs::create_dir(&manager_path).expect("manager path directory");
+        let host = McpHostState {
+            path: manager_path,
+            manager: Mutex::new(Arc::new(McpManager::default())),
+            persistence: Arc::new(McpPersistence::default()),
+            oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
+        };
+
+        let result = with_manager_critical(&host, |manager| {
+            manager.add_server(definition("Rejected critical", "rejected_critical"))
+        });
+
+        assert!(result.is_err());
+        assert!(
+            read_manager(&host, |manager| Ok(manager.snapshot().servers.is_empty())).unwrap(),
+            "the live manager changes only after its critical snapshot is durable"
+        );
+    }
+
+    #[test]
+    fn mutation_burst_is_coalesced_into_one_mcp_snapshot_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = McpHostState::load(directory.path()).unwrap();
+        for index in 0..10 {
+            with_manager(&host, |manager| {
+                manager.add_server(definition(
+                    &format!("Server {index}"),
+                    &format!("server_{index}"),
+                ))
+            })
+            .unwrap();
+        }
+        std::thread::sleep(SNAPSHOT_DEBOUNCE + Duration::from_millis(100));
+        assert_eq!(host.persistence.successful_writes.load(Ordering::SeqCst), 1);
+        let restored = McpHostState::load(directory.path()).unwrap();
+        assert_eq!(
+            read_manager(&restored, |manager| Ok(manager.snapshot().servers.len())).unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn pending_mcp_snapshot_flushes_synchronously_for_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = McpHostState::load(directory.path()).unwrap();
+        with_manager(&host, |manager| {
+            manager.add_server(definition("Shutdown", "shutdown"))
+        })
+        .unwrap();
+        host.flush_persistence().expect("shutdown flush");
+        assert_eq!(host.persistence.successful_writes.load(Ordering::SeqCst), 1);
+        assert!(directory.path().join("mcp/manager.json").is_file());
     }
 
     #[test]

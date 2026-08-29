@@ -33,7 +33,7 @@ use personal_agent_runtime::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::path::BaseDirectory;
@@ -44,7 +44,7 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use tracing_subscriber::util::SubscriberInitExt;
 
 struct DesktopState {
-    profile: Mutex<ProfileState>,
+    profile: Arc<Mutex<ProfileState>>,
     memory: Mutex<PersistentMemory>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
     runtime_emergency_control: OpenCodeSidecarControl,
@@ -430,6 +430,21 @@ fn clean_shutdown(app: &tauri::AppHandle) {
     let pty = app.state::<pty_host::PtyHostState>();
     tauri::async_runtime::block_on(pty.shutdown());
     let state = app.state::<DesktopState>();
+    if let Some(goals) = app.try_state::<goals_host::GoalsHostState>()
+        && let Err(error) = goals.flush_persistence(&state.profile)
+    {
+        tracing::warn!(%error, "goal snapshots could not be flushed during shutdown");
+    }
+    if let Some(automations) = app.try_state::<automation_host::AutomationHostState>()
+        && let Err(error) = automations.flush_persistence(&state.profile)
+    {
+        tracing::warn!(%error, "automation snapshot could not be flushed during shutdown");
+    }
+    if let Some(mcp) = app.try_state::<mcp_host::McpHostState>()
+        && let Err(error) = mcp.flush_persistence()
+    {
+        tracing::warn!(%error, "MCP snapshot could not be flushed during shutdown");
+    }
     if let Err(error) = tauri::async_runtime::block_on(shutdown_runtime(
         &state.runtime,
         &state.runtime_emergency_control,
@@ -627,6 +642,7 @@ fn main() {
                     })
                 },
             )?;
+            let profile = Arc::new(Mutex::new(profile));
 
             let (safety_plugin, voice_runtime_script) = perf::startup_phase(
                 "resource_paths",
@@ -669,7 +685,7 @@ fn main() {
                     app.manage(automation_state);
                     app.manage(goals_state);
                     app.manage(DesktopState {
-                        profile: Mutex::new(profile),
+                        profile,
                         memory: Mutex::new(memory),
                         runtime: tokio::sync::Mutex::new(sidecar),
                         runtime_emergency_control,

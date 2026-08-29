@@ -29,7 +29,7 @@ type ArtifactContent = {
   version: number;
   media_type: string;
   byte_length: number;
-  content_base64: string;
+  content_base64?: string;
   text?: string | null;
   terminal_safe_text?: string | null;
   source_links: SourceLink[];
@@ -83,7 +83,7 @@ function latest(artifact?: Artifact): number | undefined {
 }
 
 function dataUrl(content: ArtifactContent): string {
-  return `data:${content.media_type};base64,${content.content_base64}`;
+  return `data:${content.media_type};base64,${content.content_base64 ?? ""}`;
 }
 
 export function ArtifactsWorkspace() {
@@ -131,12 +131,15 @@ export function ArtifactsWorkspace() {
 
   useEffect(() => {
     if (!selectedId) return;
-    const version = selectedVersion ?? latest(artifacts.get(selectedId));
+    const artifact = artifacts.get(selectedId);
+    const version = selectedVersion ?? latest(artifact);
     if (!version) return;
+    const format = artifact && textKinds.has(artifact.kind) ? "text" : "raw";
     setBusy(true);
     void invoke<ArtifactContent>("artifact_content", {
       artifactId: selectedId,
       version,
+      format,
     })
       .then((next) => {
         setContent(next);
@@ -272,7 +275,7 @@ export function ArtifactsWorkspace() {
     try {
       const destination = await invoke<string>("artifact_export", {
         artifactId: selected.id,
-        version: selectedVersion ?? null,
+        version: selectedVersion ?? latest(selected) ?? null,
         path: exportPath,
         confirmed: exportConfirmed,
       });
@@ -363,10 +366,10 @@ export function ArtifactsWorkspace() {
               <label>Version<select value={selectedVersion ?? ""} onChange={(event) => setSelectedVersion(Number(event.target.value))}>{selected.versions.map((version) => <option key={version.version} value={version.version}>v{version.version} · {version.byte_length} bytes</option>)}</select></label>
             </header>
             <div className="artifact-preview">
-              {content?.media_type.startsWith("image/") && content.media_type !== "image/svg+xml" ? <img src={dataUrl(content)} alt={content.title} /> : null}
-              {content?.media_type.startsWith("audio/") ? <audio controls src={dataUrl(content)} /> : null}
-              {content?.media_type.startsWith("video/") ? <video controls src={dataUrl(content)} /> : null}
-              {content?.text != null ? <pre>{content.terminal_safe_text}</pre> : null}
+              {content?.content_base64 != null && content.media_type.startsWith("image/") && content.media_type !== "image/svg+xml" ? <img src={dataUrl(content)} alt={content.title} /> : null}
+              {content?.content_base64 != null && content.media_type.startsWith("audio/") ? <audio controls src={dataUrl(content)} /> : null}
+              {content?.content_base64 != null && content.media_type.startsWith("video/") ? <video controls src={dataUrl(content)} /> : null}
+              {content?.text != null ? <pre>{content.text}</pre> : null}
               {content && content.text == null && !/^(image|audio|video)\//.test(content.media_type) ? <p>Binary preview is unavailable. Export this version to open it in its native application.</p> : null}
             </div>
             {textKinds.has(selected.kind) ? <label>Editor<textarea aria-label="Artifact editor" value={body} onChange={(event) => setBody(event.target.value)} /></label> : <label>New binary version<input type="file" aria-label="New binary version" onChange={(event) => {

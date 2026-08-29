@@ -9,7 +9,7 @@ use personal_agent_core::{
     Artifact, ArtifactKind, ArtifactVersion, ArtifactWorkspace, SourceLink, WhiteboardCard,
     sanitized_html_report, terminal_safe_text,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::io::Write as _;
 use std::path::Path;
@@ -34,10 +34,38 @@ pub(crate) struct ArtifactContent {
     version: u32,
     media_type: String,
     byte_length: usize,
-    content_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal_safe_text: Option<String>,
     source_links: Vec<SourceLink>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactContentFormat {
+    Raw,
+    Text,
+    Terminal,
+}
+
+type ArtifactRepresentations = (Option<String>, Option<String>, Option<String>);
+
+fn artifact_representation(
+    bytes: &[u8],
+    format: ArtifactContentFormat,
+) -> Result<ArtifactRepresentations, String> {
+    match format {
+        ArtifactContentFormat::Raw => Ok((Some(STANDARD.encode(bytes)), None, None)),
+        ArtifactContentFormat::Text => String::from_utf8(bytes.to_vec())
+            .map(|text| (None, Some(text), None))
+            .map_err(|_| "artifact content is not valid UTF-8; request raw format".to_owned()),
+        ArtifactContentFormat::Terminal => String::from_utf8(bytes.to_vec())
+            .map(|text| (None, None, Some(terminal_safe_text(&text))))
+            .map_err(|_| "artifact content is not valid UTF-8; request raw format".to_owned()),
+    }
 }
 
 fn snapshot(workspace: &ArtifactWorkspace) -> ArtifactWorkspaceSnapshot {
@@ -392,6 +420,7 @@ pub(crate) fn artifact_restore_version(
 pub(crate) fn artifact_content(
     artifact_id: Uuid,
     version: Option<u32>,
+    format: ArtifactContentFormat,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ArtifactContent, String> {
     let profile = state
@@ -408,7 +437,7 @@ pub(crate) fn artifact_content(
         .artifact_blob(&selected.content_sha256)
         .map_err(|error| error.to_string())?;
     verify_blob(&selected, &bytes)?;
-    let text = String::from_utf8(bytes.clone()).ok();
+    let (content_base64, text, terminal_safe_text) = artifact_representation(&bytes, format)?;
     Ok(ArtifactContent {
         artifact_id,
         title: artifact.title.clone(),
@@ -416,9 +445,9 @@ pub(crate) fn artifact_content(
         version: selected.version,
         media_type: selected.media_type,
         byte_length: selected.byte_length,
-        content_base64: STANDARD.encode(&bytes),
-        terminal_safe_text: text.as_deref().map(terminal_safe_text),
+        content_base64,
         text,
+        terminal_safe_text,
         source_links: selected.source_links,
     })
 }
@@ -634,5 +663,37 @@ mod tests {
         };
         assert!(verify_blob(&version, bytes).is_ok());
         assert!(verify_blob(&version, b"tampered").is_err());
+    }
+
+    #[test]
+    fn artifact_content_serializes_exactly_one_requested_representation() {
+        let cases = [
+            (ArtifactContentFormat::Raw, "content_base64"),
+            (ArtifactContentFormat::Text, "text"),
+            (ArtifactContentFormat::Terminal, "terminal_safe_text"),
+        ];
+        for (format, expected) in cases {
+            let (raw, text, terminal) = artifact_representation(b"hello\x1b[31m", format)
+                .expect("requested representation");
+            let serialized = serde_json::to_value(ArtifactContent {
+                artifact_id: Uuid::nil(),
+                title: "test".into(),
+                kind: ArtifactKind::Text,
+                version: 1,
+                media_type: "text/plain".into(),
+                byte_length: 10,
+                content_base64: raw,
+                text,
+                terminal_safe_text: terminal,
+                source_links: Vec::new(),
+            })
+            .expect("serialize content");
+            let present = ["content_base64", "text", "terminal_safe_text"]
+                .into_iter()
+                .filter(|field| serialized.get(field).is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(present, vec![expected]);
+        }
+        assert!(artifact_representation(&[0xff], ArtifactContentFormat::Text).is_err());
     }
 }
