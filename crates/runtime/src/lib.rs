@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use personal_agent_contracts::proto::EventEnvelope;
 use personal_agent_policy::{DataZone, Effect, Idempotency, Risk, ToolDescriptor};
@@ -854,6 +855,8 @@ pub struct OpenCodeSidecar {
     client: Option<opencode_api::Client>,
     session_directories: Arc<RwLock<BTreeMap<String, PathBuf>>>,
     emergency_client: Arc<RwLock<Option<opencode_api::Client>>>,
+    runtime_connection: Arc<RwLock<Option<RuntimeConnection>>>,
+    turn_states: Arc<DashMap<SessionId, TurnState>>,
     termination_requested: Arc<AtomicBool>,
     tool_bridge: Option<NativeToolBridge>,
 }
@@ -868,7 +871,56 @@ pub struct OpenCodeSidecarControl {
     child: Arc<tokio::sync::Mutex<Option<Child>>>,
     session_directories: Arc<RwLock<BTreeMap<String, PathBuf>>>,
     client: Arc<RwLock<Option<opencode_api::Client>>>,
+    runtime_connection: Arc<RwLock<Option<RuntimeConnection>>>,
+    turn_states: Arc<DashMap<SessionId, TurnState>>,
     termination_requested: Arc<AtomicBool>,
+}
+
+/// Stable identifier used to isolate mutable state for one runtime session.
+pub type SessionId = String;
+
+#[derive(Clone)]
+struct RuntimeConnection {
+    endpoint: Url,
+    generated_client: opencode_api::Client,
+    authenticated_client: reqwest::Client,
+}
+
+/// Mutable state associated with one in-flight or recoverable turn.
+///
+/// Turn state is intentionally held in a concurrent map rather than on the
+/// process lifecycle owner. Independent sessions can therefore submit and
+/// reconcile turns without contending on a global runtime mutex.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnState {
+    message_id: String,
+    directory: String,
+}
+
+impl TurnState {
+    /// Prompt message identifier used to correlate the assistant response.
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    /// Canonical working directory used by this turn.
+    #[must_use]
+    pub fn directory(&self) -> &str {
+        &self.directory
+    }
+}
+
+/// Cloneable authenticated runtime data plane.
+///
+/// Lifecycle ownership remains with [`OpenCodeSidecar`]. This handle contains
+/// only the progenitor client, authenticated HTTP client, base URL, shared
+/// session registry and per-turn state needed for concurrent requests.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    connection: Arc<RwLock<Option<RuntimeConnection>>>,
+    session_directories: Arc<RwLock<BTreeMap<SessionId, PathBuf>>>,
+    turn_states: Arc<DashMap<SessionId, TurnState>>,
 }
 
 /// Cloneable, authenticated handle for read-only sidecar requests.
@@ -1235,6 +1287,10 @@ impl OpenCodeSidecarControl {
         if let Ok(mut client) = self.client.write() {
             *client = None;
         }
+        if let Ok(mut connection) = self.runtime_connection.write() {
+            *connection = None;
+        }
+        self.turn_states.clear();
         if let Ok(mut sessions) = self.session_directories.write() {
             sessions.clear();
         }
@@ -1278,6 +1334,652 @@ fn bounded_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+impl RuntimeHandle {
+    fn connection(&self) -> Result<RuntimeConnection, RuntimeError> {
+        self.connection
+            .read()
+            .map_err(|_| RuntimeError::Rejected("runtime connection is unavailable".into()))?
+            .clone()
+            .ok_or(RuntimeError::NotRunning)
+    }
+
+    fn generated_client(&self) -> Result<opencode_api::Client, RuntimeError> {
+        Ok(self.connection()?.generated_client)
+    }
+
+    fn registered_session_directory(&self, session_id: &str) -> Result<String, RuntimeError> {
+        self.session_directories
+            .read()
+            .map_err(|_| RuntimeError::Rejected("runtime session registry is unavailable".into()))?
+            .get(session_id)
+            .map(|path| path.display().to_string())
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "session working directory is not registered; resume it before use".into(),
+                )
+            })
+    }
+
+    fn register_session_directory(
+        &self,
+        session_id: SessionId,
+        directory: PathBuf,
+    ) -> Result<(), RuntimeError> {
+        self.session_directories
+            .write()
+            .map_err(|_| RuntimeError::Rejected("runtime session registry is unavailable".into()))?
+            .insert(session_id, directory);
+        Ok(())
+    }
+
+    /// Create a cloneable authenticated HTTP client for streaming observers,
+    /// PTYs and other native integrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::NotRunning`] while no verified runtime
+    /// connection is published.
+    pub fn api_client(&self) -> Result<OpenCodeApiClient, RuntimeError> {
+        let connection = self.connection()?;
+        Ok(OpenCodeApiClient {
+            endpoint: connection.endpoint,
+            client: connection.authenticated_client,
+        })
+    }
+
+    /// Return the currently recoverable state for a session's latest turn.
+    #[must_use]
+    pub fn turn_state(&self, session_id: &str) -> Option<TurnState> {
+        self.turn_states
+            .get(session_id)
+            .map(|state| state.value().clone())
+    }
+
+    /// Call one reviewed runtime API route through the shared authenticated
+    /// data plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime is unavailable, the route is invalid,
+    /// the request fails, or the response is not JSON.
+    pub async fn request_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        self.api_client()?
+            .request_json(method, path, query, body)
+            .await
+    }
+
+    /// Read the complete desktop catalog without taking the lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be canonicalized. Individual
+    /// unavailable catalog resources are represented explicitly in the result.
+    pub async fn desktop_catalog(&self, directory: &Path) -> Result<Value, RuntimeError> {
+        let directory = std::fs::canonicalize(directory)?;
+        let directory = directory.display().to_string();
+        let query = [("directory", directory)];
+        let resources = [
+            ("sessions", "/session"),
+            ("session_status", "/session/status"),
+            ("providers", "/provider"),
+            ("provider_auth", "/provider/auth"),
+            ("agents", "/agent"),
+            ("commands", "/command"),
+            ("skills", "/skill"),
+            ("mcp", "/mcp"),
+            ("projects", "/project"),
+            ("path", "/path"),
+            ("vcs", "/vcs"),
+            ("vcs_status", "/vcs/status"),
+            ("permissions", "/permission"),
+            ("questions", "/question"),
+            ("config", "/config"),
+            ("config_providers", "/config/providers"),
+            ("shells", "/pty/shells"),
+        ];
+        let mut catalog = serde_json::Map::new();
+        for (name, route) in resources {
+            let value = match self
+                .request_json(reqwest::Method::GET, route, &query, None)
+                .await
+            {
+                Ok(value) => serde_json::json!({"available": true, "data": value}),
+                Err(error) => serde_json::json!({
+                    "available": false,
+                    "reason": error.to_string()
+                }),
+            };
+            catalog.insert(name.to_owned(), value);
+        }
+        Ok(Value::Object(catalog))
+    }
+
+    /// Discover models through the concurrent runtime data plane.
+    async fn discover_models_inner(
+        &mut self,
+        working_directory: Option<&Path>,
+    ) -> Result<Vec<ModelCapability>, RuntimeError> {
+        let directory = working_directory
+            .map(std::fs::canonicalize)
+            .transpose()?
+            .map(|path| path.display().to_string());
+        let query = directory
+            .map(|directory| vec![("directory", directory)])
+            .unwrap_or_default();
+        let value = self
+            .request_json(reqwest::Method::GET, "/provider", &query, None)
+            .await
+            .map_err(|_| api_failure("model discovery"))?;
+        let connected = value
+            .get("connected")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let providers = value
+            .get("all")
+            .and_then(Value::as_array)
+            .ok_or_else(|| api_failure("provider response shape"))?;
+        Ok(providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|provider_id| connected.contains(provider_id))
+            })
+            .flat_map(|provider| {
+                let provider_id = provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                provider
+                    .get("models")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |(catalog_id, model)| {
+                        if provider_id.is_empty() {
+                            return None;
+                        }
+                        let model_id = model
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(catalog_id)
+                            .to_owned();
+                        Some(ModelCapability {
+                            local: is_local_provider(&provider_id),
+                            reasoning: model
+                                .pointer("/capabilities/reasoning")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            tool_calls: model
+                                .pointer("/capabilities/toolcall")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            provider_id: provider_id.clone(),
+                            model_id,
+                            context_tokens: numeric_u64(model.pointer("/limit/context")),
+                            input_modalities: enabled_modalities(
+                                model.pointer("/capabilities/input"),
+                            ),
+                            output_modalities: enabled_modalities(
+                                model.pointer("/capabilities/output"),
+                            ),
+                        })
+                    })
+            })
+            .collect())
+    }
+
+    /// Create and register a runtime session without taking a lifecycle lock.
+    async fn begin_session_inner(
+        &mut self,
+        options: SessionOptions,
+    ) -> Result<String, RuntimeError> {
+        let use_fork_environment = use_fork_session_environment(
+            std::env::var("PERSONAL_AGENT_OPENCODE_SOURCE")
+                .ok()
+                .as_deref(),
+            !options.environment.is_empty(),
+        )?;
+        if options.effort.is_some() && options.model.is_none() {
+            return Err(RuntimeError::Rejected(
+                "model effort requires an explicit provider/model selection".into(),
+            ));
+        }
+        let directory = std::fs::canonicalize(&options.working_directory)?;
+        if !directory.is_dir() {
+            return Err(RuntimeError::Rejected(
+                "session working directory is not a directory".into(),
+            ));
+        }
+        let directory_text = directory.display().to_string();
+        let mut body = serde_json::Map::new();
+        if let Some(agent) = options.agent {
+            body.insert("agent".to_owned(), Value::String(agent));
+        }
+        if use_fork_environment {
+            body.insert(
+                "environment".to_owned(),
+                serde_json::to_value(options.environment)
+                    .map_err(|_| api_failure("session environment"))?,
+            );
+        }
+        if let Some(model) = options.model {
+            let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
+                RuntimeError::Rejected("model must use provider/model syntax".into())
+            })?;
+            if provider_id.is_empty() || model_id.is_empty() {
+                return Err(RuntimeError::Rejected(
+                    "model must use non-empty provider/model syntax".into(),
+                ));
+            }
+            body.insert(
+                "model".to_owned(),
+                serde_json::json!({
+                    "providerID": provider_id,
+                    "id": model_id,
+                    "variant": options.effort,
+                }),
+            );
+        }
+        let session_id = if use_fork_environment {
+            let response = self
+                .request_json(
+                    reqwest::Method::POST,
+                    "/session",
+                    &[("directory", directory_text)],
+                    Some(Value::Object(body)),
+                )
+                .await
+                .map_err(|_| api_failure("session create"))?;
+            response_identifier(response, "/id", "session create")
+        } else {
+            let body = generated_body::<opencode_api::types::SessionCreateBody>(
+                Value::Object(body),
+                "session create body",
+            )?;
+            let response = self
+                .generated_client()?
+                .session_create()
+                .directory(&directory_text)
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| api_failure("session create"))?;
+            response_identifier(response.into_inner(), "/id", "session create")
+        }?;
+        self.register_session_directory(session_id.clone(), directory)?;
+        Ok(session_id)
+    }
+
+    /// Validate and register an existing session.
+    async fn resume_session_inner(
+        &mut self,
+        session_id: &str,
+        working_directory: &Path,
+    ) -> Result<(), RuntimeError> {
+        let directory = std::fs::canonicalize(working_directory)?;
+        let directory_text = directory.display().to_string();
+        self.generated_client()?
+            .session_get()
+            .session_id(session_id)
+            .directory(&directory_text)
+            .send()
+            .await
+            .map_err(|_| api_failure("session resume"))?;
+        self.register_session_directory(session_id.to_owned(), directory)?;
+        Ok(())
+    }
+
+    /// Compact one registered session.
+    async fn compact_session_inner(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        let directory = self.registered_session_directory(session_id)?;
+        let session = self
+            .generated_client()?
+            .session_get()
+            .session_id(session_id)
+            .directory(&directory)
+            .send()
+            .await
+            .map_err(|_| api_failure("session compact model lookup"))?;
+        let session = serde_json::to_value(session.into_inner())
+            .map_err(|_| api_failure("session compact model response"))?;
+        let provider_id = session
+            .pointer("/model/providerID")
+            .and_then(Value::as_str)
+            .ok_or_else(|| api_failure("session compact model selection"))?;
+        let model_id = session
+            .pointer("/model/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| api_failure("session compact model selection"))?;
+        let body = generated_body::<opencode_api::types::SessionSummarizeBody>(
+            serde_json::json!({
+                "providerID": provider_id,
+                "modelID": model_id,
+                "auto": false,
+            }),
+            "session compact body",
+        )?;
+        self.generated_client()?
+            .session_summarize()
+            .session_id(session_id)
+            .directory(&directory)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| api_failure("session compact"))?;
+        Ok(())
+    }
+
+    /// Fork one registered session and retain its working directory.
+    async fn fork_session_inner(&mut self, session_id: &str) -> Result<String, RuntimeError> {
+        let directory = self.registered_session_directory(session_id)?;
+        let body = generated_body::<opencode_api::types::SessionForkBody>(
+            serde_json::json!({}),
+            "session fork body",
+        )?;
+        let response = self
+            .generated_client()?
+            .session_fork()
+            .session_id(session_id)
+            .directory(&directory)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| api_failure("session fork"))?;
+        let fork = response_identifier(response.into_inner(), "/id", "session fork")?;
+        self.register_session_directory(fork.clone(), PathBuf::from(directory))?;
+        Ok(fork)
+    }
+
+    /// Abort one registered session.
+    async fn abort_session_inner(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        let directory = self.registered_session_directory(session_id)?;
+        self.generated_client()?
+            .session_abort()
+            .session_id(session_id)
+            .directory(&directory)
+            .send()
+            .await
+            .map_err(|_| api_failure("session abort"))?;
+        self.turn_states.remove(session_id);
+        Ok(())
+    }
+
+    /// Submit a prompt and register its recoverable per-session turn state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid attachments, unknown sessions, unavailable
+    /// runtime connections, rejected prompts, or failed event subscriptions.
+    pub async fn submit_with_attachments(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        attachments: Vec<Value>,
+        options: PromptOptions<'_>,
+    ) -> Result<PromptSubmission, RuntimeError> {
+        let parts = prompt_parts(prompt, attachments)?;
+        let directory = self.registered_session_directory(session_id)?;
+        let client = self.generated_client()?;
+        let session = tokio::time::timeout(
+            Duration::from_secs(15),
+            client
+                .session_get()
+                .session_id(session_id)
+                .directory(&directory)
+                .send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode session lookup timed out".into()))?
+        .map_err(|_| api_failure("session prompt context"))?;
+        let session = serde_json::to_value(session.into_inner())
+            .map_err(|_| api_failure("session prompt context response"))?;
+        let event_response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.event_subscribe().directory(&directory).send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode event subscription timed out".into()))?
+        .map_err(|_| api_failure("session event subscription"))?;
+        let message_id = format!("msg_{}", Uuid::new_v4().simple());
+        let mut prompt_body = serde_json::Map::from_iter([
+            ("messageID".to_owned(), Value::String(message_id.clone())),
+            ("parts".to_owned(), Value::Array(parts)),
+        ]);
+        apply_prompt_selection(
+            &mut prompt_body,
+            &session,
+            options.model,
+            options.agent,
+            options.effort,
+        )?;
+        if let Some(system) = options.system.filter(|value| !value.trim().is_empty()) {
+            prompt_body.insert("system".to_owned(), Value::String(system.to_owned()));
+        }
+        let admitted_payload = serde_json::json!({
+            "message_id": message_id,
+            "provider_id": prompt_body.get("model")
+                .and_then(|model| model.get("providerID"))
+                .and_then(Value::as_str),
+            "model_id": prompt_body.get("model")
+                .and_then(|model| model.get("modelID").or_else(|| model.get("id")))
+                .and_then(Value::as_str),
+        });
+        let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
+            Value::Object(prompt_body),
+            "session prompt body",
+        )?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .session_prompt_async()
+                .session_id(session_id)
+                .directory(&directory)
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Rejected("OpenCode prompt submission timed out".into()))?
+        .map_err(|_| api_failure("session prompt"))?;
+        self.turn_states.insert(
+            session_id.to_owned(),
+            TurnState {
+                message_id: message_id.clone(),
+                directory: directory.clone(),
+            },
+        );
+        let (tx, rx) = mpsc::channel(128);
+        tx.send(runtime_event(
+            1,
+            session_id,
+            "response.admitted",
+            &admitted_payload,
+        )?)
+        .await
+        .map_err(|_| RuntimeError::StreamClosed)?;
+        let session_id = session_id.to_owned();
+        tokio::spawn(forward_sse_events(
+            event_response.into_inner(),
+            tx,
+            session_id,
+            2,
+        ));
+        Ok(PromptSubmission {
+            message_id,
+            events: rx,
+        })
+    }
+
+    /// Submit a text-only prompt through the concurrent data plane.
+    async fn submit_inner(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        plan: Option<Value>,
+    ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
+        if plan.is_some() {
+            return Err(RuntimeError::Rejected(
+                "structured plan submission is not supported by the pinned runtime API".into(),
+            ));
+        }
+        Ok(self
+            .submit_with_attachments(session_id, prompt, Vec::new(), PromptOptions::default())
+            .await?
+            .events)
+    }
+
+    /// Resolve a pending permission or question for one session.
+    async fn answer_inner(
+        &mut self,
+        session_id: &str,
+        answer: RuntimeAnswer,
+    ) -> Result<(), RuntimeError> {
+        let kind = answer
+            .answer
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::Rejected("runtime answer kind is required".into()))?;
+        let directory = self.registered_session_directory(session_id)?;
+        match kind {
+            "permission" => {
+                let body = generated_body::<opencode_api::types::PermissionReplyBody>(
+                    serde_json::json!({
+                        "reply": answer.answer.get("reply"),
+                        "message": answer.answer.get("message"),
+                    }),
+                    "permission answer",
+                )?;
+                self.generated_client()?
+                    .permission_reply()
+                    .request_id(&answer.request_id)
+                    .directory(&directory)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|_| api_failure("permission answer"))?;
+            }
+            "question" if answer.answer.get("reject") == Some(&Value::Bool(true)) => {
+                self.generated_client()?
+                    .question_reject()
+                    .request_id(&answer.request_id)
+                    .directory(&directory)
+                    .send()
+                    .await
+                    .map_err(|_| api_failure("question rejection"))?;
+            }
+            "question" => {
+                let body = generated_body::<opencode_api::types::QuestionReplyBody>(
+                    serde_json::json!({"answers": answer.answer.get("answers")}),
+                    "question answer",
+                )?;
+                self.generated_client()?
+                    .question_reply()
+                    .request_id(&answer.request_id)
+                    .directory(&directory)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|_| api_failure("question answer"))?;
+            }
+            _ => {
+                return Err(RuntimeError::Rejected(
+                    "runtime answer kind must be permission or question".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for RuntimeHandle {
+    async fn start(&mut self) -> Result<RuntimeHealth, RuntimeError> {
+        Err(RuntimeError::Rejected(
+            "runtime lifecycle start requires the lifecycle write lock".into(),
+        ))
+    }
+
+    async fn health(&mut self) -> Result<RuntimeHealth, RuntimeError> {
+        let value = self
+            .request_json(reqwest::Method::GET, "/api/health", &[], None)
+            .await?;
+        Ok(RuntimeHealth {
+            healthy: value
+                .get("healthy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            version: OPENCODE_VERSION.to_owned(),
+            detail: "authenticated loopback API health".to_owned(),
+        })
+    }
+
+    async fn stop(&mut self) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Rejected(
+            "runtime lifecycle stop requires the lifecycle write lock".into(),
+        ))
+    }
+
+    async fn discover_models(
+        &mut self,
+        working_directory: Option<&Path>,
+    ) -> Result<Vec<ModelCapability>, RuntimeError> {
+        self.discover_models_inner(working_directory).await
+    }
+
+    async fn begin_session(&mut self, options: SessionOptions) -> Result<String, RuntimeError> {
+        self.begin_session_inner(options).await
+    }
+
+    async fn resume_session(
+        &mut self,
+        session_id: &str,
+        working_directory: &Path,
+    ) -> Result<(), RuntimeError> {
+        self.resume_session_inner(session_id, working_directory)
+            .await
+    }
+
+    async fn compact_session(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        self.compact_session_inner(session_id).await
+    }
+
+    async fn fork_session(&mut self, session_id: &str) -> Result<String, RuntimeError> {
+        self.fork_session_inner(session_id).await
+    }
+
+    async fn abort_session(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        self.abort_session_inner(session_id).await
+    }
+
+    async fn submit(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        plan: Option<Value>,
+    ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
+        self.submit_inner(session_id, prompt, plan).await
+    }
+
+    async fn answer(
+        &mut self,
+        session_id: &str,
+        answer: RuntimeAnswer,
+    ) -> Result<(), RuntimeError> {
+        self.answer_inner(session_id, answer).await
+    }
+}
+
 impl OpenCodeSidecar {
     #[must_use]
     pub fn new(config: OpenCodeConfig) -> Self {
@@ -1285,6 +1987,8 @@ impl OpenCodeSidecar {
             child: Arc::new(tokio::sync::Mutex::new(None)),
             session_directories: Arc::new(RwLock::new(BTreeMap::new())),
             client: Arc::new(RwLock::new(None)),
+            runtime_connection: Arc::new(RwLock::new(None)),
+            turn_states: Arc::new(DashMap::new()),
             termination_requested: Arc::new(AtomicBool::new(false)),
         };
         Self::with_emergency_control(config, &control)
@@ -1306,6 +2010,8 @@ impl OpenCodeSidecar {
             client: None,
             session_directories: Arc::clone(&emergency_control.session_directories),
             emergency_client: Arc::clone(&emergency_control.client),
+            runtime_connection: Arc::clone(&emergency_control.runtime_connection),
+            turn_states: Arc::clone(&emergency_control.turn_states),
             termination_requested: Arc::clone(&emergency_control.termination_requested),
             tool_bridge: None,
         }
@@ -1318,7 +2024,23 @@ impl OpenCodeSidecar {
             child: Arc::clone(&self.child),
             session_directories: Arc::clone(&self.session_directories),
             client: Arc::clone(&self.emergency_client),
+            runtime_connection: Arc::clone(&self.runtime_connection),
+            turn_states: Arc::clone(&self.turn_states),
             termination_requested: Arc::clone(&self.termination_requested),
+        }
+    }
+
+    /// Create a cloneable authenticated data-plane handle.
+    ///
+    /// The handle itself is safe to retain across lifecycle transitions. Its
+    /// requests return [`RuntimeError::NotRunning`] while no verified sidecar
+    /// connection is published.
+    #[must_use]
+    pub fn runtime_handle(&self) -> RuntimeHandle {
+        RuntimeHandle {
+            connection: Arc::clone(&self.runtime_connection),
+            session_directories: Arc::clone(&self.session_directories),
+            turn_states: Arc::clone(&self.turn_states),
         }
     }
 
@@ -1369,31 +2091,6 @@ impl OpenCodeSidecar {
         self.client.as_ref().ok_or(RuntimeError::NotRunning)
     }
 
-    fn registered_session_directory(&self, session_id: &str) -> Result<String, RuntimeError> {
-        self.session_directories
-            .read()
-            .map_err(|_| RuntimeError::Rejected("runtime session registry is unavailable".into()))?
-            .get(session_id)
-            .map(|path| path.display().to_string())
-            .ok_or_else(|| {
-                RuntimeError::Rejected(
-                    "session working directory is not registered; resume it before use".into(),
-                )
-            })
-    }
-
-    fn register_session_directory(
-        &self,
-        session_id: String,
-        directory: PathBuf,
-    ) -> Result<(), RuntimeError> {
-        self.session_directories
-            .write()
-            .map_err(|_| RuntimeError::Rejected("runtime session registry is unavailable".into()))?
-            .insert(session_id, directory);
-        Ok(())
-    }
-
     /// Count native tool calls audited during this runtime process.
     pub async fn tool_audit_count(&self) -> usize {
         match &self.tool_bridge {
@@ -1434,6 +2131,20 @@ impl OpenCodeSidecar {
         })
     }
 
+    fn publish_runtime_connection(&self) -> Result<(), RuntimeError> {
+        let connection = RuntimeConnection {
+            endpoint: self.endpoint.clone().ok_or(RuntimeError::NotRunning)?,
+            generated_client: self.generated_client()?.clone(),
+            authenticated_client: self.raw_client()?,
+        };
+        *self
+            .runtime_connection
+            .write()
+            .map_err(|_| RuntimeError::Rejected("runtime connection is unavailable".into()))? =
+            Some(connection);
+        Ok(())
+    }
+
     /// Call one reviewed `OpenCode` operation without disclosing the loopback
     /// endpoint or per-run credential to the renderer.
     ///
@@ -1448,7 +2159,7 @@ impl OpenCodeSidecar {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, RuntimeError> {
-        self.api_client()?
+        self.runtime_handle()
             .request_json(method, path, query, body)
             .await
     }
@@ -1460,43 +2171,7 @@ impl OpenCodeSidecar {
     /// Returns an error when the workspace cannot be canonicalized. Individual
     /// unavailable resources remain explicit inside the returned catalog.
     pub async fn desktop_catalog(&self, directory: &Path) -> Result<Value, RuntimeError> {
-        let directory = std::fs::canonicalize(directory)?;
-        let directory = directory.display().to_string();
-        let query = [("directory", directory)];
-        let resources = [
-            ("sessions", "/session"),
-            ("session_status", "/session/status"),
-            ("providers", "/provider"),
-            ("provider_auth", "/provider/auth"),
-            ("agents", "/agent"),
-            ("commands", "/command"),
-            ("skills", "/skill"),
-            ("mcp", "/mcp"),
-            ("projects", "/project"),
-            ("path", "/path"),
-            ("vcs", "/vcs"),
-            ("vcs_status", "/vcs/status"),
-            ("permissions", "/permission"),
-            ("questions", "/question"),
-            ("config", "/config"),
-            ("config_providers", "/config/providers"),
-            ("shells", "/pty/shells"),
-        ];
-        let mut catalog = serde_json::Map::new();
-        for (name, route) in resources {
-            let value = match self
-                .request_json(reqwest::Method::GET, route, &query, None)
-                .await
-            {
-                Ok(value) => serde_json::json!({"available": true, "data": value}),
-                Err(error) => serde_json::json!({
-                    "available": false,
-                    "reason": error.to_string()
-                }),
-            };
-            catalog.insert(name.to_owned(), value);
-        }
-        Ok(Value::Object(catalog))
+        self.runtime_handle().desktop_catalog(directory).await
     }
 
     fn safety_config_overlay(&self) -> Result<String, RuntimeError> {
@@ -1739,92 +2414,9 @@ impl OpenCodeSidecar {
         attachments: Vec<Value>,
         options: PromptOptions<'_>,
     ) -> Result<PromptSubmission, RuntimeError> {
-        let parts = prompt_parts(prompt, attachments)?;
-        let directory = self.registered_session_directory(session_id)?;
-        let client = self.generated_client()?.clone();
-        // Validate the session before opening the long-lived event stream. A
-        // deleted/stale active session must fail or be replaced immediately,
-        // instead of leaving the renderer waiting behind an idle SSE request.
-        let session = tokio::time::timeout(
-            Duration::from_secs(15),
-            client
-                .session_get()
-                .session_id(session_id)
-                .directory(&directory)
-                .send(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Rejected("OpenCode session lookup timed out".into()))?
-        .map_err(|_| api_failure("session prompt context"))?;
-        let session = serde_json::to_value(session.into_inner())
-            .map_err(|_| api_failure("session prompt context response"))?;
-        let event_response = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.event_subscribe().directory(&directory).send(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Rejected("OpenCode event subscription timed out".into()))?
-        .map_err(|_| api_failure("session event subscription"))?;
-        let message_id = format!("msg_{}", Uuid::new_v4().simple());
-        let mut prompt_body = serde_json::Map::from_iter([
-            ("messageID".to_owned(), Value::String(message_id.clone())),
-            ("parts".to_owned(), Value::Array(parts)),
-        ]);
-        apply_prompt_selection(
-            &mut prompt_body,
-            &session,
-            options.model,
-            options.agent,
-            options.effort,
-        )?;
-        if let Some(system) = options.system.filter(|value| !value.trim().is_empty()) {
-            prompt_body.insert("system".to_owned(), Value::String(system.to_owned()));
-        }
-        let admitted_payload = serde_json::json!({
-            "message_id": message_id,
-            "provider_id": prompt_body.get("model")
-                .and_then(|model| model.get("providerID"))
-                .and_then(Value::as_str),
-            "model_id": prompt_body.get("model")
-                .and_then(|model| model.get("modelID").or_else(|| model.get("id")))
-                .and_then(Value::as_str),
-        });
-        let body = generated_body::<opencode_api::types::SessionPromptAsyncBody>(
-            Value::Object(prompt_body),
-            "session prompt body",
-        )?;
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            client
-                .session_prompt_async()
-                .session_id(session_id)
-                .directory(&directory)
-                .body(body)
-                .send(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Rejected("OpenCode prompt submission timed out".into()))?
-        .map_err(|_| api_failure("session prompt"))?;
-        let (tx, rx) = mpsc::channel(128);
-        tx.send(runtime_event(
-            1,
-            session_id,
-            "response.admitted",
-            &admitted_payload,
-        )?)
-        .await
-        .map_err(|_| RuntimeError::StreamClosed)?;
-        let session_id = session_id.to_owned();
-        tokio::spawn(forward_sse_events(
-            event_response.into_inner(),
-            tx,
-            session_id,
-            2,
-        ));
-        Ok(PromptSubmission {
-            message_id,
-            events: rx,
-        })
+        self.runtime_handle()
+            .submit_with_attachments(session_id, prompt, attachments, options)
+            .await
     }
 }
 
@@ -1912,7 +2504,13 @@ impl AgentRuntime for OpenCodeSidecar {
         }
         match self.await_health().await {
             Ok(health) => match self.verify_openapi_contract().await {
-                Ok(()) => Ok(health),
+                Ok(()) => match self.publish_runtime_connection() {
+                    Ok(()) => Ok(health),
+                    Err(error) => {
+                        let _ = self.stop().await;
+                        Err(error)
+                    }
+                },
                 Err(error) => {
                     let _ = self.stop().await;
                     Err(error)
@@ -1937,6 +2535,10 @@ impl AgentRuntime for OpenCodeSidecar {
         if let Ok(mut emergency_client) = self.emergency_client.write() {
             *emergency_client = None;
         }
+        if let Ok(mut connection) = self.runtime_connection.write() {
+            *connection = None;
+        }
+        self.turn_states.clear();
         self.tool_bridge = None;
         if let Ok(mut sessions) = self.session_directories.write() {
             sessions.clear();
@@ -1948,320 +2550,56 @@ impl AgentRuntime for OpenCodeSidecar {
         &mut self,
         working_directory: Option<&Path>,
     ) -> Result<Vec<ModelCapability>, RuntimeError> {
-        let directory = working_directory
-            .map(std::fs::canonicalize)
-            .transpose()?
-            .map(|path| path.display().to_string());
-        let query = directory
-            .map(|directory| vec![("directory", directory)])
-            .unwrap_or_default();
-        // Provider metadata evolves additively between OpenCode releases. Read
-        // it as reviewed JSON so unknown provider fields cannot break the
-        // desktop model selector through strict generated-response decoding.
-        let value = self
-            .request_json(reqwest::Method::GET, "/provider", &query, None)
+        self.runtime_handle()
+            .discover_models_inner(working_directory)
             .await
-            .map_err(|_| api_failure("model discovery"))?;
-        let connected = value
-            .get("connected")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<BTreeSet<_>>();
-        let providers = value
-            .get("all")
-            .and_then(Value::as_array)
-            .ok_or_else(|| api_failure("provider response shape"))?;
-        Ok(providers
-            .iter()
-            .filter(|provider| {
-                provider
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|provider_id| connected.contains(provider_id))
-            })
-            .flat_map(|provider| {
-                let provider_id = provider
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                provider
-                    .get("models")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(move |(catalog_id, model)| {
-                        if provider_id.is_empty() {
-                            return None;
-                        }
-                        let model_id = model
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or(catalog_id)
-                            .to_owned();
-                        Some(ModelCapability {
-                            local: is_local_provider(&provider_id),
-                            reasoning: model
-                                .pointer("/capabilities/reasoning")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            tool_calls: model
-                                .pointer("/capabilities/toolcall")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            provider_id: provider_id.clone(),
-                            model_id,
-                            context_tokens: numeric_u64(model.pointer("/limit/context")),
-                            input_modalities: enabled_modalities(
-                                model.pointer("/capabilities/input"),
-                            ),
-                            output_modalities: enabled_modalities(
-                                model.pointer("/capabilities/output"),
-                            ),
-                        })
-                    })
-            })
-            .collect())
     }
+
     async fn begin_session(&mut self, options: SessionOptions) -> Result<String, RuntimeError> {
-        let use_fork_environment = use_fork_session_environment(
-            std::env::var("PERSONAL_AGENT_OPENCODE_SOURCE")
-                .ok()
-                .as_deref(),
-            !options.environment.is_empty(),
-        )?;
-        if options.effort.is_some() && options.model.is_none() {
-            return Err(RuntimeError::Rejected(
-                "model effort requires an explicit provider/model selection".into(),
-            ));
-        }
-        let directory = std::fs::canonicalize(&options.working_directory)?;
-        if !directory.is_dir() {
-            return Err(RuntimeError::Rejected(
-                "session working directory is not a directory".into(),
-            ));
-        }
-        let directory_text = directory.display().to_string();
-        let mut body = serde_json::Map::new();
-        if let Some(agent) = options.agent {
-            body.insert("agent".to_owned(), Value::String(agent));
-        }
-        if use_fork_environment {
-            body.insert(
-                "environment".to_owned(),
-                serde_json::to_value(options.environment)
-                    .map_err(|_| api_failure("session environment"))?,
-            );
-        }
-        if let Some(model) = options.model {
-            let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
-                RuntimeError::Rejected("model must use provider/model syntax".into())
-            })?;
-            if provider_id.is_empty() || model_id.is_empty() {
-                return Err(RuntimeError::Rejected(
-                    "model must use non-empty provider/model syntax".into(),
-                ));
-            }
-            body.insert(
-                "model".to_owned(),
-                serde_json::json!({
-                    "providerID": provider_id,
-                    "id": model_id,
-                    "variant": options.effort,
-                }),
-            );
-        }
-        let session_id = if use_fork_environment {
-            let response = self
-                .request_json(
-                    reqwest::Method::POST,
-                    "/session",
-                    &[("directory", directory_text)],
-                    Some(Value::Object(body)),
-                )
-                .await
-                .map_err(|_| api_failure("session create"))?;
-            response_identifier(response, "/id", "session create")
-        } else {
-            let body = generated_body::<opencode_api::types::SessionCreateBody>(
-                Value::Object(body),
-                "session create body",
-            )?;
-            let response = self
-                .generated_client()?
-                .session_create()
-                .directory(&directory_text)
-                .body(body)
-                .send()
-                .await
-                .map_err(|_| api_failure("session create"))?;
-            response_identifier(response.into_inner(), "/id", "session create")
-        }?;
-        self.register_session_directory(session_id.clone(), directory)?;
-        Ok(session_id)
+        self.runtime_handle().begin_session_inner(options).await
     }
+
     async fn resume_session(
         &mut self,
         session_id: &str,
         working_directory: &Path,
     ) -> Result<(), RuntimeError> {
-        let directory = std::fs::canonicalize(working_directory)?;
-        let directory_text = directory.display().to_string();
-        self.generated_client()?
-            .session_get()
-            .session_id(session_id)
-            .directory(&directory_text)
-            .send()
+        self.runtime_handle()
+            .resume_session_inner(session_id, working_directory)
             .await
-            .map_err(|_| api_failure("session resume"))?;
-        self.register_session_directory(session_id.to_owned(), directory)?;
-        Ok(())
     }
+
     async fn compact_session(&mut self, session_id: &str) -> Result<(), RuntimeError> {
-        let directory = self.registered_session_directory(session_id)?;
-        let session = self
-            .generated_client()?
-            .session_get()
-            .session_id(session_id)
-            .directory(&directory)
-            .send()
+        self.runtime_handle()
+            .compact_session_inner(session_id)
             .await
-            .map_err(|_| api_failure("session compact model lookup"))?;
-        let session = serde_json::to_value(session.into_inner())
-            .map_err(|_| api_failure("session compact model response"))?;
-        let provider_id = session
-            .pointer("/model/providerID")
-            .and_then(Value::as_str)
-            .ok_or_else(|| api_failure("session compact model selection"))?;
-        let model_id = session
-            .pointer("/model/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| api_failure("session compact model selection"))?;
-        let body = generated_body::<opencode_api::types::SessionSummarizeBody>(
-            serde_json::json!({
-                "providerID": provider_id,
-                "modelID": model_id,
-                "auto": false,
-            }),
-            "session compact body",
-        )?;
-        self.generated_client()?
-            .session_summarize()
-            .session_id(session_id)
-            .directory(&directory)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| api_failure("session compact"))?;
-        Ok(())
     }
+
     async fn fork_session(&mut self, session_id: &str) -> Result<String, RuntimeError> {
-        let directory = self.registered_session_directory(session_id)?;
-        let body = generated_body::<opencode_api::types::SessionForkBody>(
-            serde_json::json!({}),
-            "session fork body",
-        )?;
-        let response = self
-            .generated_client()?
-            .session_fork()
-            .session_id(session_id)
-            .directory(&directory)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| api_failure("session fork"))?;
-        let fork = response_identifier(response.into_inner(), "/id", "session fork")?;
-        self.register_session_directory(fork.clone(), PathBuf::from(directory))?;
-        Ok(fork)
+        self.runtime_handle().fork_session_inner(session_id).await
     }
+
     async fn abort_session(&mut self, session_id: &str) -> Result<(), RuntimeError> {
-        let directory = self.registered_session_directory(session_id)?;
-        self.generated_client()?
-            .session_abort()
-            .session_id(session_id)
-            .directory(&directory)
-            .send()
-            .await
-            .map_err(|_| api_failure("session abort"))?;
-        Ok(())
+        self.runtime_handle().abort_session_inner(session_id).await
     }
+
     async fn submit(
         &mut self,
         session_id: &str,
         prompt: &str,
         plan: Option<Value>,
     ) -> Result<mpsc::Receiver<EventEnvelope>, RuntimeError> {
-        if plan.is_some() {
-            return Err(RuntimeError::Rejected(
-                "structured plan submission is not supported by the pinned runtime API".into(),
-            ));
-        }
-        Ok(self
-            .submit_with_attachments(session_id, prompt, Vec::new(), PromptOptions::default())
-            .await?
-            .events)
+        self.runtime_handle()
+            .submit_inner(session_id, prompt, plan)
+            .await
     }
+
     async fn answer(
         &mut self,
         session_id: &str,
         answer: RuntimeAnswer,
     ) -> Result<(), RuntimeError> {
-        let kind = answer
-            .answer
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::Rejected("runtime answer kind is required".into()))?;
-        let directory = self.registered_session_directory(session_id)?;
-        match kind {
-            "permission" => {
-                let body = generated_body::<opencode_api::types::PermissionReplyBody>(
-                    serde_json::json!({
-                        "reply": answer.answer.get("reply"),
-                        "message": answer.answer.get("message"),
-                    }),
-                    "permission answer",
-                )?;
-                self.generated_client()?
-                    .permission_reply()
-                    .request_id(&answer.request_id)
-                    .directory(&directory)
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|_| api_failure("permission answer"))?;
-            }
-            "question" if answer.answer.get("reject") == Some(&Value::Bool(true)) => {
-                self.generated_client()?
-                    .question_reject()
-                    .request_id(&answer.request_id)
-                    .directory(&directory)
-                    .send()
-                    .await
-                    .map_err(|_| api_failure("question rejection"))?;
-            }
-            "question" => {
-                let body = generated_body::<opencode_api::types::QuestionReplyBody>(
-                    serde_json::json!({"answers": answer.answer.get("answers")}),
-                    "question answer",
-                )?;
-                self.generated_client()?
-                    .question_reply()
-                    .request_id(&answer.request_id)
-                    .directory(&directory)
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|_| api_failure("question answer"))?;
-            }
-            _ => {
-                return Err(RuntimeError::Rejected(
-                    "runtime answer kind must be permission or question".into(),
-                ));
-            }
-        }
-        Ok(())
+        self.runtime_handle().answer_inner(session_id, answer).await
     }
 }
 
@@ -2897,6 +3235,207 @@ impl AgentRuntime for FakeRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone)]
+    struct FakeRuntimeHttp {
+        handle: RuntimeHandle,
+    }
+
+    impl FakeRuntimeHttp {
+        async fn chat_turn(&self) -> Result<Value, RuntimeError> {
+            self.handle
+                .request_json(reqwest::Method::POST, "/chat-turn", &[], Some(json!({})))
+                .await
+        }
+
+        async fn runtime_resource(&self, index: usize) -> Result<Value, RuntimeError> {
+            self.handle
+                .request_json(
+                    reqwest::Method::GET,
+                    "/runtime-resource",
+                    &[("index", index.to_string())],
+                    None,
+                )
+                .await
+        }
+    }
+
+    async fn spawn_fake_runtime() -> (
+        FakeRuntimeHttp,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TokioTcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind fake runtime");
+        let endpoint = Url::parse(&format!(
+            "http://{}/",
+            listener.local_addr().expect("fake runtime address")
+        ))
+        .expect("fake runtime URL");
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_server = Arc::clone(&active);
+        let maximum_for_server = Arc::clone(&maximum);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..21 {
+                let (mut stream, _) = listener.accept().await.expect("accept fake request");
+                let active = Arc::clone(&active_for_server);
+                let maximum = Arc::clone(&maximum_for_server);
+                requests.push(tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1_024];
+                    loop {
+                        let read = stream.read(&mut buffer).await.expect("read fake request");
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n")
+                            || request.len() >= 16 * 1_024
+                        {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let in_flight = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(in_flight, Ordering::SeqCst);
+                    let delay = if request.starts_with("POST /chat-turn ") {
+                        Duration::from_millis(300)
+                    } else {
+                        Duration::from_millis(20)
+                    };
+                    tokio::time::sleep(delay).await;
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                        )
+                        .await
+                        .expect("write fake response");
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for request in requests {
+                request.await.expect("fake request task");
+            }
+        });
+        let authenticated_client = reqwest::Client::builder()
+            .build()
+            .expect("fake authenticated client");
+        let generated_client = opencode_api::Client::new_with_client(
+            endpoint.as_str().trim_end_matches('/'),
+            authenticated_client.clone(),
+        );
+        let connection = RuntimeConnection {
+            endpoint,
+            generated_client,
+            authenticated_client,
+        };
+        let handle = RuntimeHandle {
+            connection: Arc::new(RwLock::new(Some(connection))),
+            session_directories: Arc::new(RwLock::new(BTreeMap::new())),
+            turn_states: Arc::new(DashMap::new()),
+        };
+        (FakeRuntimeHttp { handle }, maximum, server)
+    }
+
+    #[tokio::test]
+    async fn runtime_handle_allows_chat_and_twenty_resources_to_overlap() {
+        let (runtime, maximum, server) = spawn_fake_runtime().await;
+        let started = tokio::time::Instant::now();
+        let chat_runtime = runtime.clone();
+        let chat = tokio::spawn(async move { chat_runtime.chat_turn().await });
+        let resources = (0..20).map(|index| {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.runtime_resource(index).await })
+        });
+        let resources = futures_util::future::join_all(resources);
+        let (chat, resources) = tokio::join!(chat, resources);
+        assert_eq!(chat.expect("chat task").expect("chat response")["ok"], true);
+        for resource in resources {
+            assert_eq!(
+                resource.expect("resource task").expect("resource response")["ok"],
+                true
+            );
+        }
+        server.await.expect("fake runtime server");
+        let elapsed = started.elapsed();
+        let maximum = maximum.load(Ordering::SeqCst);
+        println!(
+            "PERF-10 concurrency elapsed_ms={} max_in_flight={maximum}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "concurrent handle took {elapsed:?}; serialized time is at least 700 ms"
+        );
+        assert!(maximum > 1, "fake runtime observed no overlapping calls");
+    }
+
+    #[test]
+    fn replacement_sidecar_keeps_retained_runtime_handle_state() {
+        let profile = tempfile::tempdir().expect("temporary runtime profile");
+        let first = OpenCodeSidecar::new(isolated_sidecar_config(
+            PathBuf::from("first-opencode"),
+            profile.path(),
+        ));
+        let retained = first.runtime_handle();
+        let control = first.emergency_control();
+        let replacement = OpenCodeSidecar::with_emergency_control(
+            isolated_sidecar_config(PathBuf::from("replacement-opencode"), profile.path()),
+            &control,
+        );
+        let replacement_handle = replacement.runtime_handle();
+
+        assert!(Arc::ptr_eq(
+            &retained.connection,
+            &replacement_handle.connection
+        ));
+        assert!(Arc::ptr_eq(
+            &retained.session_directories,
+            &replacement_handle.session_directories
+        ));
+        assert!(Arc::ptr_eq(
+            &retained.turn_states,
+            &replacement_handle.turn_states
+        ));
+        let endpoint = Url::parse("http://127.0.0.1:9/").expect("fixture URL");
+        let authenticated_client = reqwest::Client::new();
+        *replacement_handle
+            .connection
+            .write()
+            .expect("replacement connection lock") = Some(RuntimeConnection {
+            endpoint: endpoint.clone(),
+            generated_client: opencode_api::Client::new_with_client(
+                endpoint.as_str().trim_end_matches('/'),
+                authenticated_client.clone(),
+            ),
+            authenticated_client,
+        });
+        assert_eq!(
+            retained
+                .api_client()
+                .expect("retained published client")
+                .endpoint,
+            endpoint
+        );
+        replacement_handle.turn_states.insert(
+            "ses_replacement".to_owned(),
+            TurnState {
+                message_id: "msg_replacement".to_owned(),
+                directory: profile.path().display().to_string(),
+            },
+        );
+        assert_eq!(
+            retained
+                .turn_state("ses_replacement")
+                .expect("retained handle turn state")
+                .message_id(),
+            "msg_replacement"
+        );
+    }
 
     #[test]
     fn opencode_source_selects_only_reviewed_contract_fingerprints() {

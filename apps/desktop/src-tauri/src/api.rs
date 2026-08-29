@@ -481,7 +481,7 @@ pub(crate) async fn save_config(
         .write()
         .map_err(|_| "configuration lock is poisoned".to_owned())? = validated.config.clone();
 
-    let mut runtime = state.runtime.lock().await;
+    let mut runtime = state.runtime.write().await;
     runtime.stop().await.map_err(|error| error.to_string())?;
     *runtime = configured_runtime(&state, &validated.config);
     let health = runtime.start().await.map_err(|error| error.to_string())?;
@@ -639,11 +639,6 @@ pub(crate) async fn chat_send(
         .await
         .map_err(|error| error.to_string())?;
     let runtime_api = runtime.api_client().map_err(|error| error.to_string())?;
-    state
-        .turn_clients
-        .write()
-        .map_err(|_| "turn client lock is poisoned".to_owned())?
-        .insert(session_id.clone(), runtime_api.clone());
     drop(runtime);
     *state.active_session.lock().await = Some(ActiveSession {
         id: session_id.clone(),
@@ -859,19 +854,23 @@ pub(crate) async fn chat_turn_status(
     }
     let config = config_snapshot(&state)?;
     let directory = canonical_directory(&config, directory.as_deref())?;
-    let runtime_api = state
-        .turn_clients
-        .read()
-        .map_err(|_| "turn client lock is poisoned".to_owned())?
-        .get(&session_id)
-        .cloned()
-        .ok_or_else(|| "turn recovery client is unavailable".to_owned())?;
+    let runtime = state.runtime.lock().await;
+    let turn = runtime
+        .turn_state(&session_id)
+        .ok_or_else(|| "turn recovery state is unavailable".to_owned())?;
+    if turn.message_id() != prompt_message_id {
+        return Err("turn recovery message does not match the session's latest turn".to_owned());
+    }
+    if Path::new(turn.directory()) != directory {
+        return Err("turn recovery directory does not match the submitted turn".to_owned());
+    }
+    let runtime_api = runtime.api_client().map_err(|error| error.to_string())?;
     let route = format!("/session/{session_id}/message");
     let messages = runtime_api
         .request_json(
             reqwest::Method::GET,
             &route,
-            &[("directory", directory.display().to_string())],
+            &[("directory", turn.directory().to_owned())],
             None,
         )
         .await

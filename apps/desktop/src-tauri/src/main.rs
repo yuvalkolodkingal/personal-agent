@@ -27,10 +27,10 @@ use personal_agent_core::{
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
 use personal_agent_runtime::{
-    AgentRuntime, OpenCodeApiClient, OpenCodeConfig, OpenCodeSidecar, OpenCodeSidecarControl,
+    AgentRuntime, OpenCodeConfig, OpenCodeSidecar, OpenCodeSidecarControl, RuntimeHandle,
     RuntimeHealth,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
@@ -46,9 +46,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct DesktopState {
     profile: Arc<Mutex<ProfileState>>,
     memory: Mutex<PersistentMemory>,
-    runtime: tokio::sync::Mutex<OpenCodeSidecar>,
+    runtime: RuntimeAccess,
     runtime_emergency_control: OpenCodeSidecarControl,
-    turn_clients: RwLock<BTreeMap<String, OpenCodeApiClient>>,
     config: RwLock<PersonalAgentConfig>,
     config_path: PathBuf,
     sidecar_executable: PathBuf,
@@ -65,6 +64,34 @@ struct DesktopState {
     migration_review: Mutex<Option<MigrationReview>>,
     app_data: PathBuf,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+/// Separates process lifecycle mutation from the cloneable runtime data plane.
+///
+/// Existing host modules call `lock()` to take a handle; that method acquires
+/// only a short-lived read lock and returns immediately. Start, stop and config
+/// replacement are the only operations that hold the lifecycle write lock.
+struct RuntimeAccess {
+    lifecycle: tokio::sync::RwLock<OpenCodeSidecar>,
+    handle: tokio::sync::RwLock<RuntimeHandle>,
+}
+
+impl RuntimeAccess {
+    fn new(sidecar: OpenCodeSidecar) -> Self {
+        let handle = sidecar.runtime_handle();
+        Self {
+            lifecycle: tokio::sync::RwLock::new(sidecar),
+            handle: tokio::sync::RwLock::new(handle),
+        }
+    }
+
+    async fn lock(&self) -> RuntimeHandle {
+        self.handle.read().await.clone()
+    }
+
+    async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, OpenCodeSidecar> {
+        self.lifecycle.write().await
+    }
 }
 
 #[derive(Clone)]
@@ -401,11 +428,11 @@ enum RuntimeShutdownPath {
 }
 
 async fn shutdown_runtime(
-    runtime: &tokio::sync::Mutex<OpenCodeSidecar>,
+    runtime: &RuntimeAccess,
     emergency_control: &OpenCodeSidecarControl,
     lock_timeout: Duration,
 ) -> Result<RuntimeShutdownPath, personal_agent_runtime::RuntimeError> {
-    if let Ok(mut runtime) = tokio::time::timeout(lock_timeout, runtime.lock()).await {
+    if let Ok(mut runtime) = tokio::time::timeout(lock_timeout, runtime.write()).await {
         tracing::info!(path = "lifecycle-lock", "runtime shutdown path selected");
         runtime.stop().await?;
         Ok(RuntimeShutdownPath::LifecycleLock)
@@ -687,9 +714,8 @@ fn main() {
                     app.manage(DesktopState {
                         profile,
                         memory: Mutex::new(memory),
-                        runtime: tokio::sync::Mutex::new(sidecar),
+                        runtime: RuntimeAccess::new(sidecar),
                         runtime_emergency_control,
-                        turn_clients: RwLock::new(BTreeMap::new()),
                         config: RwLock::new(config.config),
                         config_path,
                         sidecar_executable,
@@ -740,7 +766,7 @@ fn main() {
                         let runtime_handle = handle.clone();
                         let runtime_start = async move {
                             let state = runtime_handle.state::<DesktopState>();
-                            match state.runtime.lock().await.start().await {
+                            match state.runtime.write().await.start().await {
                                 Ok(health) => health,
                                 Err(error) => RuntimeHealth {
                                     healthy: false,
@@ -1036,8 +1062,8 @@ mod tests {
         let health = sidecar.start().await.expect("start bundled sidecar");
         assert!(health.healthy);
         let emergency_control = sidecar.emergency_control();
-        let runtime = tokio::sync::Mutex::new(sidecar);
-        let mut held_runtime = runtime.lock().await;
+        let runtime = RuntimeAccess::new(sidecar);
+        let mut held_runtime = runtime.write().await;
 
         let path = shutdown_runtime(&runtime, &emergency_control, Duration::from_millis(25))
             .await
