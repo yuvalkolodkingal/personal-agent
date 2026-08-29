@@ -356,16 +356,141 @@ fn redact_secrets(value: Value) -> Value {
 }
 
 fn redact_secret_text(text: &str) -> String {
-    if text.contains("-----BEGIN")
-        || text.contains("Bearer ")
-        || text.contains("sk-")
-        || text.contains("ghp_")
-        || text.contains("github_pat_")
-    {
+    if contains_secret_pattern(text) {
         "[REDACTED]".into()
     } else {
         text.into()
     }
+}
+
+fn contains_secret_pattern(text: &str) -> bool {
+    // Preserve the established sentinels before applying the more structured
+    // detectors below. A PEM body must never survive merely because its exact
+    // label is new to us.
+    text.contains("-----BEGIN")
+        || text.contains("Bearer ")
+        || text.contains("sk-")
+        || text.contains("ghp_")
+        || text.contains("github_pat_")
+        || contains_prefixed_run(text, "AKIA", 16, |byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit()
+        })
+        || contains_prefixed_run(text, "sk-", 20, |byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+        })
+        || ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"]
+            .iter()
+            .any(|prefix| text.contains(prefix))
+        || contains_jwt(text)
+        || contains_keyed_long_secret(text)
+}
+
+fn contains_prefixed_run(
+    text: &str,
+    prefix: &str,
+    minimum_length: usize,
+    allowed: impl Fn(u8) -> bool,
+) -> bool {
+    text.match_indices(prefix).any(|(start, _)| {
+        text.as_bytes()[start + prefix.len()..]
+            .iter()
+            .copied()
+            .take_while(|byte| allowed(*byte))
+            .count()
+            >= minimum_length
+    })
+}
+
+fn contains_jwt(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|start| {
+        if !bytes[start..].starts_with(b"eyJ") {
+            return false;
+        }
+        let mut cursor = start + 3;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| is_base64_url_byte(*byte))
+        {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'.') {
+            return false;
+        }
+        cursor += 1;
+        let second_start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| is_base64_url_byte(*byte))
+        {
+            cursor += 1;
+        }
+        if cursor == second_start || bytes.get(cursor) != Some(&b'.') {
+            return false;
+        }
+        cursor += 1;
+        bytes
+            .get(cursor)
+            .is_some_and(|byte| is_base64_url_byte(*byte))
+    })
+}
+
+fn contains_keyed_long_secret(text: &str) -> bool {
+    const KEY_NAMES: [&[u8]; 4] = [b"token", b"secret", b"key", b"password"];
+    let bytes = text.as_bytes();
+
+    (0..bytes.len()).any(|start| {
+        KEY_NAMES.iter().any(|key| {
+            let Some(candidate) = bytes.get(start..start + key.len()) else {
+                return false;
+            };
+            if !candidate.eq_ignore_ascii_case(key) {
+                return false;
+            }
+
+            let mut cursor = start + key.len();
+            if bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            {
+                cursor += 1;
+            }
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if !bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b':' | b'='))
+            {
+                return false;
+            }
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            {
+                cursor += 1;
+            }
+
+            bytes[cursor..]
+                .iter()
+                .copied()
+                .take_while(|byte| is_base64_byte(*byte))
+                .count()
+                >= 32
+        })
+    })
+}
+
+fn is_base64_url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')
+}
+
+fn is_base64_byte(byte: u8) -> bool {
+    is_base64_url_byte(byte) || matches!(byte, b'+' | b'/')
 }
 
 #[cfg(test)]
@@ -436,19 +561,50 @@ mod tests {
 
     #[test]
     fn mutation_corpus_secret_shapes_are_always_redacted() {
-        let secret_shapes = [
+        let legacy_secret_shapes = [
             ["-----BE", "GIN PRIVATE KEY-----fixture"].concat(),
             ["Bear", "er fixture-token"].concat(),
             ["s", "k-fixture-token"].concat(),
             ["gh", "p_fixture-token"].concat(),
             ["github_", "pat_fixture-token"].concat(),
         ];
+        let pattern_secret_shapes = [
+            ["AK", "IA1234567890ABCDEF"].concat(),
+            ["s", "k-abcdefghijklmnopqrst"].concat(),
+            ["s", "k-abcd_EFGH-ijklmnop1234"].concat(),
+            ["xox", "b-fixture"].concat(),
+            ["xox", "a-fixture"].concat(),
+            ["xox", "p-fixture"].concat(),
+            ["xox", "r-fixture"].concat(),
+            ["xox", "s-fixture"].concat(),
+            ["ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"].concat(),
+            [
+                "-----BE",
+                "GIN RSA PRIVATE KEY-----\nfixture\n-----END RSA PRIVATE KEY-----",
+            ]
+            .concat(),
+            [
+                "-----BE",
+                "GIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----",
+            ]
+            .concat(),
+            ["token=", "0123456789abcdef0123456789abcdef"].concat(),
+            ["SECRET : ", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"].concat(),
+            ["key=", "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo012345"].concat(),
+            ["password = ", "abcd_EFGH-ijklmnop_QRST-uvwxyz123456"].concat(),
+            ["\"token\": \"", "0123456789abcdef0123456789abcdef\""].concat(),
+        ];
+        assert!(pattern_secret_shapes.len() >= 12);
+        let secret_shapes = legacy_secret_shapes
+            .iter()
+            .chain(pattern_secret_shapes.iter())
+            .collect::<Vec<_>>();
         let mut state = 0xa076_1d64_78bd_642f_u64;
         for _ in 0..2_048 {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
-            let secret = &secret_shapes[usize::try_from(state).unwrap_or(0) % secret_shapes.len()];
+            let secret = secret_shapes[usize::try_from(state).unwrap_or(0) % secret_shapes.len()];
             let padding = format!("{:016x}", state.wrapping_mul(0x2545_f491_4f6c_dd1d));
             let value = serde_json::json!({
                 "ordinary": format!("{padding}{secret}{padding}"),
@@ -458,6 +614,17 @@ mod tests {
             let serialized = serde_json::to_string(&redacted).expect("serialize");
             assert!(!serialized.contains(secret));
             assert!(serialized.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn similar_non_secret_text_is_not_over_redacted() {
+        for text in [
+            "AKIA1234",
+            "eyJhbGciOiJIUzI1NiJ9.only-one-dot",
+            "token=short",
+        ] {
+            assert_eq!(redact_secret_text(text), text);
         }
     }
 
