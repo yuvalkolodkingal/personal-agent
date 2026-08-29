@@ -321,6 +321,11 @@ type Diagnostic = {
   }>;
 };
 
+type CapabilitiesReady = {
+  capabilities: Diagnostic["capabilities"] | null;
+  error?: string | null;
+};
+
 const emptyProjection: Projection = {
   last_sequence: 0,
   active_profile: "default",
@@ -3337,6 +3342,56 @@ export function App() {
   const [voiceUi, setVoiceUi] = useState<VoicePresentation>(() =>
     voicePresentation("offline"),
   );
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    let firstFrame: number | undefined;
+    let paintedFrame: number | undefined;
+    const signalPaint = () => {
+      if (disposed) return;
+      void invoke("startup_window_painted").catch((caught) => {
+        if (!disposed) setBootError(String(caught));
+      });
+    };
+    const signalAfterPaint = () => {
+      if (typeof window.requestAnimationFrame !== "function") {
+        signalPaint();
+        return;
+      }
+      firstFrame = window.requestAnimationFrame(() => {
+        paintedFrame = window.requestAnimationFrame(signalPaint);
+      });
+    };
+    void listen<CapabilitiesReady>("capabilities-ready", ({ payload }) => {
+      if (disposed) return;
+      if (payload.capabilities) {
+        setDiagnostic((current) => ({
+          ...current,
+          capabilities: payload.capabilities ?? [],
+        }));
+      }
+      if (payload.error) setBootError(payload.error);
+    })
+      .then((dispose) => {
+        if (disposed) dispose();
+        else {
+          unlisten = dispose;
+          signalAfterPaint();
+        }
+      })
+      .catch((caught) => {
+        if (!disposed) {
+          setBootError(String(caught));
+          signalAfterPaint();
+        }
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+      if (firstFrame !== undefined) window.cancelAnimationFrame(firstFrame);
+      if (paintedFrame !== undefined) window.cancelAnimationFrame(paintedFrame);
+    };
+  }, []);
   useEffect(() => {
     void invoke<Bootstrap>("bootstrap")
       .then((data) => {

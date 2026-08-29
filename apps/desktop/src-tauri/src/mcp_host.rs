@@ -64,8 +64,7 @@ impl OAuthAttemptRegistry {
 impl McpHostState {
     pub(crate) fn load(app_data: &Path) -> Result<Self, String> {
         let path = app_data.join("mcp/manager.json");
-        let existed = path.exists();
-        let mut manager = if existed {
+        let mut manager = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
                 .map_err(|error| format!("MCP manager state is invalid: {error}"))?
         } else {
@@ -77,15 +76,6 @@ impl McpHostState {
             manager: Mutex::new(manager),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
         };
-        // Persist normalized transient lifecycle state before it can be shown
-        // or synchronized into the newly-created OpenCode sidecar.
-        if existed {
-            let manager = state
-                .manager
-                .lock()
-                .map_err(|_| "MCP manager lock is poisoned".to_owned())?;
-            state.save(&manager)?;
-        }
         Ok(state)
     }
 
@@ -1490,7 +1480,10 @@ mod tests {
         .unwrap();
         drop(host);
 
+        let manager_path = directory.path().join("mcp/manager.json");
+        let persisted_before_reload = fs::read(&manager_path).unwrap();
         let restored = McpHostState::load(directory.path()).unwrap();
+        assert_eq!(fs::read(&manager_path).unwrap(), persisted_before_reload);
         let snapshot = read_manager(&restored, |manager| Ok(manager.snapshot())).unwrap();
         let server = snapshot
             .servers
@@ -1507,11 +1500,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = fs::metadata(directory.path().join("mcp/manager.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = fs::metadata(manager_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
     }

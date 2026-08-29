@@ -80,6 +80,43 @@ describe("desktop workspace", () => {
     vi.restoreAllMocks();
   });
 
+  it("subscribes before signaling first paint and applies deferred capabilities", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(listeners.has("capabilities-ready")).toBe(true),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("startup_window_painted"),
+    );
+    const listenIndex = listen.mock.calls.findIndex(
+      ([event]) => event === "capabilities-ready",
+    );
+    const paintIndex = invoke.mock.calls.findIndex(
+      ([command]) => command === "startup_window_painted",
+    );
+    expect(listen.mock.invocationCallOrder[listenIndex]).toBeLessThan(
+      invoke.mock.invocationCallOrder[paintIndex]!,
+    );
+
+    act(() =>
+      listeners.get("capabilities-ready")?.({
+        payload: {
+          capabilities: [
+            {
+              id: "desktop.active_view",
+              backend: "AT-SPI",
+              status: { state: "supported" },
+            },
+          ],
+          error: null,
+        },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
+    expect(screen.getByText("desktop.active_view")).toBeInTheDocument();
+    expect(screen.getByText("AT-SPI")).toBeInTheDocument();
+  });
+
   it("shows explicit private microphone state and disables capture until native STT is ready", () => {
     render(<App />);
     expect(
@@ -317,7 +354,7 @@ describe("desktop workspace", () => {
         <App />
       </StrictMode>,
     );
-    await waitFor(() => expect(pending).toHaveLength(6));
+    await waitFor(() => expect(pending).toHaveLength(8));
     await act(async () => {
       for (const registration of pending) {
         registration.resolve(() =>

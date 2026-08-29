@@ -2,16 +2,53 @@
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 const MAX_TURN_SAMPLES: usize = 512;
 
 #[derive(Default)]
 struct PerfSamples {
     startup_phases_microseconds: BTreeMap<String, u64>,
+    startup_span_timeline: Vec<StartupSpanEvent>,
     turn_first_delta_microseconds: VecDeque<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct StartupSpanEvent {
+    order: u64,
+    span: String,
+    event: &'static str,
+}
+
+/// One-shot renderer-paint barrier for probes that may block the native setup thread.
+#[derive(Clone, Default)]
+pub(crate) struct StartupReadiness {
+    window_painted: Arc<AtomicBool>,
+    window_painted_notify: Arc<Notify>,
+}
+
+impl StartupReadiness {
+    /// Release deferred startup work after the renderer has presented its first frame.
+    pub(crate) fn mark_window_painted(&self) {
+        if !self.window_painted.swap(true, Ordering::AcqRel) {
+            record_startup_milestone("window_paint");
+            self.window_painted_notify.notify_waiters();
+        }
+    }
+
+    /// Wait without losing a notification that races with waiter registration.
+    pub(crate) async fn wait_for_window_paint(&self) {
+        while !self.window_painted.load(Ordering::Acquire) {
+            let notified = self.window_painted_notify.notified();
+            if self.window_painted.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
 }
 
 static PERF_SAMPLES: OnceLock<Mutex<PerfSamples>> = OnceLock::new();
@@ -32,11 +69,30 @@ pub(crate) fn startup_phase<T>(
     operation: impl FnOnce() -> T,
 ) -> T {
     let started = Instant::now();
+    record_startup_span_event(name, "start");
     span.in_scope(|| {
         let result = operation();
         record_startup_phase(name, started.elapsed());
+        record_startup_span_event(name, "complete");
         result
     })
+}
+
+fn record_startup_span_event(name: &'static str, event: &'static str) {
+    if let Ok(mut samples) = samples().lock() {
+        let order = u64::try_from(samples.startup_span_timeline.len()).unwrap_or(u64::MAX);
+        samples.startup_span_timeline.push(StartupSpanEvent {
+            order,
+            span: name.to_owned(),
+            event,
+        });
+    }
+}
+
+/// Record an instantaneous startup event in the same ordering stream as phase spans.
+pub(crate) fn record_startup_milestone(name: &'static str) {
+    record_startup_span_event(name, "milestone");
+    tracing::info!(phase = name, "startup milestone reached");
 }
 
 /// Retain the last cold-start measurement for a named phase.
@@ -122,6 +178,7 @@ pub(crate) fn report() -> Value {
         "measurement": "live-process-monotonic",
         "last_cold_start": {
             "phases_microseconds": samples.startup_phases_microseconds,
+            "span_timeline": samples.startup_span_timeline,
             "startup_native_setup_microseconds": samples
                 .startup_phases_microseconds
                 .get("native_setup")

@@ -424,8 +424,9 @@ async fn shutdown_runtime(
 }
 
 fn clean_shutdown(app: &tauri::AppHandle) {
-    let capabilities = app.state::<capabilities::CapabilityState>();
-    tauri::async_runtime::block_on(capabilities.shutdown_portal());
+    if let Some(capabilities) = app.try_state::<capabilities::CapabilityState>() {
+        tauri::async_runtime::block_on(capabilities.shutdown_portal());
+    }
     let pty = app.state::<pty_host::PtyHostState>();
     tauri::async_runtime::block_on(pty.shutdown());
     let state = app.state::<DesktopState>();
@@ -449,6 +450,30 @@ fn clean_shutdown(app: &tauri::AppHandle) {
         let _ = std::fs::remove_file(playback.wav);
     }
     tracing::info!("desktop host stopped");
+}
+
+struct DeferredNativeStates {
+    capabilities: Result<capabilities::CapabilityState, String>,
+    mcp: Result<mcp_host::McpHostState, String>,
+}
+
+async fn load_deferred_native_states(
+    app_data: PathBuf,
+    startup_readiness: perf::StartupReadiness,
+) -> Result<DeferredNativeStates, String> {
+    startup_readiness.wait_for_window_paint().await;
+    tokio::task::spawn_blocking(move || DeferredNativeStates {
+        capabilities: perf::startup_phase(
+            "capability_probe",
+            &tracing::info_span!("startup.capability_probe"),
+            || capabilities::CapabilityState::load(&app_data),
+        ),
+        mcp: perf::startup_phase("mcp_load", &tracing::info_span!("startup.mcp_load"), || {
+            mcp_host::McpHostState::load(&app_data)
+        }),
+    })
+    .await
+    .map_err(|error| format!("deferred native startup task failed: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -480,6 +505,12 @@ fn install_media_permission_handler(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn install_media_permission_handler(_: &tauri::App) -> tauri::Result<()> {
     Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects managed state into owned command arguments.
+fn startup_window_painted(startup_readiness: tauri::State<'_, perf::StartupReadiness>) {
+    startup_readiness.mark_window_painted();
 }
 
 #[allow(clippy::too_many_lines)] // Tauri setup keeps lifecycle ordering explicit in one entrypoint.
@@ -626,24 +657,15 @@ fn main() {
                 },
             )?;
             let runtime_emergency_control = sidecar.emergency_control();
-            let capability_state = perf::startup_phase(
-                "capability_probe",
-                &tracing::info_span!("startup.capability_probe"),
-                || capabilities::CapabilityState::load(&app_data),
-            )?;
-            let mcp_state = perf::startup_phase(
-                "mcp_load",
-                &tracing::info_span!("startup.mcp_load"),
-                || mcp_host::McpHostState::load(&app_data),
-            )?;
+            let deferred_app_data = app_data.clone();
+            let startup_readiness = perf::StartupReadiness::default();
             perf::startup_phase(
                 "state_install",
                 &tracing::info_span!("startup.state_install"),
                 || {
-                    app.manage(capability_state);
                     app.manage(pty_host::PtyHostState::default());
                     app.manage(connector_oauth::ConnectorOAuthState::default());
-                    app.manage(mcp_state);
+                    app.manage(startup_readiness.clone());
                     app.manage(automation_state);
                     app.manage(goals_state);
                     app.manage(DesktopState {
@@ -693,37 +715,116 @@ fn main() {
             })?;
 
             let handle = app.handle().clone();
+            let deferred_startup_readiness = startup_readiness;
             perf::startup_phase(
                 "runtime_spawn",
                 &tracing::info_span!("startup.runtime_spawn"),
                 || {
                     tauri::async_runtime::spawn(async move {
-                        let state = handle.state::<DesktopState>();
-                        let health = match state.runtime.lock().await.start().await {
-                            Ok(health) => health,
-                            Err(error) => RuntimeHealth {
-                                healthy: false,
-                                version: personal_agent_runtime::OPENCODE_VERSION.to_owned(),
-                                detail: error.to_string(),
-                            },
+                        let runtime_handle = handle.clone();
+                        let runtime_start = async move {
+                            let state = runtime_handle.state::<DesktopState>();
+                            match state.runtime.lock().await.start().await {
+                                Ok(health) => health,
+                                Err(error) => RuntimeHealth {
+                                    healthy: false,
+                                    version: personal_agent_runtime::OPENCODE_VERSION.to_owned(),
+                                    detail: error.to_string(),
+                                },
+                            }
                         };
+                        let deferred_startup = load_deferred_native_states(
+                            deferred_app_data,
+                            deferred_startup_readiness,
+                        );
+                        let (health, deferred_states) =
+                            tokio::join!(runtime_start, deferred_startup);
+
+                        match deferred_states {
+                            Ok(DeferredNativeStates { capabilities, mcp }) => {
+                                match capabilities {
+                                    Ok(capability_state) => {
+                                        let capabilities =
+                                            capability_state.diagnostic_capabilities().await;
+                                        if handle.manage(capability_state) {
+                                            perf::record_startup_milestone("capabilities_ready");
+                                            if let Err(error) = handle.emit(
+                                                "capabilities-ready",
+                                                serde_json::json!({
+                                                    "capabilities": capabilities,
+                                                    "error": null,
+                                                }),
+                                            ) {
+                                                tracing::warn!(%error, "capability readiness could not be emitted");
+                                            }
+                                        } else {
+                                            tracing::warn!("capability state was already installed");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, "native capabilities could not be loaded");
+                                        if let Err(emit_error) = handle.emit(
+                                            "capabilities-ready",
+                                            serde_json::json!({
+                                                "capabilities": null,
+                                                "error": error,
+                                            }),
+                                        ) {
+                                            tracing::warn!(%emit_error, "capability load failure could not be emitted");
+                                        }
+                                    }
+                                }
+                                match mcp {
+                                    Ok(mcp_state) => {
+                                        if handle.manage(mcp_state) {
+                                            let mcp = handle.state::<mcp_host::McpHostState>();
+                                            match mcp_host::mcp_manager_snapshot(mcp) {
+                                                Ok(snapshot) => {
+                                                    if let Err(error) = handle
+                                                        .emit("mcp-manager://changed", snapshot)
+                                                    {
+                                                        tracing::warn!(%error, "loaded MCP snapshot could not be emitted");
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(%error, "loaded MCP snapshot could not be read");
+                                                }
+                                            }
+                                        } else {
+                                            tracing::warn!("MCP host state was already installed");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, "MCP host state could not be loaded");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "deferred native startup failed");
+                            }
+                        }
+
+                        let state = handle.state::<DesktopState>();
                         tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
                         persist_runtime_health(&state, &health);
                         if health.healthy {
                             automation_host::ensure_resident_executor(handle.clone());
                             goals_host::ensure_resident_executor(handle.clone());
-                            let mcp = handle.state::<mcp_host::McpHostState>();
-                            match mcp_host::restore_enabled_servers(&mcp, &state).await {
-                                Ok(snapshot) => {
-                                    if let Err(error) =
-                                        handle.emit("mcp-manager://changed", snapshot)
-                                    {
-                                        tracing::warn!(%error, "restored MCP snapshot could not be emitted");
+                            if let Some(mcp) = handle.try_state::<mcp_host::McpHostState>() {
+                                match mcp_host::restore_enabled_servers(&mcp, &state).await {
+                                    Ok(snapshot) => {
+                                        if let Err(error) =
+                                            handle.emit("mcp-manager://changed", snapshot)
+                                        {
+                                            tracing::warn!(%error, "restored MCP snapshot could not be emitted");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "persisted MCP servers could not be synchronized");
                                     }
                                 }
-                                Err(error) => {
-                                    tracing::warn!(%error, "persisted MCP servers could not be synchronized");
-                                }
+                            } else {
+                                tracing::warn!("persisted MCP servers were not restored because manager loading failed");
                             }
                         }
                     });
@@ -733,6 +834,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            startup_window_painted,
             diagnostics,
             projection,
             submit_message,
@@ -843,6 +945,58 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn app_paint_precedes_deferred_gdbus_probe_in_perf_report() {
+        fn parsed_perf_report() -> serde_json::Value {
+            let rendered = serde_json::to_string(&perf::report()).expect("render perf report");
+            serde_json::from_str(&rendered).expect("parse perf report")
+        }
+
+        fn last_event_order(report: &serde_json::Value, span: &str, event: &str) -> Option<u64> {
+            report
+                .pointer("/last_cold_start/span_timeline")?
+                .as_array()?
+                .iter()
+                .filter(|entry| {
+                    entry.get("span").and_then(serde_json::Value::as_str) == Some(span)
+                        && entry.get("event").and_then(serde_json::Value::as_str) == Some(event)
+                })
+                .filter_map(|entry| entry.get("order").and_then(serde_json::Value::as_u64))
+                .next_back()
+        }
+
+        let directory = tempfile::tempdir().expect("temporary app data");
+        let startup_readiness = perf::StartupReadiness::default();
+        let gdbus_before = last_event_order(&parsed_perf_report(), "gdbus_probe", "start");
+        let deferred = tokio::spawn(load_deferred_native_states(
+            directory.path().to_path_buf(),
+            startup_readiness.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            last_event_order(&parsed_perf_report(), "gdbus_probe", "start"),
+            gdbus_before,
+            "gdbus probe started before the renderer paint barrier opened"
+        );
+
+        startup_readiness.mark_window_painted();
+        let states = deferred
+            .await
+            .expect("deferred startup join")
+            .expect("deferred startup");
+        states.capabilities.expect("capability state");
+        states.mcp.expect("MCP state");
+
+        let report = parsed_perf_report();
+        let paint =
+            last_event_order(&report, "window_paint", "milestone").expect("window paint milestone");
+        let gdbus =
+            last_event_order(&report, "gdbus_probe", "start").expect("gdbus probe span start");
+        assert!(paint < gdbus, "window paint must precede the gdbus probe");
+    }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[tokio::test]

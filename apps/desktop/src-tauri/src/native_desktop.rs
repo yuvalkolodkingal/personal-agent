@@ -209,22 +209,28 @@ fn executable(program: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn atspi_available() -> bool {
-    std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.a11y.Bus",
-            "--object-path",
-            "/org/a11y/bus",
-            "--method",
-            "org.a11y.Bus.GetAddress",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    crate::perf::startup_phase(
+        "gdbus_probe",
+        &tracing::info_span!("startup.gdbus_probe"),
+        || {
+            std::process::Command::new("gdbus")
+                .args([
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.a11y.Bus",
+                    "--object-path",
+                    "/org/a11y/bus",
+                    "--method",
+                    "org.a11y.Bus.GetAddress",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+    )
 }
 
 #[cfg(not(target_os = "linux"))]

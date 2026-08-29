@@ -121,6 +121,18 @@ impl CapabilityState {
     pub(crate) async fn shutdown_portal(&self) {
         self.portal.disconnect().await;
     }
+
+    pub(crate) async fn diagnostic_capabilities(
+        &self,
+    ) -> Vec<personal_agent_platform::PlatformCapability> {
+        self.desktop
+            .lock()
+            .await
+            .backend()
+            .status()
+            .plan
+            .capabilities
+    }
 }
 
 fn atomic_save_connectors(path: &Path, connectors: &[ConnectorConfig]) -> Result<(), String> {

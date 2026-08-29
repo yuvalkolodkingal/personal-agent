@@ -351,6 +351,7 @@ pub(crate) async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<V
         "projection": projection,
         "history": history,
         "catalog": catalog,
+        "capabilities": Value::Null,
         "voice": voice_status_for(&state, &config),
         "app_data": state.app_data,
     }))
