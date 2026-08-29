@@ -14,6 +14,9 @@ LIMITS_US = {
     "wake_detection_to_listening": 250_000,
     "internal_speaker_stop": 50_000,
     "offline_deterministic_command": 500_000,
+    "startup_native_setup": 800_000,
+    "bootstrap_ipc": 250_000,
+    "desktop_snapshot_warm": 150_000,
 }
 
 
@@ -34,7 +37,11 @@ def main() -> None:
     if args.write:
         output = ROOT / "docs/operations/performance-report.json"
         output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print("verified deterministic performance distributions; physical-device metrics remain externally gated")
+    print(
+        "verified deterministic replay performance distributions; "
+        "replay is not a physical microphone, speaker, network, screen-capture, "
+        "or UI-startup measurement; physical-device metrics remain externally gated"
+    )
 
 
 if __name__ == "__main__":

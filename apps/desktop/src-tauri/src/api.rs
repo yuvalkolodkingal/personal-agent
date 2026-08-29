@@ -1,4 +1,4 @@
-use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime};
+use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime, perf};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
     NativeVoiceStatus, NeuralVoiceRuntime, discover_native_voice, play_wav, synthesize_piper,
@@ -444,6 +444,11 @@ pub(crate) async fn runtime_catalog(
     Ok(catalog)
 }
 
+#[tracing::instrument(
+    name = "turn.chat_send",
+    skip_all,
+    fields(turn_id = tracing::field::Empty)
+)]
 #[tauri::command]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Native turn orchestration keeps lifecycle outcomes in one auditable path.
 pub(crate) async fn chat_send(
@@ -457,6 +462,8 @@ pub(crate) async fn chat_send(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
+    let mut turn_trace = perf::TurnTrace::start();
+    tracing::Span::current().record("turn_id", turn_trace.id());
     let text = text.trim().to_owned();
     if text.is_empty() {
         return Err("message cannot be blank".to_owned());
@@ -625,7 +632,21 @@ pub(crate) async fn chat_send(
                     .or_else(|| payload.get("text"))
                     .and_then(Value::as_str)
             {
-                response.push_str(delta);
+                if let Some(elapsed) = turn_trace.record_first_delta() {
+                    let elapsed_microseconds =
+                        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+                    tracing::info_span!(
+                        "turn.first_delta",
+                        turn_id = turn_trace.id(),
+                        elapsed_microseconds
+                    )
+                    .in_scope(|| {
+                        response.push_str(delta);
+                        tracing::info!("first response delta received");
+                    });
+                } else {
+                    response.push_str(delta);
+                }
             }
             let state = app.state::<DesktopState>();
             if let Ok(mut profile) = state.profile.lock() {
@@ -684,17 +705,28 @@ pub(crate) async fn chat_send(
                 response = final_text;
             }
         }
-        let _ = app.emit(
-            "runtime-turn-complete",
-            json!({
-                "session_id": session_for_task,
-                "text": response,
-                "speak": speak_response,
-                "status": outcome,
-                "error": failure,
-                "elapsed_ms": started.elapsed().as_millis(),
-            }),
-        );
+        let turn_elapsed = turn_trace.elapsed();
+        let elapsed_microseconds = u64::try_from(turn_elapsed.as_micros()).unwrap_or(u64::MAX);
+        tracing::info_span!(
+            "turn.turn_complete",
+            turn_id = turn_trace.id(),
+            elapsed_microseconds,
+            status = outcome
+        )
+        .in_scope(|| {
+            tracing::info!("runtime turn completed");
+            let _ = app.emit(
+                "runtime-turn-complete",
+                json!({
+                    "session_id": session_for_task,
+                    "text": response,
+                    "speak": speak_response,
+                    "status": outcome,
+                    "error": failure,
+                    "elapsed_ms": turn_elapsed.as_millis(),
+                }),
+            );
+        });
     });
     Ok(json!({
         "session_id": session_id,

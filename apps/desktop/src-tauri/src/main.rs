@@ -11,6 +11,7 @@ mod goals_host;
 mod mcp_host;
 mod native_desktop;
 mod native_dictation;
+mod perf;
 #[cfg(target_os = "linux")]
 mod portal_linux;
 #[cfg(not(target_os = "linux"))]
@@ -231,8 +232,17 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 }
 
 #[tauri::command]
-fn diagnostics() -> serde_json::Value {
-    personal_agent_core::diagnostic_snapshot()
+#[allow(clippy::needless_pass_by_value)] // Tauri provides an owned application handle.
+fn diagnostics(app: tauri::AppHandle) -> serde_json::Value {
+    let mut diagnostics = personal_agent_core::diagnostic_snapshot();
+    let perf = perf::report();
+    if let Some(object) = diagnostics.as_object_mut() {
+        object.insert("perf".to_owned(), perf.clone());
+    }
+    if let Err(error) = app.emit("perf-report", &perf) {
+        tracing::warn!(%error, "performance report could not be emitted");
+    }
+    diagnostics
 }
 
 #[tauri::command]
@@ -507,8 +517,19 @@ fn main() {
             }
         })
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
-            let log_guard = init_logging(&app_data.join("logs"))?;
+            let native_setup_started = std::time::Instant::now();
+            let app_data = perf::startup_phase(
+                "app_data",
+                &tracing::info_span!("startup.app_data"),
+                || app.path().app_data_dir(),
+            )?;
+            let log_guard = perf::startup_phase(
+                "logging",
+                &tracing::info_span!("startup.logging"),
+                || init_logging(&app_data.join("logs")),
+            )?;
+            let native_setup_span = tracing::info_span!("startup.native_setup");
+            let _native_setup_guard = native_setup_span.enter();
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 platform = std::env::consts::OS,
@@ -516,109 +537,199 @@ fn main() {
                 "desktop host starting"
             );
             let config_path = app_data.join("config.toml");
-            let config = load_or_initialize_config(&config_path)?;
-            let lifecycle = LifecycleMarker::begin(
-                &app_data.join("lifecycle/run-state.json"),
-                env!("CARGO_PKG_VERSION"),
+            let config = perf::startup_phase(
+                "config_load",
+                &tracing::info_span!("startup.config_load"),
+                || load_or_initialize_config(&config_path),
+            )?;
+            let lifecycle = perf::startup_phase(
+                "lifecycle",
+                &tracing::info_span!("startup.lifecycle"),
+                || {
+                    LifecycleMarker::begin(
+                        &app_data.join("lifecycle/run-state.json"),
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                },
             )?;
             let previous_unclean_run = lifecycle.previous_unclean_run();
             let database = app_data.join("profiles/default.db");
-            let mut profile = ProfileState::open(&database, "default", &OsSecretStore)?;
-            profile.record_lifecycle_start(previous_unclean_run)?;
-            let automation_state = automation_host::AutomationHostState::load(&mut profile)
-                .map_err(std::io::Error::other)?;
-            let goals_state = goals_host::GoalsHostState::load(
-                &mut profile,
-                &config.config.runtime.working_directory,
-            )
-            .map_err(std::io::Error::other)?;
-            let memory = if let Some(memory) = profile.persistent_memory_snapshot()? {
-                memory
-            } else {
-                PersistentMemory::from_store(profile.memory_snapshot()?.unwrap_or_default())
-            };
+            let mut profile = perf::startup_phase(
+                "db_open",
+                &tracing::info_span!("startup.db_open"),
+                || ProfileState::open(&database, "default", &OsSecretStore),
+            )?;
+            perf::startup_phase(
+                "lifecycle_replay",
+                &tracing::info_span!("startup.lifecycle_replay"),
+                || profile.record_lifecycle_start(previous_unclean_run),
+            )?;
+            let automation_state = perf::startup_phase(
+                "automation_load",
+                &tracing::info_span!("startup.automation_load"),
+                || {
+                    automation_host::AutomationHostState::load(&mut profile)
+                        .map_err(std::io::Error::other)
+                },
+            )?;
+            let goals_state = perf::startup_phase(
+                "goals_replay",
+                &tracing::info_span!("startup.goals_replay"),
+                || {
+                    goals_host::GoalsHostState::load(
+                        &mut profile,
+                        &config.config.runtime.working_directory,
+                    )
+                    .map_err(std::io::Error::other)
+                },
+            )?;
+            let memory = perf::startup_phase(
+                "memory_load",
+                &tracing::info_span!("startup.memory_load"),
+                || -> Result<PersistentMemory, personal_agent_core::CoreError> {
+                    Ok(if let Some(memory) = profile.persistent_memory_snapshot()? {
+                        memory
+                    } else {
+                        PersistentMemory::from_store(
+                            profile.memory_snapshot()?.unwrap_or_default(),
+                        )
+                    })
+                },
+            )?;
 
-            let safety_plugin = app
-                .path()
-                .resolve("opencode-plugin/index.ts", BaseDirectory::Resource)?;
-            let voice_runtime_script = app
-                .path()
-                .resolve("voice-runtime/voice-runtime.py", BaseDirectory::Resource)?;
-            let sidecar_executable = sidecar_path()?;
-            let sidecar = runtime_from_parts(
-                sidecar_executable.clone(),
-                safety_plugin.clone(),
-                &app_data,
-                &config.config,
-            );
+            let (safety_plugin, voice_runtime_script) = perf::startup_phase(
+                "resource_paths",
+                &tracing::info_span!("startup.resource_paths"),
+                || -> tauri::Result<_> {
+                    Ok((
+                        app.path()
+                            .resolve("opencode-plugin/index.ts", BaseDirectory::Resource)?,
+                        app.path().resolve(
+                            "voice-runtime/voice-runtime.py",
+                            BaseDirectory::Resource,
+                        )?,
+                    ))
+                },
+            )?;
+            let (sidecar_executable, sidecar) = perf::startup_phase(
+                "runtime_config",
+                &tracing::info_span!("startup.runtime_config"),
+                || -> Result<_, std::io::Error> {
+                    let sidecar_executable = sidecar_path()?;
+                    let sidecar = runtime_from_parts(
+                        sidecar_executable.clone(),
+                        safety_plugin.clone(),
+                        &app_data,
+                        &config.config,
+                    );
+                    Ok((sidecar_executable, sidecar))
+                },
+            )?;
             let runtime_emergency_control = sidecar.emergency_control();
-            app.manage(capabilities::CapabilityState::load(&app_data)?);
-            app.manage(pty_host::PtyHostState::default());
-            app.manage(connector_oauth::ConnectorOAuthState::default());
-            app.manage(mcp_host::McpHostState::load(&app_data)?);
-            app.manage(automation_state);
-            app.manage(goals_state);
-            app.manage(DesktopState {
-                profile: Mutex::new(profile),
-                memory: Mutex::new(memory),
-                runtime: tokio::sync::Mutex::new(sidecar),
-                runtime_emergency_control,
-                turn_clients: RwLock::new(BTreeMap::new()),
-                config: RwLock::new(config.config),
-                config_path,
-                sidecar_executable,
-                safety_plugin,
-                active_session: tokio::sync::Mutex::new(None),
-                pending_memory_sessions: tokio::sync::Mutex::new(BTreeSet::new()),
-                voice_playback: tokio::sync::Mutex::new(None),
-                voice_runtime: tokio::sync::Mutex::new(None),
-                voice_runtime_script,
-                voice_runtime_pid: AtomicU32::new(0),
-                voice_synthesis_active: AtomicBool::new(false),
-                voice_generation: AtomicU64::new(0),
-                lifecycle: Mutex::new(Some(lifecycle)),
-                migration_review: Mutex::new(None),
-                app_data,
-                _log_guard: log_guard,
-            });
-            install_media_permission_handler(app)?;
-            if let Err(error) = app
-                .global_shortcut()
-                .register(Shortcut::new(Some(Modifiers::SUPER), Code::KeyJ))
-            {
-                tracing::warn!(%error, "Super+J global shortcut could not be registered");
-            }
-            install_tray(app)?;
+            let capability_state = perf::startup_phase(
+                "capability_probe",
+                &tracing::info_span!("startup.capability_probe"),
+                || capabilities::CapabilityState::load(&app_data),
+            )?;
+            let mcp_state = perf::startup_phase(
+                "mcp_load",
+                &tracing::info_span!("startup.mcp_load"),
+                || mcp_host::McpHostState::load(&app_data),
+            )?;
+            perf::startup_phase(
+                "state_install",
+                &tracing::info_span!("startup.state_install"),
+                || {
+                    app.manage(capability_state);
+                    app.manage(pty_host::PtyHostState::default());
+                    app.manage(connector_oauth::ConnectorOAuthState::default());
+                    app.manage(mcp_state);
+                    app.manage(automation_state);
+                    app.manage(goals_state);
+                    app.manage(DesktopState {
+                        profile: Mutex::new(profile),
+                        memory: Mutex::new(memory),
+                        runtime: tokio::sync::Mutex::new(sidecar),
+                        runtime_emergency_control,
+                        turn_clients: RwLock::new(BTreeMap::new()),
+                        config: RwLock::new(config.config),
+                        config_path,
+                        sidecar_executable,
+                        safety_plugin,
+                        active_session: tokio::sync::Mutex::new(None),
+                        pending_memory_sessions: tokio::sync::Mutex::new(BTreeSet::new()),
+                        voice_playback: tokio::sync::Mutex::new(None),
+                        voice_runtime: tokio::sync::Mutex::new(None),
+                        voice_runtime_script,
+                        voice_runtime_pid: AtomicU32::new(0),
+                        voice_synthesis_active: AtomicBool::new(false),
+                        voice_generation: AtomicU64::new(0),
+                        lifecycle: Mutex::new(Some(lifecycle)),
+                        migration_review: Mutex::new(None),
+                        app_data,
+                        _log_guard: log_guard,
+                    });
+                },
+            );
+            perf::startup_phase(
+                "media_permissions",
+                &tracing::info_span!("startup.media_permissions"),
+                || install_media_permission_handler(app),
+            )?;
+            perf::startup_phase(
+                "global_shortcut",
+                &tracing::info_span!("startup.global_shortcut"),
+                || {
+                    if let Err(error) = app
+                        .global_shortcut()
+                        .register(Shortcut::new(Some(Modifiers::SUPER), Code::KeyJ))
+                    {
+                        tracing::warn!(%error, "Super+J global shortcut could not be registered");
+                    }
+                },
+            );
+            perf::startup_phase("tray", &tracing::info_span!("startup.tray"), || {
+                install_tray(app)
+            })?;
 
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let state = handle.state::<DesktopState>();
-                let health = match state.runtime.lock().await.start().await {
-                    Ok(health) => health,
-                    Err(error) => RuntimeHealth {
-                        healthy: false,
-                        version: personal_agent_runtime::OPENCODE_VERSION.to_owned(),
-                        detail: error.to_string(),
-                    },
-                };
-                tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
-                persist_runtime_health(&state, &health);
-                if health.healthy {
-                    automation_host::ensure_resident_executor(handle.clone());
-                    goals_host::ensure_resident_executor(handle.clone());
-                    let mcp = handle.state::<mcp_host::McpHostState>();
-                    match mcp_host::restore_enabled_servers(&mcp, &state).await {
-                        Ok(snapshot) => {
-                            if let Err(error) = handle.emit("mcp-manager://changed", snapshot) {
-                                tracing::warn!(%error, "restored MCP snapshot could not be emitted");
+            perf::startup_phase(
+                "runtime_spawn",
+                &tracing::info_span!("startup.runtime_spawn"),
+                || {
+                    tauri::async_runtime::spawn(async move {
+                        let state = handle.state::<DesktopState>();
+                        let health = match state.runtime.lock().await.start().await {
+                            Ok(health) => health,
+                            Err(error) => RuntimeHealth {
+                                healthy: false,
+                                version: personal_agent_runtime::OPENCODE_VERSION.to_owned(),
+                                detail: error.to_string(),
+                            },
+                        };
+                        tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
+                        persist_runtime_health(&state, &health);
+                        if health.healthy {
+                            automation_host::ensure_resident_executor(handle.clone());
+                            goals_host::ensure_resident_executor(handle.clone());
+                            let mcp = handle.state::<mcp_host::McpHostState>();
+                            match mcp_host::restore_enabled_servers(&mcp, &state).await {
+                                Ok(snapshot) => {
+                                    if let Err(error) =
+                                        handle.emit("mcp-manager://changed", snapshot)
+                                    {
+                                        tracing::warn!(%error, "restored MCP snapshot could not be emitted");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "persisted MCP servers could not be synchronized");
+                                }
                             }
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, "persisted MCP servers could not be synchronized");
-                        }
-                    }
-                }
-            });
+                    });
+                },
+            );
+            perf::record_startup_phase("native_setup", native_setup_started.elapsed());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
