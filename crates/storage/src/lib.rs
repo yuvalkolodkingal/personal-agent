@@ -12,7 +12,8 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const BASELINE_SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const PROJECTION_CHECKPOINT_KIND: &str = "projection.checkpoint";
 const PROJECTION_CHECKPOINT_ID: &str = "projection.checkpoint";
 const SUPERVISOR_SNAPSHOT_KIND: &str = "agent-supervisor";
@@ -39,6 +40,14 @@ pub enum StorageError {
     DestinationExists(PathBuf),
     #[error("content-addressed blob does not exist: {0}")]
     BlobMissing(String),
+    #[error(
+        "database schema version {found} is newer than supported version {supported}; downgrade is refused"
+    )]
+    DowngradeRefused { found: i64, supported: i64 },
+    #[error("database schema version {0} predates the supported v4 migration baseline")]
+    UnsupportedDatabaseSchema(i64),
+    #[error("a file-backed database is required to back up schema version {0} before migration")]
+    MigrationBackupRequired(i64),
 }
 
 /// Owned encrypted store. Database access never crosses the native-core boundary.
@@ -94,9 +103,11 @@ impl EventStore {
     ///
     /// Returns a database, cipher-availability, or migration error.
     pub fn open(path: &Path, key: &SecretString) -> Result<Self, StorageError> {
+        let existed = path.exists();
         let connection = Connection::open(path)?;
         Self::configure(&connection, key, !path.as_os_str().is_empty())?;
-        Self::migrate(&connection)?;
+        let backup = existed.then_some((path, key));
+        Self::migrate(&connection, backup)?;
         Ok(Self { connection })
     }
 
@@ -108,7 +119,7 @@ impl EventStore {
     pub fn open_in_memory(key: &SecretString) -> Result<Self, StorageError> {
         let connection = Connection::open_in_memory()?;
         Self::configure(&connection, key, false)?;
-        Self::migrate(&connection)?;
+        Self::migrate(&connection, None)?;
         Ok(Self { connection })
     }
 
@@ -133,60 +144,48 @@ impl EventStore {
         Ok(())
     }
 
-    fn migrate(connection: &Connection) -> Result<(), StorageError> {
+    fn migrate(
+        connection: &Connection,
+        backup: Option<(&Path, &SecretString)>,
+    ) -> Result<(), StorageError> {
+        let version = database_schema_version(connection)?;
+        if version > SCHEMA_VERSION {
+            return Err(StorageError::DowngradeRefused {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version != 0 && version < BASELINE_SCHEMA_VERSION {
+            return Err(StorageError::UnsupportedDatabaseSchema(version));
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        if version >= BASELINE_SCHEMA_VERSION {
+            let Some((path, key)) = backup else {
+                return Err(StorageError::MigrationBackupRequired(version));
+            };
+            let backup_path = migration_backup_path(path, version, SCHEMA_VERSION);
+            backup_connection_to(connection, &backup_path, key)?;
+        }
+
         let tx = connection.unchecked_transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS events(
-               monotonic_sequence INTEGER PRIMARY KEY,
-               event_id TEXT NOT NULL UNIQUE,
-               profile_id TEXT NOT NULL,
-               event_type TEXT NOT NULL,
-               wall_clock_timestamp TEXT NOT NULL,
-               envelope BLOB NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY, created_at TEXT NOT NULL, mode TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS goals(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, status TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, status TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS task_edges(goal_id TEXT NOT NULL, dependency_id TEXT NOT NULL, dependent_id TEXT NOT NULL, PRIMARY KEY(goal_id, dependency_id, dependent_id));
-             CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS tool_runs(id TEXT PRIMARY KEY, task_id TEXT, tool_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS permission_requests(id TEXT PRIMARY KEY, task_id TEXT, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS consent_grants(id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, coverage TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, trust TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS memory_links(memory_id TEXT NOT NULL, source_event_id TEXT NOT NULL, PRIMARY KEY(memory_id, source_event_id));
-             CREATE TABLE IF NOT EXISTS automations(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS automation_runs(id TEXT PRIMARY KEY, automation_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS blobs(content_hash TEXT PRIMARY KEY, byte_length INTEGER NOT NULL, body BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS connectors(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS provider_usage(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, amount_usd REAL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS egress(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, destination TEXT NOT NULL, size_bytes INTEGER NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS settings(profile_id TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, PRIMARY KEY(profile_id, key));
-             CREATE TABLE IF NOT EXISTS migration_runs(id TEXT PRIMARY KEY, source_fingerprint TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS migration_items(
-               id TEXT PRIMARY KEY,
-               kind TEXT NOT NULL,
-               source_locator TEXT NOT NULL,
-               source_modified_at TEXT,
-               content_sha256 TEXT NOT NULL,
-               destination TEXT NOT NULL,
-               enabled INTEGER NOT NULL,
-               contains_personal_data INTEGER NOT NULL,
-               payload BLOB NOT NULL,
-               imported_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS runtime_snapshots(
-               kind TEXT NOT NULL,
-               id TEXT NOT NULL,
-               body_json TEXT NOT NULL,
-               updated_at TEXT NOT NULL,
-               PRIMARY KEY(kind,id)
-             );"
-        )?;
-        tx.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))", [SCHEMA_VERSION])?;
+        let mut migrated_version = version;
+        if migrated_version == 0 {
+            migrate_to_v4(&tx)?;
+            migrated_version = BASELINE_SCHEMA_VERSION;
+            tx.pragma_update(None, "user_version", migrated_version)?;
+        }
+        while migrated_version < SCHEMA_VERSION {
+            let next_version = migrated_version + 1;
+            match next_version {
+                5 => migrate_to_v5(&tx)?,
+                _ => return Err(StorageError::UnsupportedDatabaseSchema(migrated_version)),
+            }
+            migrated_version = next_version;
+            tx.pragma_update(None, "user_version", migrated_version)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -343,18 +342,7 @@ impl EventStore {
     ///
     /// Returns destination, I/O, `SQLCipher`, or backup errors.
     pub fn backup_to(&self, path: &Path, key: &SecretString) -> Result<(), StorageError> {
-        reject_existing_destination(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut destination = Connection::open(path)?;
-        Self::configure(&destination, key, true)?;
-        {
-            let backup = rusqlite::backup::Backup::new(&self.connection, &mut destination)?;
-            backup.run_to_completion(128, Duration::from_millis(1), None)?;
-        }
-        destination.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-        Ok(())
+        backup_connection_to(&self.connection, path, key)
     }
 
     /// Export all event envelopes to a private, atomic JSON file. This is an
@@ -668,6 +656,150 @@ impl EventStore {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn database_schema_version(connection: &Connection) -> Result<i64, StorageError> {
+    let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if user_version != 0 {
+        return Ok(user_version);
+    }
+
+    // Releases before PERF-6 recorded v4 only in `schema_migrations`. Recognize
+    // that one legacy marker so the first user-version migration can still make
+    // a backup before changing any schema state.
+    let has_legacy_marker: bool = connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_schema
+           WHERE type = 'table' AND name = 'schema_migrations'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_legacy_marker {
+        return Ok(0);
+    }
+    let version = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(version)
+}
+
+fn migrate_to_v4(tx: &Transaction<'_>) -> Result<(), StorageError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS events(
+           monotonic_sequence INTEGER PRIMARY KEY,
+           event_id TEXT NOT NULL UNIQUE,
+           profile_id TEXT NOT NULL,
+           event_type TEXT NOT NULL,
+           wall_clock_timestamp TEXT NOT NULL,
+           envelope BLOB NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY, created_at TEXT NOT NULL, mode TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS goals(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, status TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, status TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS task_edges(goal_id TEXT NOT NULL, dependency_id TEXT NOT NULL, dependent_id TEXT NOT NULL, PRIMARY KEY(goal_id, dependency_id, dependent_id));
+         CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS tool_runs(id TEXT PRIMARY KEY, task_id TEXT, tool_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS permission_requests(id TEXT PRIMARY KEY, task_id TEXT, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS consent_grants(id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, coverage TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, trust TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS memory_links(memory_id TEXT NOT NULL, source_event_id TEXT NOT NULL, PRIMARY KEY(memory_id, source_event_id));
+         CREATE TABLE IF NOT EXISTS automations(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS automation_runs(id TEXT PRIMARY KEY, automation_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS blobs(content_hash TEXT PRIMARY KEY, byte_length INTEGER NOT NULL, body BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS connectors(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS provider_usage(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, amount_usd REAL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS egress(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, destination TEXT NOT NULL, size_bytes INTEGER NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS settings(profile_id TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT NOT NULL, PRIMARY KEY(profile_id, key));
+         CREATE TABLE IF NOT EXISTS migration_runs(id TEXT PRIMARY KEY, source_fingerprint TEXT NOT NULL, state TEXT NOT NULL, body_json TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS migration_items(
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           source_locator TEXT NOT NULL,
+           source_modified_at TEXT,
+           content_sha256 TEXT NOT NULL,
+           destination TEXT NOT NULL,
+           enabled INTEGER NOT NULL,
+           contains_personal_data INTEGER NOT NULL,
+           payload BLOB NOT NULL,
+           imported_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS runtime_snapshots(
+           kind TEXT NOT NULL,
+           id TEXT NOT NULL,
+           body_json TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(kind,id)
+         );",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        [BASELINE_SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v5(tx: &Transaction<'_>) -> Result<(), StorageError> {
+    tx.execute_batch(
+        "ALTER TABLE provider_usage ADD COLUMN day TEXT NOT NULL DEFAULT '';
+         ALTER TABLE provider_usage ADD COLUMN session_id TEXT;
+         ALTER TABLE egress ADD COLUMN day TEXT NOT NULL DEFAULT '';
+         ALTER TABLE egress ADD COLUMN session_id TEXT;
+         CREATE INDEX provider_usage_profile_day_idx ON provider_usage(profile_id, day);
+         CREATE INDEX provider_usage_session_id_idx ON provider_usage(session_id);
+         CREATE INDEX egress_profile_day_idx ON egress(profile_id, day);
+         CREATE INDEX egress_session_id_idx ON egress(session_id);",
+    )?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version, applied_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        [SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+fn migration_backup_path(path: &Path, from_version: i64, to_version: i64) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("personal-agent.db");
+    path.with_file_name(format!(
+        "{file_name}.pre-v{from_version}-to-v{to_version}.backup"
+    ))
+}
+
+fn backup_connection_to(
+    source: &Connection,
+    path: &Path,
+    key: &SecretString,
+) -> Result<(), StorageError> {
+    reject_existing_destination(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(path)?);
+    let mut destination = Connection::open(path)?;
+    EventStore::configure(&destination, key, true)?;
+    {
+        let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+        backup.run_to_completion(128, Duration::from_millis(1), None)?;
+    }
+    destination.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    Ok(())
 }
 
 fn validate_event(event: &EventEnvelope) -> Result<(), StorageError> {
@@ -1056,6 +1188,133 @@ mod tests {
             checkpoint.projection_snapshot_blob,
             json!({"last_sequence": 10_000})
         );
+    }
+
+    #[test]
+    fn v4_database_is_backed_up_then_migrated_to_v5_with_data_intact() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("profile.db");
+        let backup = migration_backup_path(&database, 4, 5);
+        let key = SecretString::from("test-only-key".to_owned());
+        let event = EventEnvelope::new(
+            1,
+            "migration-test",
+            "default",
+            "goal.created",
+            &json!({"preserved": true}),
+        )
+        .expect("event");
+
+        {
+            let connection = Connection::open(&database).expect("open v4 database");
+            EventStore::configure(&connection, &key, true).expect("configure v4 database");
+            let tx = connection.unchecked_transaction().expect("v4 transaction");
+            migrate_to_v4(&tx).expect("create v4 schema");
+            tx.pragma_update(None, "user_version", BASELINE_SCHEMA_VERSION)
+                .expect("mark v4");
+            tx.execute(
+                "INSERT INTO events(
+                   monotonic_sequence,event_id,profile_id,event_type,wall_clock_timestamp,envelope
+                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    1_i64,
+                    event.event_id,
+                    event.profile_id,
+                    event.r#type,
+                    event.wall_clock_timestamp,
+                    event.encode_to_vec()
+                ],
+            )
+            .expect("seed v4 data");
+            tx.commit().expect("commit v4 database");
+        }
+
+        let migrated = EventStore::open(&database, &key).expect("migrate v4 to v5");
+        assert!(backup.is_file(), "pre-migration backup was not created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&backup)
+                    .expect("backup metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            migrated
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("source user_version"),
+            SCHEMA_VERSION
+        );
+        let migration_rows: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (4, 5)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration rows");
+        assert_eq!(migration_rows, 2);
+        let usage_index: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'provider_usage_profile_day_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v5 index");
+        assert_eq!(usage_index, 1);
+        let migrated_events = migrated.after(0, 10).expect("migrated events");
+        assert_eq!(migrated_events, vec![event.clone()]);
+
+        let backup_connection = Connection::open(&backup).expect("open backup");
+        EventStore::configure(&backup_connection, &key, true).expect("configure backup");
+        assert_eq!(
+            backup_connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("backup user_version"),
+            BASELINE_SCHEMA_VERSION
+        );
+        let backup_envelope: Vec<u8> = backup_connection
+            .query_row(
+                "SELECT envelope FROM events WHERE monotonic_sequence = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backup event");
+        assert_eq!(
+            EventEnvelope::decode(backup_envelope.as_slice()).expect("decode backup event"),
+            event
+        );
+    }
+
+    #[test]
+    fn newer_database_version_is_rejected_instead_of_downgraded() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("future.db");
+        let key = SecretString::from("test-only-key".to_owned());
+        drop(EventStore::open(&database, &key).expect("create current database"));
+        {
+            let connection = Connection::open(&database).expect("open current database");
+            EventStore::configure(&connection, &key, true).expect("configure database");
+            connection
+                .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .expect("mark future version");
+        }
+
+        match EventStore::open(&database, &key) {
+            Err(StorageError::DowngradeRefused { found, supported }) => {
+                assert_eq!(found, SCHEMA_VERSION + 1);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("future database was silently downgraded"),
+        }
     }
 
     #[test]
