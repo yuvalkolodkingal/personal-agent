@@ -18,7 +18,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use thiserror::Error;
 use tokio::{
@@ -816,11 +819,26 @@ async fn write_bridge_response(
 /// Owned `OpenCode` process. The UI never receives this endpoint or credential.
 pub struct OpenCodeSidecar {
     config: OpenCodeConfig,
-    child: Option<Child>,
+    child: Arc<tokio::sync::Mutex<Option<Child>>>,
     endpoint: Option<Url>,
     client: Option<opencode_api::Client>,
     session_directories: Arc<RwLock<BTreeMap<String, PathBuf>>>,
+    emergency_client: Arc<RwLock<Option<opencode_api::Client>>>,
+    termination_requested: Arc<AtomicBool>,
     tool_bridge: Option<NativeToolBridge>,
+}
+
+/// Cloneable native-only control plane used when the sidecar lifecycle lock is contended.
+///
+/// The handle is deliberately not serializable and is never exposed over Tauri IPC. It exists so
+/// host shutdown can interrupt registered sessions and terminate the owned process without waiting
+/// indefinitely for a request holding the normal lifecycle lock.
+#[derive(Clone)]
+pub struct OpenCodeSidecarControl {
+    child: Arc<tokio::sync::Mutex<Option<Child>>>,
+    session_directories: Arc<RwLock<BTreeMap<String, PathBuf>>>,
+    client: Arc<RwLock<Option<opencode_api::Client>>>,
+    termination_requested: Arc<AtomicBool>,
 }
 
 /// Cloneable, authenticated handle for read-only sidecar requests.
@@ -1114,6 +1132,95 @@ impl OpenCodeApiClient {
     }
 }
 
+impl OpenCodeSidecarControl {
+    /// Interrupt every session registered with this sidecar without taking its lifecycle lock.
+    ///
+    /// Abort requests are best-effort and bounded to one second each so an unresponsive sidecar
+    /// cannot prevent the caller from proceeding to process termination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when registered sessions exist but the authenticated client is unavailable,
+    /// or when one or more abort requests fail. All registered sessions are attempted concurrently.
+    pub async fn abort_all_sessions(&self) -> Result<(), RuntimeError> {
+        let sessions = self
+            .session_directories
+            .read()
+            .map_err(|_| RuntimeError::Rejected("runtime session registry is unavailable".into()))?
+            .iter()
+            .map(|(session_id, directory)| (session_id.clone(), directory.display().to_string()))
+            .collect::<Vec<_>>();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let client = self
+            .client
+            .read()
+            .map_err(|_| RuntimeError::Rejected("runtime emergency client is unavailable".into()))?
+            .clone()
+            .ok_or(RuntimeError::NotRunning)?;
+        let aborts = sessions.into_iter().map(|(session_id, directory)| {
+            let client = client.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client
+                        .session_abort()
+                        .session_id(&session_id)
+                        .directory(&directory)
+                        .send(),
+                )
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+                Ok::<(), ()>(())
+            }
+        });
+        let failure_count = futures_util::future::join_all(aborts)
+            .await
+            .into_iter()
+            .filter(Result::is_err)
+            .count();
+        if failure_count == 0 {
+            Ok(())
+        } else {
+            Err(RuntimeError::Rejected(format!(
+                "{failure_count} runtime session abort request(s) failed"
+            )))
+        }
+    }
+
+    /// Kill and reap the owned sidecar child without taking the lifecycle lock.
+    ///
+    /// The termination flag also prevents a concurrent startup operation from publishing a child
+    /// after emergency shutdown has begun.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system process error when the child cannot be killed or reaped.
+    pub async fn kill(&self) -> Result<(), RuntimeError> {
+        self.termination_requested.store(true, Ordering::Release);
+        let child = self.child.lock().await.take();
+        let result = stop_child(child).await;
+        if let Ok(mut client) = self.client.write() {
+            *client = None;
+        }
+        if let Ok(mut sessions) = self.session_directories.write() {
+            sessions.clear();
+        }
+        result
+    }
+}
+
+async fn stop_child(child: Option<Child>) -> Result<(), RuntimeError> {
+    let Some(mut child) = child else {
+        return Ok(());
+    };
+    child.kill().await?;
+    child.wait().await?;
+    Ok(())
+}
+
 fn validate_pty_identifier(pty_id: &str) -> Result<(), RuntimeError> {
     if pty_id.is_empty()
         || pty_id.len() > 128
@@ -1144,14 +1251,54 @@ fn bounded_text(value: &str, limit: usize) -> String {
 impl OpenCodeSidecar {
     #[must_use]
     pub fn new(config: OpenCodeConfig) -> Self {
+        let control = OpenCodeSidecarControl {
+            child: Arc::new(tokio::sync::Mutex::new(None)),
+            session_directories: Arc::new(RwLock::new(BTreeMap::new())),
+            client: Arc::new(RwLock::new(None)),
+            termination_requested: Arc::new(AtomicBool::new(false)),
+        };
+        Self::with_emergency_control(config, &control)
+    }
+
+    /// Create a replacement runtime that remains attached to an existing emergency control handle.
+    ///
+    /// Configuration reload uses this constructor after stopping the previous runtime. Reusing the
+    /// handle keeps host shutdown authoritative even while the runtime value is being replaced.
+    #[must_use]
+    pub fn with_emergency_control(
+        config: OpenCodeConfig,
+        emergency_control: &OpenCodeSidecarControl,
+    ) -> Self {
         Self {
             config,
-            child: None,
+            child: Arc::clone(&emergency_control.child),
             endpoint: None,
             client: None,
-            session_directories: Arc::new(RwLock::new(BTreeMap::new())),
+            session_directories: Arc::clone(&emergency_control.session_directories),
+            emergency_client: Arc::clone(&emergency_control.client),
+            termination_requested: Arc::clone(&emergency_control.termination_requested),
             tool_bridge: None,
         }
+    }
+
+    /// Create a cloneable native-only handle for time-bounded host shutdown.
+    #[must_use]
+    pub fn emergency_control(&self) -> OpenCodeSidecarControl {
+        OpenCodeSidecarControl {
+            child: Arc::clone(&self.child),
+            session_directories: Arc::clone(&self.session_directories),
+            client: Arc::clone(&self.emergency_client),
+            termination_requested: Arc::clone(&self.termination_requested),
+        }
+    }
+
+    /// Interrupt every registered sidecar session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authenticated abort client is unavailable or an abort fails.
+    pub async fn abort_all_sessions(&self) -> Result<(), RuntimeError> {
+        self.emergency_control().abort_all_sessions().await
     }
 
     fn reserve_loopback_port() -> Result<u16, std::io::Error> {
@@ -1459,8 +1606,11 @@ impl OpenCodeSidecar {
 
     async fn api_health(&mut self) -> Result<RuntimeHealth, RuntimeError> {
         let endpoint = self.endpoint.as_ref().ok_or(RuntimeError::NotRunning)?;
-        let child = self.child.as_mut().ok_or(RuntimeError::NotRunning)?;
-        if let Some(status) = child.try_wait()? {
+        let child_status = {
+            let mut child = self.child.lock().await;
+            child.as_mut().ok_or(RuntimeError::NotRunning)?.try_wait()?
+        };
+        if let Some(status) = child_status {
             return Ok(RuntimeHealth {
                 healthy: false,
                 version: self.config.version.clone(),
@@ -1496,7 +1646,7 @@ impl OpenCodeSidecar {
 
     async fn verify_openapi_contract(&self) -> Result<(), RuntimeError> {
         let endpoint = self.endpoint.as_ref().ok_or(RuntimeError::NotRunning)?;
-        if self.child.is_none() {
+        if self.child.lock().await.is_none() {
             return Err(RuntimeError::NotRunning);
         }
         let response = reqwest::Client::new()
@@ -1646,8 +1796,13 @@ impl OpenCodeSidecar {
 #[async_trait]
 impl AgentRuntime for OpenCodeSidecar {
     async fn start(&mut self) -> Result<RuntimeHealth, RuntimeError> {
-        if self.child.is_some() {
+        if self.child.lock().await.is_some() {
             return self.health().await;
+        }
+        if self.termination_requested.load(Ordering::Acquire) {
+            return Err(RuntimeError::Rejected(
+                "runtime startup rejected because host shutdown is in progress".into(),
+            ));
         }
         if self.config.version != OPENCODE_VERSION {
             return Err(RuntimeError::IncompatibleVersion {
@@ -1691,7 +1846,18 @@ impl AgentRuntime for OpenCodeSidecar {
             .kill_on_drop(true);
         let child = command.spawn()?;
         self.tool_bridge = Some(bridge);
-        self.child = Some(child);
+        {
+            let mut child_slot = self.child.lock().await;
+            if self.termination_requested.load(Ordering::Acquire) {
+                drop(child_slot);
+                self.tool_bridge = None;
+                stop_child(Some(child)).await?;
+                return Err(RuntimeError::Rejected(
+                    "runtime startup interrupted by host shutdown".into(),
+                ));
+            }
+            *child_slot = Some(child);
+        }
         self.endpoint =
             Some(Url::parse(&format!("http://127.0.0.1:{port}/")).expect("loopback URL"));
         self.client = match self.build_generated_client() {
@@ -1701,6 +1867,14 @@ impl AgentRuntime for OpenCodeSidecar {
                 return Err(error);
             }
         };
+        if let Ok(mut emergency_client) = self.emergency_client.write() {
+            emergency_client.clone_from(&self.client);
+        } else {
+            let _ = self.stop().await;
+            return Err(RuntimeError::Rejected(
+                "runtime emergency client is unavailable".into(),
+            ));
+        }
         match self.await_health().await {
             Ok(health) => match self.verify_openapi_contract().await {
                 Ok(()) => Ok(health),
@@ -1721,21 +1895,18 @@ impl AgentRuntime for OpenCodeSidecar {
     }
 
     async fn stop(&mut self) -> Result<(), RuntimeError> {
-        let mut failure = None;
-        if let Some(mut child) = self.child.take() {
-            if let Err(error) = child.kill().await {
-                failure = Some(error);
-            } else if let Err(error) = child.wait().await {
-                failure = Some(error);
-            }
-        }
+        let child = self.child.lock().await.take();
+        let result = stop_child(child).await;
         self.endpoint = None;
         self.client = None;
+        if let Ok(mut emergency_client) = self.emergency_client.write() {
+            *emergency_client = None;
+        }
         self.tool_bridge = None;
         if let Ok(mut sessions) = self.session_directories.write() {
             sessions.clear();
         }
-        failure.map_or(Ok(()), |error| Err(error.into()))
+        result
     }
 
     async fn discover_models(

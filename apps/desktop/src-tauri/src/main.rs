@@ -26,7 +26,8 @@ use personal_agent_core::{
 use personal_agent_migration::{LegacyRoots, MigrationConsent, MigrationPlan, MigrationReport};
 use personal_agent_platform::{LifecycleMarker, OsSecretStore};
 use personal_agent_runtime::{
-    AgentRuntime, OpenCodeApiClient, OpenCodeConfig, OpenCodeSidecar, RuntimeHealth,
+    AgentRuntime, OpenCodeApiClient, OpenCodeConfig, OpenCodeSidecar, OpenCodeSidecarControl,
+    RuntimeHealth,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,7 @@ struct DesktopState {
     profile: Mutex<ProfileState>,
     memory: Mutex<PersistentMemory>,
     runtime: tokio::sync::Mutex<OpenCodeSidecar>,
+    runtime_emergency_control: OpenCodeSidecarControl,
     turn_clients: RwLock<BTreeMap<String, OpenCodeApiClient>>,
     config: RwLock<PersonalAgentConfig>,
     config_path: PathBuf,
@@ -110,12 +112,12 @@ fn sidecar_path() -> Result<PathBuf, std::io::Error> {
     }))
 }
 
-fn runtime_from_parts(
+fn runtime_config_from_parts(
     executable: PathBuf,
     safety_plugin: PathBuf,
     app_data: &Path,
     config: &PersonalAgentConfig,
-) -> OpenCodeSidecar {
+) -> OpenCodeConfig {
     let mut runtime_config = OpenCodeConfig::pinned(
         executable,
         safety_plugin,
@@ -146,15 +148,32 @@ fn runtime_from_parts(
                 .collect()
         })
         .unwrap_or_default();
-    OpenCodeSidecar::new(runtime_config)
+    runtime_config
+}
+
+fn runtime_from_parts(
+    executable: PathBuf,
+    safety_plugin: PathBuf,
+    app_data: &Path,
+    config: &PersonalAgentConfig,
+) -> OpenCodeSidecar {
+    OpenCodeSidecar::new(runtime_config_from_parts(
+        executable,
+        safety_plugin,
+        app_data,
+        config,
+    ))
 }
 
 fn configured_runtime(state: &DesktopState, config: &PersonalAgentConfig) -> OpenCodeSidecar {
-    runtime_from_parts(
-        state.sidecar_executable.clone(),
-        state.safety_plugin.clone(),
-        &state.app_data,
-        config,
+    OpenCodeSidecar::with_emergency_control(
+        runtime_config_from_parts(
+            state.sidecar_executable.clone(),
+            state.safety_plugin.clone(),
+            &state.app_data,
+            config,
+        ),
+        &state.runtime_emergency_control,
     )
 }
 
@@ -365,15 +384,46 @@ fn persist_runtime_health(state: &DesktopState, health: &RuntimeHealth) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeShutdownPath {
+    LifecycleLock,
+    EmergencyControl,
+}
+
+async fn shutdown_runtime(
+    runtime: &tokio::sync::Mutex<OpenCodeSidecar>,
+    emergency_control: &OpenCodeSidecarControl,
+    lock_timeout: Duration,
+) -> Result<RuntimeShutdownPath, personal_agent_runtime::RuntimeError> {
+    if let Ok(mut runtime) = tokio::time::timeout(lock_timeout, runtime.lock()).await {
+        tracing::info!(path = "lifecycle-lock", "runtime shutdown path selected");
+        runtime.stop().await?;
+        Ok(RuntimeShutdownPath::LifecycleLock)
+    } else {
+        tracing::warn!(
+            path = "emergency-control",
+            timeout_ms = lock_timeout.as_millis(),
+            "runtime lifecycle lock timed out; aborting sessions before child termination"
+        );
+        if let Err(error) = emergency_control.abort_all_sessions().await {
+            tracing::warn!(%error, "runtime sessions could not all be aborted before termination");
+        }
+        emergency_control.kill().await?;
+        Ok(RuntimeShutdownPath::EmergencyControl)
+    }
+}
+
 fn clean_shutdown(app: &tauri::AppHandle) {
     let capabilities = app.state::<capabilities::CapabilityState>();
     tauri::async_runtime::block_on(capabilities.shutdown_portal());
     let pty = app.state::<pty_host::PtyHostState>();
     tauri::async_runtime::block_on(pty.shutdown());
     let state = app.state::<DesktopState>();
-    if let Ok(mut runtime) = state.runtime.try_lock()
-        && let Err(error) = tauri::async_runtime::block_on(runtime.stop())
-    {
+    if let Err(error) = tauri::async_runtime::block_on(shutdown_runtime(
+        &state.runtime,
+        &state.runtime_emergency_control,
+        Duration::from_secs(5),
+    )) {
         tracing::warn!(%error, "runtime did not stop cleanly");
     }
     if let Ok(mut lifecycle) = state.lifecycle.lock()
@@ -501,6 +551,7 @@ fn main() {
                 &app_data,
                 &config.config,
             );
+            let runtime_emergency_control = sidecar.emergency_control();
             app.manage(capabilities::CapabilityState::load(&app_data)?);
             app.manage(pty_host::PtyHostState::default());
             app.manage(connector_oauth::ConnectorOAuthState::default());
@@ -511,6 +562,7 @@ fn main() {
                 profile: Mutex::new(profile),
                 memory: Mutex::new(memory),
                 runtime: tokio::sync::Mutex::new(sidecar),
+                runtime_emergency_control,
                 turn_clients: RwLock::new(BTreeMap::new()),
                 config: RwLock::new(config.config),
                 config_path,
@@ -675,4 +727,45 @@ fn main() {
             clean_shutdown(app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn shutdown_timeout_stops_sidecar_while_lifecycle_lock_is_held() {
+        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries/opencode-x86_64-unknown-linux-gnu");
+        assert!(
+            executable.is_file(),
+            "missing bundled sidecar; run `bun run sidecar:fetch`"
+        );
+        let safety_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../packages/opencode-plugin/src/index.ts");
+        let profile = tempfile::tempdir().expect("temporary sidecar profile");
+        let mut config = OpenCodeConfig::pinned(
+            executable,
+            safety_plugin,
+            profile.path().join("opencode-profile"),
+        );
+        config.startup_timeout = Duration::from_secs(60);
+        let mut sidecar = OpenCodeSidecar::new(config);
+        let health = sidecar.start().await.expect("start bundled sidecar");
+        assert!(health.healthy);
+        let emergency_control = sidecar.emergency_control();
+        let runtime = tokio::sync::Mutex::new(sidecar);
+        let mut held_runtime = runtime.lock().await;
+
+        let path = shutdown_runtime(&runtime, &emergency_control, Duration::from_millis(25))
+            .await
+            .expect("emergency sidecar shutdown");
+
+        assert_eq!(path, RuntimeShutdownPath::EmergencyControl);
+        assert!(matches!(
+            held_runtime.health().await,
+            Err(personal_agent_runtime::RuntimeError::NotRunning)
+        ));
+    }
 }
