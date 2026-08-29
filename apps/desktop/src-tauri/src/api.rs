@@ -23,6 +23,89 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
 
+const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
+const E5_SMALL_INT8_DIMENSIONS: usize = 384;
+
+fn parse_worker_embedding(value: &Value) -> Result<Vec<f32>, String> {
+    if value.get("model").and_then(Value::as_str) != Some(E5_SMALL_INT8_MODEL_ID) {
+        return Err("embedding worker returned an unexpected model provenance label".to_owned());
+    }
+    if value.get("dimensions").and_then(Value::as_u64)
+        != u64::try_from(E5_SMALL_INT8_DIMENSIONS).ok()
+    {
+        return Err("embedding worker returned an unexpected vector width".to_owned());
+    }
+    let vectors = value
+        .get("vectors")
+        .and_then(Value::as_array)
+        .filter(|vectors| vectors.len() == 1)
+        .ok_or_else(|| "embedding worker must return exactly one vector".to_owned())?;
+    let vector = vectors[0]
+        .as_array()
+        .filter(|vector| vector.len() == E5_SMALL_INT8_DIMENSIONS)
+        .ok_or_else(|| "embedding worker returned an invalid vector".to_owned())?;
+    vector
+        .iter()
+        .map(|component| {
+            let component = component
+                .as_f64()
+                .ok_or_else(|| "embedding vector contains a non-number".to_owned())?;
+            if !component.is_finite() {
+                return Err("embedding vector contains a non-finite number".to_owned());
+            }
+            if component < f64::from(f32::MIN) || component > f64::from(f32::MAX) {
+                return Err("embedding vector component is outside f32 range".to_owned());
+            }
+            let component = component
+                .to_string()
+                .parse::<f32>()
+                .map_err(|_| "embedding vector component is outside f32 range".to_owned())?;
+            if !component.is_finite() {
+                return Err("embedding vector contains a non-finite f32 value".to_owned());
+            }
+            Ok(component)
+        })
+        .collect()
+}
+
+async fn embedding_for_text(
+    state: &DesktopState,
+    text: &str,
+    input_type: &str,
+    dimensions: usize,
+) -> Result<(Vec<f32>, String), String> {
+    let model_root = state
+        .app_data
+        .join("voice/neural/models/multilingual-e5-small-int8");
+    if dimensions == E5_SMALL_INT8_DIMENSIONS
+        && model_root.join("model.onnx").is_file()
+        && model_root.join("tokenizer.json").is_file()
+    {
+        match neural_voice_request(
+            state,
+            "embed",
+            json!({"texts": [text], "input_type": input_type}),
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(value) => match parse_worker_embedding(&value) {
+                Ok(vector) => return Ok((vector, E5_SMALL_INT8_MODEL_ID.to_owned())),
+                Err(error) => {
+                    tracing::warn!(%error, "neural memory embedding response was invalid; using offline fallback");
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "neural memory embedder was unavailable; using offline fallback");
+            }
+        }
+    }
+
+    let fallback = FeatureHashEmbedder::new(dimensions);
+    let vector = fallback.embed(text).map_err(|error| error.to_string())?;
+    Ok((vector, fallback.model().id))
+}
+
 fn config_snapshot(state: &DesktopState) -> Result<PersonalAgentConfig, String> {
     state
         .config
@@ -69,7 +152,7 @@ fn conversational_memory_intent(text: &str) -> bool {
             .any(|word| lower.contains(word))
 }
 
-fn store_explicit_memory(
+async fn store_explicit_memory(
     state: &DesktopState,
     content: &str,
     tier: MemoryTier,
@@ -78,16 +161,22 @@ fn store_explicit_memory(
     let source = format!("desktop-ui:{}", uuid::Uuid::now_v7());
     let mut memory = Memory::explicit_user(content, tier, source);
     sensitivity.clone_into(&mut memory.sensitivity);
+    let dimensions = state
+        .memory
+        .lock()
+        .map_err(|_| "memory store lock is poisoned".to_owned())?
+        .store
+        .embedding_model
+        .dimensions;
+    let (embedding, embedding_model_id) =
+        embedding_for_text(state, content, "passage", dimensions).await?;
     let mut store = state
         .memory
         .lock()
         .map_err(|_| "memory store lock is poisoned".to_owned())?;
-    let embedding = FeatureHashEmbedder::new(store.store.embedding_model.dimensions)
-        .embed(content)
-        .map_err(|error| error.to_string())?;
     store
         .store
-        .upsert(memory.clone(), Some(embedding))
+        .upsert_labeled(memory.clone(), Some(embedding), &embedding_model_id)
         .map_err(|error| error.to_string())?;
     state
         .profile
@@ -98,22 +187,35 @@ fn store_explicit_memory(
     Ok(memory)
 }
 
-fn memory_system_context(
+#[allow(clippy::too_many_lines)] // One read lock renders fact, style, and project context consistently.
+async fn memory_system_context(
     state: &DesktopState,
     query: &str,
     limit: usize,
 ) -> Result<String, String> {
+    let dimensions = state
+        .memory
+        .lock()
+        .map_err(|_| "memory store lock is poisoned".to_owned())?
+        .store
+        .embedding_model
+        .dimensions;
+    let (query_embedding, embedding_model_id) =
+        embedding_for_text(state, query, "query", dimensions).await?;
     let store = state
         .memory
         .lock()
         .map_err(|_| "memory store lock is poisoned".to_owned())?;
     let limit = limit.max(1);
-    let query_embedding = FeatureHashEmbedder::new(store.store.embedding_model.dimensions)
-        .embed(query)
-        .map_err(|error| error.to_string())?;
     let mut memories = store
         .store
-        .recall(query, Some(&query_embedding), limit, chrono::Utc::now())
+        .recall_labeled(
+            query,
+            Some(&query_embedding),
+            &embedding_model_id,
+            limit,
+            chrono::Utc::now(),
+        )
         .into_iter()
         .map(|result| result.memory)
         .collect::<Vec<_>>();
@@ -458,7 +560,8 @@ pub(crate) async fn chat_send(
     let config = config_snapshot(&state)?;
     let explicit_memory = explicit_memory_request(&text).map(str::to_owned);
     if let Some(content) = explicit_memory.as_deref() {
-        let memory = store_explicit_memory(&state, content, MemoryTier::Semantic, "private")?;
+        let memory =
+            store_explicit_memory(&state, content, MemoryTier::Semantic, "private").await?;
         let _ = persist_domain_event(&state, "memory.created", &json!(memory))?;
     }
     let directory = canonical_directory(&config, directory.as_deref())?;
@@ -509,18 +612,15 @@ pub(crate) async fn chat_send(
         let mut pending = state.pending_memory_sessions.lock().await;
         if pending.remove(&session_id) {
             drop(pending);
-            let memory = store_explicit_memory(&state, &text, MemoryTier::Semantic, "private")?;
+            let memory =
+                store_explicit_memory(&state, &text, MemoryTier::Semantic, "private").await?;
             let _ = persist_domain_event(&state, "memory.created", &json!(memory))?;
         } else if conversational_memory_intent(&text) {
             pending.insert(session_id.clone());
         }
     }
     let memory_context = if config.memory.enabled {
-        Some(memory_system_context(
-            &state,
-            &text,
-            usize::from(config.memory.recall_limit),
-        )?)
+        Some(memory_system_context(&state, &text, usize::from(config.memory.recall_limit)).await?)
     } else {
         None
     };
@@ -1183,7 +1283,7 @@ fn persist_domain_event(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Tauri deserializes owned IPC arguments.
-pub(crate) fn domain_action(
+pub(crate) async fn domain_action(
     domain: String,
     action: String,
     payload: Value,
@@ -1241,7 +1341,8 @@ pub(crate) fn domain_action(
                     .get("sensitivity")
                     .and_then(Value::as_str)
                     .unwrap_or("private"),
-            )?;
+            )
+            .await?;
             persist_domain_event(&state, "memory.created", &json!(memory))
         }
         ("memory", "approve" | "reject" | "delete") => {
@@ -2186,6 +2287,16 @@ const PIPER_VOICE_CONFIG: VoiceAsset = VoiceAsset {
     url: "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
     sha256: "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
 };
+const E5_SMALL_INT8_MODEL: VoiceAsset = VoiceAsset {
+    name: "model.onnx",
+    url: "https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3/onnx/model_qint8_avx512_vnni.onnx",
+    sha256: "dd476dd0c2514e9b9be83aeb3853fac0763e0bdf4a71645407587d77c48a2d88",
+};
+const E5_SMALL_INT8_TOKENIZER: VoiceAsset = VoiceAsset {
+    name: "tokenizer.json",
+    url: "https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3/onnx/tokenizer.json",
+    sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+};
 
 async fn download_voice_asset(
     asset: &VoiceAsset,
@@ -2355,23 +2466,75 @@ async fn run_voice_installer(
     Err(format!("{phase} failed: {detail}"))
 }
 
-async fn install_neural_voice(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
-    if (std::env::consts::OS, std::env::consts::ARCH) != ("linux", "x86_64") {
-        return Err("automatic neural voice installation currently supports Linux x86_64; compatibility voice remains available".to_owned());
-    }
+async fn ensure_neural_python(root: &Path, app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let neural = root.join("neural");
     let venv = neural.join("venv");
+    let python = venv.join(if cfg!(windows) {
+        "Scripts/python.exe"
+    } else {
+        "bin/python"
+    });
+    if python.is_file() {
+        return Ok(python);
+    }
     std::fs::create_dir_all(&neural).map_err(|error| error.to_string())?;
     let mut create = Command::new("uv");
     create.args(["venv", "--python", "3.12"]).arg(&venv);
     run_voice_installer(
         app,
-        "Creating isolated Python 3.12 voice runtime",
+        "Creating isolated Python 3.12 neural runtime",
         create,
         Duration::from_secs(300),
     )
     .await?;
-    let python = venv.join("bin/python");
+    if !python.is_file() {
+        return Err("uv completed without creating the neural Python runtime".to_owned());
+    }
+    Ok(python)
+}
+
+async fn install_memory_embedder(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
+    if std::env::consts::ARCH != "x86_64" {
+        return Err(
+            "the pinned int8 multilingual E5 build requires x86_64; feature-hash memory recall remains available"
+                .to_owned(),
+        );
+    }
+    let python = ensure_neural_python(root, app).await?;
+    let mut install = Command::new("uv");
+    install
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .args(["numpy==2.5.2", "onnxruntime==1.28.0", "tokenizers==0.22.2"]);
+    run_voice_installer(
+        app,
+        "Installing pinned CPU embedding runtime",
+        install,
+        Duration::from_mins(10),
+    )
+    .await?;
+
+    let destination = root.join("neural/models/multilingual-e5-small-int8");
+    download_voice_asset(
+        &E5_SMALL_INT8_MODEL,
+        &destination.join(E5_SMALL_INT8_MODEL.name),
+        app,
+    )
+    .await?;
+    download_voice_asset(
+        &E5_SMALL_INT8_TOKENIZER,
+        &destination.join(E5_SMALL_INT8_TOKENIZER.name),
+        app,
+    )
+    .await
+}
+
+async fn install_neural_voice(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
+    if (std::env::consts::OS, std::env::consts::ARCH) != ("linux", "x86_64") {
+        return Err("automatic neural voice installation currently supports Linux x86_64; compatibility voice remains available".to_owned());
+    }
+    let neural = root.join("neural");
+    let python = ensure_neural_python(root, app).await?;
     let mut install = Command::new("uv");
     install
         .args(["pip", "install", "--python"])
@@ -2444,7 +2607,11 @@ pub(crate) async fn voice_install(
 ) -> Result<NativeVoiceStatus, String> {
     let root = state.app_data.join("voice");
     match component.as_str() {
-        "balanced" | "neural" => install_neural_voice(&root, &app).await?,
+        "balanced" | "neural" => {
+            install_neural_voice(&root, &app).await?;
+            install_memory_embedder(&root, &app).await?;
+        }
+        "memory-embedder" => install_memory_embedder(&root, &app).await?,
         "whisper" => install_whisper_engine(&root, &app).await?,
         "whisper-model" => {
             download_voice_asset(
@@ -2467,6 +2634,7 @@ pub(crate) async fn voice_install(
             install_piper_engine(&root, &app).await?;
             install_piper_voice(&root, &app).await?;
             install_neural_voice(&root, &app).await?;
+            install_memory_embedder(&root, &app).await?;
         }
         _ => return Err("unknown voice component".to_owned()),
     }
@@ -2526,6 +2694,49 @@ mod tests {
             "Look at my projects and add them to memory"
         ));
         assert!(!conversational_memory_intent("What is computer memory?"));
+    }
+
+    #[test]
+    fn neural_embedding_response_requires_honest_provenance_and_width() {
+        let valid = json!({
+            "model": E5_SMALL_INT8_MODEL_ID,
+            "dimensions": E5_SMALL_INT8_DIMENSIONS,
+            "vectors": [vec![0.25_f32; E5_SMALL_INT8_DIMENSIONS]],
+        });
+        assert_eq!(
+            parse_worker_embedding(&valid)
+                .expect("valid embedding")
+                .len(),
+            E5_SMALL_INT8_DIMENSIONS
+        );
+
+        let mut mislabeled = valid.clone();
+        mislabeled["model"] = json!("feature-hash-local");
+        assert!(parse_worker_embedding(&mislabeled).is_err());
+        let mut wrong_width = valid;
+        wrong_width["vectors"] = json!([[0.25, 0.5]]);
+        assert!(parse_worker_embedding(&wrong_width).is_err());
+
+        let mut outside_f32_range = json!({
+            "model": E5_SMALL_INT8_MODEL_ID,
+            "dimensions": E5_SMALL_INT8_DIMENSIONS,
+            "vectors": [vec![0.25_f64; E5_SMALL_INT8_DIMENSIONS]],
+        });
+        outside_f32_range["vectors"][0][0] = json!(1e300_f64);
+        assert!(parse_worker_embedding(&outside_f32_range).is_err());
+    }
+
+    #[test]
+    fn neural_embedding_assets_are_revision_and_digest_pinned() {
+        for asset in [&E5_SMALL_INT8_MODEL, &E5_SMALL_INT8_TOKENIZER] {
+            assert!(
+                asset
+                    .url
+                    .contains("614241f622f53c4eeff9890bdc4f31cfecc418b3")
+            );
+            assert!(!asset.url.contains("/main/"));
+            assert_eq!(asset.sha256.len(), 64);
+        }
     }
 
     #[test]

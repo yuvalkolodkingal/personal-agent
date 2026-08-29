@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
-import os
 from pathlib import Path
 import sys
 import time
@@ -21,6 +21,19 @@ from typing import Any
 
 PROTOCOL_STDOUT = sys.stdout
 sys.stdout = sys.stderr
+
+E5_MODEL_ID = "e5-small-int8"
+E5_MODEL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+E5_MODEL_SHA256 = "dd476dd0c2514e9b9be83aeb3853fac0763e0bdf4a71645407587d77c48a2d88"
+E5_TOKENIZER_SHA256 = "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def transcript_text(transcript: Any) -> str:
@@ -44,6 +57,8 @@ class VoiceRuntime:
         self.qwen_kind = ""
         self.smart_turn = None
         self.turn_audio: list[float] = []
+        self.embed_session = None
+        self.embed_tokenizer = None
 
     def _moonshine_marker(self) -> dict[str, Any]:
         marker = self.root / "moonshine.json"
@@ -104,11 +119,140 @@ class VoiceRuntime:
         self.qwen_kind = kind
         return kind
 
+    def _embed_paths(self) -> tuple[Path, Path]:
+        root = self.models / "multilingual-e5-small-int8"
+        return root / "model.onnx", root / "tokenizer.json"
+
+    def _load_embedder(self) -> None:
+        if self.embed_session is not None and self.embed_tokenizer is not None:
+            return
+        model, tokenizer_file = self._embed_paths()
+        if not model.is_file() or not tokenizer_file.is_file():
+            raise RuntimeError(
+                "the pinned multilingual E5 embedder is not installed; "
+                "feature-hash fallback remains active"
+            )
+        expected = (
+            (model, E5_MODEL_SHA256),
+            (tokenizer_file, E5_TOKENIZER_SHA256),
+        )
+        for path, wanted in expected:
+            found = sha256_file(path)
+            if found != wanted:
+                raise RuntimeError(
+                    f"embedding asset digest mismatch for {path.name}: "
+                    f"expected {wanted}, found {found}"
+                )
+
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        tokenizer = Tokenizer.from_file(str(tokenizer_file))
+        tokenizer.enable_truncation(max_length=512)
+        tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
+        options = ort.SessionOptions()
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.embed_session = ort.InferenceSession(
+            str(model),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        self.embed_tokenizer = tokenizer
+
+    def embed(self, request: dict[str, Any]) -> dict[str, Any]:
+        texts = request.get("texts")
+        if not isinstance(texts, list) or not texts or len(texts) > 64:
+            raise RuntimeError("embed expects between one and 64 texts")
+        normalized = [str(text).strip() for text in texts]
+        if any(not text or len(text) > 8_192 for text in normalized):
+            raise RuntimeError("embedding texts must be non-empty and at most 8192 characters")
+        if sum(len(text) for text in normalized) > 65_536:
+            raise RuntimeError("embedding batch exceeds 65536 characters")
+        input_type = str(request.get("input_type", "passage"))
+        if input_type not in {"passage", "query"}:
+            raise RuntimeError("embedding input_type must be passage or query")
+
+        self._load_embedder()
+        import numpy as np
+
+        encoded = self.embed_tokenizer.encode_batch(
+            [f"{input_type}: {text}" for text in normalized]
+        )
+        input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
+        attention_mask = np.asarray(
+            [item.attention_mask for item in encoded], dtype=np.int64
+        )
+        token_type_ids = np.asarray(
+            [item.type_ids for item in encoded], dtype=np.int64
+        )
+        available_inputs = {item.name for item in self.embed_session.get_inputs()}
+        feed = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if "token_type_ids" in available_inputs:
+            feed["token_type_ids"] = token_type_ids
+        hidden = self.embed_session.run(None, feed)[0]
+        weights = attention_mask[:, :, None].astype(np.float32)
+        vectors = (hidden * weights).sum(axis=1) / np.clip(
+            weights.sum(axis=1), 1.0, None
+        )
+        vectors /= np.clip(
+            np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12, None
+        )
+        if vectors.shape != (len(normalized), 384) or not np.isfinite(vectors).all():
+            raise RuntimeError("embedding worker returned invalid vectors")
+        return {
+            "model": E5_MODEL_ID,
+            "revision": E5_MODEL_REVISION,
+            "dimensions": 384,
+            "vectors": vectors.tolist(),
+        }
+
+    def verify_embedder(self) -> dict[str, Any]:
+        corpus = [
+            "Project Atlas is implemented in Rust and uses Cargo.",
+            "The dentist appointment is Tuesday morning at nine.",
+            "The preferred afternoon drink is green tea without sugar.",
+            "The passport is stored in the locked bedroom drawer.",
+            "The family dog is named Miso.",
+            "Production deployments require a reviewed release tag.",
+            "The next flight departs from terminal three.",
+            "הקוד של פרויקט נובה כתוב בפייתון.",
+        ]
+        cases = [
+            ("What programming language does Project Atlas use?", 0),
+            ("When is my dentist appointment?", 1),
+            ("באיזו שפה כתוב פרויקט נובה?", 7),
+        ]
+        passages = self.embed({"texts": corpus, "input_type": "passage"})["vectors"]
+        queries = self.embed(
+            {"texts": [query for query, _ in cases], "input_type": "query"}
+        )["vectors"]
+
+        import numpy as np
+
+        passage_matrix = np.asarray(passages, dtype=np.float32)
+        ranks: list[dict[str, Any]] = []
+        for query_vector, (query, expected) in zip(queries, cases, strict=True):
+            scores = passage_matrix @ np.asarray(query_vector, dtype=np.float32)
+            top_three = np.argsort(-scores)[:3].tolist()
+            if expected not in top_three:
+                raise RuntimeError(
+                    f"embedding recall fixture failed for {query!r}: "
+                    f"expected {expected}, got {top_three}"
+                )
+            ranks.append(
+                {"query": query, "expected": expected, "top_three": top_three}
+            )
+        return {"ok": True, "model": E5_MODEL_ID, "cases": ranks}
+
     def status(self) -> dict[str, Any]:
         moonshine_marker = self.root / "moonshine.json"
         qwen_custom = self.models / "qwen3-tts-0.6b-customvoice"
         qwen_base = self.models / "qwen3-tts-0.6b-base"
         smart_turn = self.models / "smart-turn-v3.2-cpu.onnx"
+        embed_model, embed_tokenizer = self._embed_paths()
         custom_complete = (
             (qwen_custom / "config.json").is_file()
             and (qwen_custom / "model.safetensors").is_file()
@@ -125,8 +269,10 @@ class VoiceRuntime:
             "qwen_custom_voice_ready": custom_complete,
             "qwen_clone_ready": base_complete,
             "smart_turn_ready": smart_turn.is_file(),
+            "embed_ready": embed_model.is_file() and embed_tokenizer.is_file(),
             "moonshine_loaded": self.moonshine is not None,
             "qwen_loaded": self.qwen is not None,
+            "embed_loaded": self.embed_session is not None,
         }
 
     def stt_start(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +407,7 @@ class VoiceRuntime:
             "turn_complete": lambda: self.turn_complete(request),
             "stt_transcribe": lambda: self.stt_transcribe(request),
             "tts_synthesize": lambda: self.tts_synthesize(request),
+            "embed": lambda: self.embed(request),
         }
         handler = handlers.get(command)
         if handler is None:
@@ -276,8 +423,14 @@ def respond(payload: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
+    parser.add_argument("--verify-embedder", action="store_true")
     args = parser.parse_args()
     runtime = VoiceRuntime(Path(args.root).resolve())
+    if args.verify_embedder:
+        with contextlib.redirect_stdout(sys.stderr):
+            result = runtime.verify_embedder()
+        respond(result)
+        return 0
     respond({"ready": True, "protocol": 1})
     for raw in sys.stdin:
         request_id: Any = None

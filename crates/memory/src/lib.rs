@@ -7,6 +7,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Provenance label returned by the pinned CPU embedding worker.
+pub const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
+/// Immutable Hugging Face revision used for the ONNX export and tokenizer.
+pub const E5_SMALL_INT8_REVISION: &str = "614241f622f53c4eeff9890bdc4f31cfecc418b3";
+/// Output width of `intfloat/multilingual-e5-small`.
+pub const E5_SMALL_INT8_DIMENSIONS: usize = 384;
+/// Provenance label for the deterministic, dependency-free offline fallback.
+pub const FEATURE_HASH_MODEL_ID: &str = "feature-hash-local";
+const LEGACY_MISLABELED_FEATURE_HASH_ID: &str = "intfloat-multilingual-e5-small-onnx";
+
 /// Retrieval tier with different retention and trust semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,9 +52,9 @@ pub struct EmbeddingModel {
 impl Default for EmbeddingModel {
     fn default() -> Self {
         Self {
-            id: "intfloat-multilingual-e5-small-onnx".into(),
-            version: "1".into(),
-            dimensions: 384,
+            id: E5_SMALL_INT8_MODEL_ID.into(),
+            version: E5_SMALL_INT8_REVISION.into(),
+            dimensions: E5_SMALL_INT8_DIMENSIONS,
             license: "MIT".into(),
         }
     }
@@ -63,6 +73,8 @@ pub enum MemoryError {
     EmbeddingDimensions,
     #[error("memory source provenance cannot be empty")]
     MissingProvenance,
+    #[error("embedding implementation provenance cannot be empty")]
+    MissingEmbeddingProvenance,
     #[error("memory namespace cannot be blank")]
     MissingNamespace,
     #[error("project graph node does not exist: {0}")]
@@ -211,6 +223,10 @@ pub struct MemoryStore {
     pub embedding_model: EmbeddingModel,
     memories: BTreeMap<Uuid, Memory>,
     embeddings: BTreeMap<Uuid, Vec<f32>>,
+    /// Per-vector provenance keeps legacy/offline fallback vectors from being
+    /// compared with a neural query from a different embedding space.
+    #[serde(default)]
+    embedding_models: BTreeMap<Uuid, String>,
     rejected: BTreeSet<Uuid>,
 }
 
@@ -221,8 +237,24 @@ impl MemoryStore {
             embedding_model,
             memories: BTreeMap::new(),
             embeddings: BTreeMap::new(),
+            embedding_models: BTreeMap::new(),
             rejected: BTreeSet::new(),
         }
+    }
+
+    fn legacy_compatible_embedding_model_id(&self) -> &str {
+        if self.embedding_model.id == LEGACY_MISLABELED_FEATURE_HASH_ID {
+            FEATURE_HASH_MODEL_ID
+        } else {
+            self.embedding_model.id.as_str()
+        }
+    }
+
+    fn stored_embedding_model_id(&self, id: Uuid) -> &str {
+        self.embedding_models.get(&id).map_or_else(
+            || self.legacy_compatible_embedding_model_id(),
+            String::as_str,
+        )
     }
 
     /// Insert or replace a memory and optional persisted embedding.
@@ -234,6 +266,24 @@ impl MemoryStore {
         &mut self,
         memory: Memory,
         embedding: Option<Vec<f32>>,
+    ) -> Result<(), MemoryError> {
+        let model_id = self.legacy_compatible_embedding_model_id().to_owned();
+        self.upsert_labeled(memory, embedding, &model_id)
+    }
+
+    /// Insert or replace a memory while recording the implementation that
+    /// produced its vector. The label is persisted per memory so an offline
+    /// fallback can never be presented or ranked as an E5 vector.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing provenance, recalled records, mismatched vector
+    /// dimensions, or a blank embedding implementation label.
+    pub fn upsert_labeled(
+        &mut self,
+        memory: Memory,
+        embedding: Option<Vec<f32>>,
+        embedding_model_id: &str,
     ) -> Result<(), MemoryError> {
         if memory.source_event_ids.is_empty() {
             return Err(MemoryError::MissingProvenance);
@@ -248,7 +298,12 @@ impl MemoryStore {
             return Err(MemoryError::EmbeddingDimensions);
         }
         if let Some(vector) = embedding {
+            if embedding_model_id.trim().is_empty() {
+                return Err(MemoryError::MissingEmbeddingProvenance);
+            }
             self.embeddings.insert(memory.id, vector);
+            self.embedding_models
+                .insert(memory.id, embedding_model_id.to_owned());
         }
         self.rejected.remove(&memory.id);
         self.memories.insert(memory.id, memory);
@@ -281,6 +336,7 @@ impl MemoryStore {
         }
         self.memories.remove(&id);
         self.embeddings.remove(&id);
+        self.embedding_models.remove(&id);
         self.rejected.insert(id);
         Ok(())
     }
@@ -327,6 +383,27 @@ impl MemoryStore {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Vec<RecallResult> {
+        self.recall_labeled(
+            query,
+            query_embedding,
+            self.legacy_compatible_embedding_model_id(),
+            limit,
+            now,
+        )
+    }
+
+    /// Hybrid retrieval with an explicit query-vector provenance label.
+    /// Vector similarity is used only when the stored and query labels match;
+    /// lexical ranking remains available across offline/online transitions.
+    #[must_use]
+    pub fn recall_labeled(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        query_embedding_model_id: &str,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Vec<RecallResult> {
         let query_tokens = tokenize(query);
         let mut matches = self
             .memories
@@ -344,8 +421,10 @@ impl MemoryStore {
                 } else {
                     ratio(overlap, query_tokens.len())
                 };
-                let vector_score = query_embedding
-                    .zip(self.embeddings.get(&memory.id))
+                let stored_model = self.stored_embedding_model_id(memory.id);
+                let vector_score = (stored_model == query_embedding_model_id)
+                    .then(|| query_embedding.zip(self.embeddings.get(&memory.id)))
+                    .flatten()
                     .map_or(0.0, |(query, memory)| cosine(query, memory));
                 RecallResult {
                     memory: memory.recalled(),
@@ -380,6 +459,13 @@ impl MemoryStore {
         self.memories.get(&id)
     }
 
+    /// Return the honest implementation label persisted beside one vector.
+    #[must_use]
+    pub fn embedding_model_id(&self, id: Uuid) -> Option<&str> {
+        self.embeddings.get(&id)?;
+        Some(self.stored_embedding_model_id(id))
+    }
+
     #[must_use]
     pub fn export(&self) -> Vec<Memory> {
         self.memories.values().cloned().collect()
@@ -393,6 +479,7 @@ impl MemoryStore {
     pub fn delete(&mut self, id: Uuid) -> Result<Memory, MemoryError> {
         let removed = self.memories.remove(&id).ok_or(MemoryError::Missing(id))?;
         self.embeddings.remove(&id);
+        self.embedding_models.remove(&id);
         for memory in self.memories.values_mut() {
             memory.conflicts_with.retain(|other| *other != id);
         }
@@ -666,7 +753,7 @@ impl FeatureHashEmbedder {
 impl TextEmbedder for FeatureHashEmbedder {
     fn model(&self) -> EmbeddingModel {
         EmbeddingModel {
-            id: "feature-hash-local".into(),
+            id: FEATURE_HASH_MODEL_ID.into(),
             version: "1".into(),
             dimensions: self.dimensions,
             license: "Apache-2.0".into(),
@@ -803,6 +890,122 @@ mod tests {
         assert_eq!(results[0].memory.id, exact.id);
         store.delete(related.id).expect("delete");
         assert!(store.get(exact.id).unwrap().conflicts_with.is_empty());
+    }
+
+    #[test]
+    fn recall_quality_fixture_keeps_semantic_answer_in_top_three() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 4,
+            ..EmbeddingModel::default()
+        });
+        let fixture = [
+            (
+                "Project Atlas is implemented in Rust",
+                [0.99, 0.01, 0.0, 0.0],
+            ),
+            (
+                "Dentist appointment is Tuesday morning",
+                [0.0, 0.98, 0.02, 0.0],
+            ),
+            ("The preferred dessert is tiramisu", [0.0, 0.02, 0.98, 0.0]),
+            (
+                "Flight reservation is stored in email",
+                [0.0, 0.0, 0.05, 0.95],
+            ),
+            ("Compiler warnings are denied in CI", [0.82, 0.18, 0.0, 0.0]),
+            ("Weekly groceries include green tea", [0.05, 0.7, 0.25, 0.0]),
+        ];
+        let mut expected = None;
+        for (index, (content, vector)) in fixture.into_iter().enumerate() {
+            let memory = Memory::explicit_user(content, MemoryTier::Semantic, format!("e{index}"));
+            if index == 0 {
+                expected = Some(memory.id);
+            }
+            store
+                .upsert_labeled(memory, Some(vector.to_vec()), E5_SMALL_INT8_MODEL_ID)
+                .expect("fixture memory");
+        }
+
+        let top_three = store.recall_labeled(
+            "Which programming language does Atlas use?",
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+            E5_SMALL_INT8_MODEL_ID,
+            3,
+            Utc::now(),
+        );
+        assert!(
+            top_three
+                .iter()
+                .any(|result| Some(result.memory.id) == expected),
+            "expected Atlas language fact in top three: {top_three:?}"
+        );
+    }
+
+    #[test]
+    fn per_memory_embedding_provenance_prevents_cross_model_scoring() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            dimensions: 2,
+            ..EmbeddingModel::default()
+        });
+        let neural = Memory::explicit_user("neural vector", MemoryTier::Semantic, "e1");
+        let fallback = Memory::explicit_user("offline vector", MemoryTier::Semantic, "e2");
+        store
+            .upsert_labeled(neural.clone(), Some(vec![1.0, 0.0]), E5_SMALL_INT8_MODEL_ID)
+            .expect("neural");
+        store
+            .upsert_labeled(
+                fallback.clone(),
+                Some(vec![1.0, 0.0]),
+                FEATURE_HASH_MODEL_ID,
+            )
+            .expect("fallback");
+
+        let results = store.recall_labeled(
+            "unrelated",
+            Some(&[1.0, 0.0]),
+            E5_SMALL_INT8_MODEL_ID,
+            10,
+            Utc::now(),
+        );
+        assert!(results.iter().any(|result| result.memory.id == neural.id));
+        assert!(!results.iter().any(|result| result.memory.id == fallback.id));
+        assert_eq!(
+            store.embedding_model_id(neural.id),
+            Some(E5_SMALL_INT8_MODEL_ID)
+        );
+        assert_eq!(
+            store.embedding_model_id(fallback.id),
+            Some(FEATURE_HASH_MODEL_ID)
+        );
+    }
+
+    #[test]
+    fn legacy_desktop_vectors_are_identified_as_feature_hash_fallback() {
+        let mut store = MemoryStore::new(EmbeddingModel {
+            id: LEGACY_MISLABELED_FEATURE_HASH_ID.into(),
+            version: "1".into(),
+            dimensions: 2,
+            license: "Apache-2.0".into(),
+        });
+        let memory = Memory::explicit_user("legacy vector", MemoryTier::Semantic, "e1");
+        let id = memory.id;
+        // This is the exact shape of pre-FIX-7 snapshots: a vector existed but
+        // no per-vector implementation map had been serialized yet.
+        store.memories.insert(id, memory);
+        store.embeddings.insert(id, vec![1.0, 0.0]);
+
+        assert_eq!(store.embedding_model_id(id), Some(FEATURE_HASH_MODEL_ID));
+        assert!(
+            store
+                .recall_labeled(
+                    "unrelated",
+                    Some(&[1.0, 0.0]),
+                    E5_SMALL_INT8_MODEL_ID,
+                    10,
+                    Utc::now(),
+                )
+                .is_empty()
+        );
     }
 
     #[test]
