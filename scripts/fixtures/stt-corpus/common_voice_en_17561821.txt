@@ -1,0 +1,1 @@
+How is Mozilla going to handle ambiguities like queue and cue?

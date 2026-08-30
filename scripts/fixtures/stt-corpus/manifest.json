@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "corpus": "Mozilla Common Voice Corpus 11.0 English test split",
+  "license": "CC0-1.0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source_repository": "akahana/common-voice-11-eng-sample",
+  "source_revision": "4354744379973dd44a1b2273d7beb893810912f5",
+  "source_audio_archive": "en_test_0.tar",
+  "source_transcripts": "test.tsv",
+  "conversion": "ffmpeg mono signed PCM16 WAV at 16000 Hz, no trimming",
+  "cases": [
+    {
+      "id": "common_voice_en_17263741",
+      "wav_sha256": "f65f99f19db20afae32ca57add79a9ad0e07dd8aa754e76c5c8808d14af9feeb",
+      "transcript_sha256": "7eaff71eb452e041c8f98f676351d739b8b268bbf70d40d11bd274834048d43a"
+    },
+    {
+      "id": "common_voice_en_17561821",
+      "wav_sha256": "9858d3797da024684ab75d0781043e6f751c187872b9cd4caa6a9f1b84e3f04a",
+      "transcript_sha256": "fa68f4cfe8d86fdd41a41b4b2e06e6866dfdc18f22010665381ffca7737304c7"
+    },
+    {
+      "id": "common_voice_en_17893917",
+      "wav_sha256": "71587ddb03fbb1125aa6551053b3f03539bc4e071553b690626fe039046c6c26",
+      "transcript_sha256": "d1d93aa94777cc13b0cec7417e4560a569a6c790e74564cb89f13f21ab2dbac3"
+    },
+    {
+      "id": "common_voice_en_18132047",
+      "wav_sha256": "e64e52980f3d0787668bcb2066802cf8421d30f19e91b4c2ae461e638fd271fc",
+      "transcript_sha256": "c93c61680bd2c3a08bde3d1d9a938d58bf64ea9814dea28795a2aa93869effc8"
+    },
+    {
+      "id": "common_voice_en_21953345",
+      "wav_sha256": "39b8d90e946630953b660760c910085ac9f58d25ffcaab7e4d2621dc6571c5af",
+      "transcript_sha256": "fe2547fe2604b445e70fc9d819062960552f9145bdb043b51986e478a4806a2b"
+    },
+    {
+      "id": "common_voice_en_27340672",
+      "wav_sha256": "f138918c59de77db4a598aeafae4db9b2fe1d739576f002e36c2ab1c5123d42a",
+      "transcript_sha256": "e55d652a3c0fb5b6ce43860d0e2962dc17a3e6093cb2863bdbc4ac4b85616a21"
+    },
+    {
+      "id": "common_voice_en_27710027",
+      "wav_sha256": "00391cd00b9875ec72c215f226a5385bc0579e8302a2ef6b19a4f4f873e5c011",
+      "transcript_sha256": "9fb1784cd601477301cd66d8dc558a18a1e462a8377d8a9b62a30574f2469d44"
+    },
+    {
+      "id": "common_voice_en_30533383",
+      "wav_sha256": "277831ab8a339cd6f2bca43ef3de2c347a89be85f91e8def1f05a7050939a64c",
+      "transcript_sha256": "b6d3746935da4d9b99c39689943d873e5c5924cbfb6c2a9412b669a5a524f815"
+    },
+    {
+      "id": "common_voice_en_59751",
+      "wav_sha256": "795d9e14c493285e740c4c572575c54b6b62980287ef350c878df4d8888ffce0",
+      "transcript_sha256": "9b2b47eabd07f0002b14f444406a1c98b69dadb4b04e6c85cfd48f4a9d89c2e9"
+    },
+    {
+      "id": "common_voice_en_699711",
+      "wav_sha256": "9b64bd70854ade53fe75bf5376c690077f727da54ac03c67e47f395894d0cdc5",
+      "transcript_sha256": "6fd42ef6c2368e5065de8e2d787941c880e82baba7e4ea38ec8db3d9471317cd"
+    }
+  ]
+}

@@ -1,30 +1,18 @@
 {
   "ambient_armed_cpu_replay": {
-    "legacy_stt_cpu_ticks": 11123,
-    "maximum_score": 0.9982998371124268,
-    "measurement": "Linux worker user+system CPU ticks over identical replay PCM",
-    "minimum_reduction_ratio": 5.0,
-    "openwakeword_cpu_ticks": 1135,
-    "reduction_ratio": 9.8,
-    "sample_count": 5,
-    "status": "measured",
-    "wake_event_response": {
-      "maximum_microseconds": 9719,
-      "p50_microseconds": 7173,
-      "p95_microseconds": 9719,
-      "sample_count": 20
-    }
+    "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
+    "status": "external-model-assets-required"
   },
   "bootstrap_ipc": {
-    "maximum_microseconds": 916,
-    "p50_microseconds": 648,
-    "p95_microseconds": 772,
+    "maximum_microseconds": 1205,
+    "p50_microseconds": 810,
+    "p95_microseconds": 1020,
     "sample_count": 100
   },
   "desktop_snapshot_warm": {
-    "maximum_microseconds": 27,
-    "p50_microseconds": 17,
-    "p95_microseconds": 20,
+    "maximum_microseconds": 51,
+    "p50_microseconds": 24,
+    "p95_microseconds": 33,
     "sample_count": 100
   },
   "external_hardware_required": [
@@ -42,7 +30,7 @@
     "sample_count": 100
   },
   "internal_speaker_stop": {
-    "maximum_microseconds": 0,
+    "maximum_microseconds": 6,
     "p50_microseconds": 0,
     "p95_microseconds": 0,
     "sample_count": 100
@@ -50,9 +38,9 @@
   "measurement": "deterministic-replay",
   "network": "disabled",
   "offline_deterministic_command": {
-    "maximum_microseconds": 23,
-    "p50_microseconds": 10,
-    "p95_microseconds": 13,
+    "maximum_microseconds": 31,
+    "p50_microseconds": 20,
+    "p95_microseconds": 25,
     "sample_count": 100
   },
   "replay_disclaimer": "Replay numbers are not physical microphone, speaker, network, screen-capture, or UI-startup measurements.",
@@ -61,63 +49,44 @@
     "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
     "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
     "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
+    "stt_accuracy": "ten CC0 Common Voice 11 utterances transcribed by each real configured engine when replay env vars are set; no hard WER threshold",
     "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set",
+    "stt_partial_lag_ms": "paced 20 ms CC0 corpus replay comparing observed partial emit wall-time with the worker-reported decoder audio boundary when replay env vars are set",
     "tts_first_audio_ms": "three-clause fake-engine turn through a one-clause prebuffer and bounded in-memory PCM sink; excludes physical device startup"
   },
   "schema_version": 1,
   "startup_native_setup": {
-    "maximum_microseconds": 87,
-    "p50_microseconds": 22,
-    "p95_microseconds": 29,
+    "maximum_microseconds": 112,
+    "p50_microseconds": 46,
+    "p95_microseconds": 59,
     "sample_count": 100
   },
   "stt_endpoint_replay": {
-    "decisions": [
-      {
-        "complete": true,
-        "decision": "smart-turn"
-      },
-      {
-        "complete": true,
-        "decision": "smart-turn"
-      },
-      {
-        "complete": true,
-        "decision": "smart-turn"
-      },
-      {
-        "complete": true,
-        "decision": "smart-turn"
-      },
-      {
-        "complete": true,
-        "decision": "smart-turn"
-      }
-    ],
-    "endpoint_decision": {
-      "maximum_microseconds": 103040,
-      "p50_microseconds": 99637,
-      "p95_microseconds": 103040,
-      "sample_count": 5
-    },
-    "maximum_speech_probability": 0.9996996521949768,
-    "measurement": "real pinned Silero v5 512-sample frame followed by one real Smart Turn v3.2 request",
-    "smart_turn_consultations_per_silence": 1,
-    "status": "measured",
-    "vad_model": "silero-vad-v5.1.2",
-    "vad_start_probability": 0.6,
-    "vad_stop_probability": 0.35
+    "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
+    "status": "external-model-assets-required"
+  },
+  "stt_partial_lag_ms": {
+    "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
+    "status": "external-model-assets-required"
+  },
+  "stt_wer_accurate": {
+    "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
+    "status": "external-model-assets-required"
+  },
+  "stt_wer_moonshine": {
+    "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
+    "status": "external-model-assets-required"
   },
   "tts_first_audio_ms": {
-    "maximum_microseconds": 255,
-    "p50_microseconds": 125,
-    "p95_microseconds": 216,
+    "maximum_microseconds": 530,
+    "p50_microseconds": 192,
+    "p95_microseconds": 268,
     "sample_count": 100
   },
   "wake_detection_to_listening": {
-    "maximum_microseconds": 46,
-    "p50_microseconds": 9,
-    "p95_microseconds": 11,
+    "maximum_microseconds": 32,
+    "p50_microseconds": 15,
+    "p95_microseconds": 22,
     "sample_count": 100
   }
 }

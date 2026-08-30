@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,8 +28,12 @@ def main() -> None:
     args = parser.parse_args()
     result = subprocess.run(
         ["cargo", "run", "-p", "personal-agent-audio", "--bin", "audio-benchmark", "--quiet"],
-        cwd=ROOT, check=True, capture_output=True, text=True,
+        cwd=ROOT, check=False, capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        raise SystemExit(result.returncode)
     report = json.loads(result.stdout)
     for name, limit in LIMITS_US.items():
         metric = report[name]
@@ -48,11 +53,61 @@ def main() -> None:
         ), "endpoint replay did not exercise Smart Turn"
     else:
         assert endpoint["status"] == "external-model-assets-required"
+    moonshine_wer = report["stt_wer_moonshine"]
+    accurate_wer = report["stt_wer_accurate"]
+    if moonshine_wer["status"] == "measured":
+        assert accurate_wer["status"] == "measured"
+        assert moonshine_wer["sample_count"] == 10
+        assert accurate_wer["sample_count"] == 10
+        assert moonshine_wer["reference_words"] > 0
+        assert accurate_wer["reference_words"] > 0
+        assert moonshine_wer["wer"] >= 0
+        assert accurate_wer["wer"] >= 0
+        wer_evidence = (
+            f"Moonshine WER {moonshine_wer['wer']:.2%}; "
+            f"accurate WER {accurate_wer['wer']:.2%}"
+        )
+    else:
+        assert moonshine_wer["status"] == "external-model-assets-required"
+        assert accurate_wer["status"] == "external-model-assets-required"
+        wer_evidence = "WER requires the pinned external STT model assets"
+    # Print measured accuracy before the latency assertion so a hardware-bound
+    # latency failure still preserves the real two-engine WER evidence.
+    print(f"STT WER evidence: {wer_evidence}")
+    partial_lag = report["stt_partial_lag_ms"]
+    if partial_lag["status"] == "measured":
+        assert partial_lag["sample_count"] >= 10, "stt_partial_lag_ms"
+        observations = partial_lag["observations"]
+        assert set(observations) == {"moonshine", "faster-whisper"}
+        for engine, engine_observations in observations.items():
+            assert len(engine_observations) == partial_lag["by_engine"][engine]["sample_count"]
+            for observation in engine_observations:
+                assert observation["decoder_audio_samples"] <= observation["observed_audio_samples"]
+                decomposed_lag = (
+                    observation["decoder_backlog_microseconds"]
+                    + observation["post_latest_ingress_microseconds"]
+                )
+                assert abs(observation["lag_microseconds"] - decomposed_lag) <= 1
+        slow_observations = {
+            engine: [
+                observation
+                for observation in engine_observations
+                if observation["lag_microseconds"] >= 700_000
+            ]
+            for engine, engine_observations in observations.items()
+        }
+        assert partial_lag["p95_microseconds"] < 700_000, (
+            f"STT partial lag p95 {partial_lag['p95_microseconds']}us exceeded "
+            f"700000us; by engine: {partial_lag['by_engine']}; "
+            f"slow observations: {slow_observations}"
+        )
+    else:
+        assert partial_lag["status"] == "external-model-assets-required"
     if args.write:
         output = ROOT / "docs/operations/performance-report.json"
         output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
-        "verified deterministic replay performance distributions; "
+        f"verified deterministic replay performance distributions; {wer_evidence}; "
         "replay is not a physical microphone, speaker, network, screen-capture, "
         "or UI-startup measurement; physical-device metrics remain externally gated"
     )
