@@ -1,6 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
+import audioWorkletUrl from "./audio-worklet?worker&url";
 import type { AppConfig, Projection } from "./types";
+
+const VOICE_SAMPLE_RATE = 16_000;
+const VOICE_FRAME_SAMPLES = 320;
+const VOICE_WORKLET_PROCESSOR = "personal-agent-voice-capture";
+
+type CaptureProcessorNode = AudioWorkletNode | ScriptProcessorNode;
 
 export type VoiceCaptureState =
   | "idle"
@@ -77,7 +84,7 @@ export function matchWakePhrase(
 function downsample(
   samples: Float32Array,
   sourceRate: number,
-  targetRate = 16_000,
+  targetRate = VOICE_SAMPLE_RATE,
 ) {
   if (sourceRate === targetRate) return Array.from(samples);
   const ratio = sourceRate / targetRate;
@@ -91,6 +98,55 @@ function downsample(
     output[index] = sum / Math.max(1, end - start);
   }
   return output;
+}
+
+function downsampleFrame(samples: Float32Array, sourceRate: number) {
+  return Float32Array.from(downsample(samples, sourceRate, VOICE_SAMPLE_RATE));
+}
+
+async function createCaptureProcessor(
+  audioContext: AudioContext,
+  gain: number,
+  onFrame: (frame: Float32Array) => void,
+): Promise<CaptureProcessorNode> {
+  if (
+    audioContext.audioWorklet &&
+    typeof globalThis.AudioWorkletNode === "function"
+  ) {
+    await audioContext.audioWorklet.addModule(audioWorkletUrl);
+    const node = new AudioWorkletNode(audioContext, VOICE_WORKLET_PROCESSOR, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      channelCount: 1,
+      channelCountMode: "explicit",
+      processorOptions: { gain },
+    });
+    node.port.onmessage = (event: MessageEvent<unknown>) => {
+      if (
+        event.data instanceof Float32Array &&
+        event.data.length === VOICE_FRAME_SAMPLES
+      )
+        onFrame(event.data);
+    };
+    return node;
+  }
+
+  const node = audioContext.createScriptProcessor(4_096, 1, 1);
+  node.onaudioprocess = (event) => {
+    const data = new Float32Array(event.inputBuffer.getChannelData(0));
+    for (let index = 0; index < data.length; index += 1)
+      data[index] = Math.max(-1, Math.min(1, (data[index] ?? 0) * gain));
+    onFrame(downsampleFrame(data, audioContext.sampleRate));
+  };
+  return node;
+}
+
+function disconnectCaptureProcessor(node: CaptureProcessorNode | null) {
+  if (!node) return;
+  if ("port" in node) node.port.onmessage = null;
+  if ("onaudioprocess" in node) node.onaudioprocess = null;
+  node.disconnect();
 }
 
 function mergeChunks(chunks: Float32Array[]) {
@@ -125,10 +181,7 @@ export function sendVoiceStreamChunk(samples: ArrayLike<number>) {
     speech_prob: number;
     vad_frames?: number;
     vad_model?: string;
-  }>(
-    "voice_stream_chunk",
-    encodePcm16Le(samples),
-  );
+  }>("voice_stream_chunk", encodePcm16Le(samples));
 }
 
 export type WakeChunkResult = {
@@ -186,10 +239,7 @@ export function advanceVadEndpoint(
 
 /** Send ambient audio to the dedicated wake-word worker without JSON samples. */
 export function sendWakeStreamChunk(samples: ArrayLike<number>) {
-  return invoke<WakeChunkResult>(
-    "voice_wake_chunk",
-    encodePcm16Le(samples),
-  );
+  return invoke<WakeChunkResult>("voice_wake_chunk", encodePcm16Le(samples));
 }
 
 export function useVoiceCapture(
@@ -210,23 +260,23 @@ export function useVoiceCapture(
   const stream = useRef<MediaStream | null>(null);
   const context = useRef<AudioContext | null>(null);
   const source = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processor = useRef<ScriptProcessorNode | null>(null);
+  const processor = useRef<CaptureProcessorNode | null>(null);
   const chunks = useRef<Float32Array[]>([]);
-  const streamingChunks = useRef<Float32Array[]>([]);
-  const streamingSamples = useRef(0);
   const neuralStreaming = useRef(false);
   const streamFailure = useRef("");
   const streamQueue = useRef<Promise<void>>(Promise.resolve());
   const speechStarted = useRef(false);
   const turnCheckInFlight = useRef(false);
   const semanticConsultedForSilence = useRef(false);
-  const considerEndpointRef = useRef<() => Promise<void>>(async () => undefined);
+  const considerEndpointRef = useRef<() => Promise<void>>(
+    async () => undefined,
+  );
   const startRef = useRef<() => Promise<void>>(async () => undefined);
   const onTranscriptRef = useRef(onTranscript);
   const wakeStream = useRef<MediaStream | null>(null);
   const wakeContext = useRef<AudioContext | null>(null);
   const wakeSource = useRef<MediaStreamAudioSourceNode | null>(null);
-  const wakeProcessor = useRef<ScriptProcessorNode | null>(null);
+  const wakeProcessor = useRef<CaptureProcessorNode | null>(null);
   const wakeRolling = useRef<Float32Array[]>([]);
   const wakeCandidate = useRef<Float32Array[]>([]);
   const wakeCandidateSamples = useRef(0);
@@ -259,7 +309,7 @@ export function useVoiceCapture(
   const stopWakeCapture = useCallback(
     async (publishPrivacy = true) => {
       wakeGeneration.current += 1;
-      wakeProcessor.current?.disconnect();
+      disconnectCaptureProcessor(wakeProcessor.current);
       wakeSource.current?.disconnect();
       wakeStream.current?.getTracks().forEach((track) => track.stop());
       void wakeContext.current?.close().catch(() => undefined);
@@ -295,10 +345,7 @@ export function useVoiceCapture(
   const activateWake = useCallback(
     async (phrase: string, remainder = "") => {
       const detectedAt = performance.now();
-      if (
-        detectedAt - lastWakeDetectedAt.current <
-        config.voice.refractory_ms
-      )
+      if (detectedAt - lastWakeDetectedAt.current < config.voice.refractory_ms)
         return;
       lastWakeDetectedAt.current = detectedAt;
       publishPartial(phrase, { final: false, source: "wake" }, false);
@@ -363,121 +410,124 @@ export function useVoiceCapture(
       const audioContext = new AudioContext();
       await audioContext.resume();
       const input = audioContext.createMediaStreamSource(media);
-      const node = audioContext.createScriptProcessor(4096, 1, 1);
       const silentOutput = audioContext.createGain();
       silentOutput.gain.value = 0;
       wakeRolling.current = [];
       wakeCandidate.current = [];
       wakeCandidateSamples.current = 0;
       wakeSpeechStarted.current = false;
-      node.onaudioprocess = (event) => {
-        if (wakeGeneration.current !== generation) return;
-        const data = new Float32Array(event.inputBuffer.getChannelData(0));
-        const gain = config.voice.input_gain_percent / 100;
-        let sum = 0;
-        for (let index = 0; index < data.length; index += 1) {
-          const sample = Math.max(-1, Math.min(1, (data[index] ?? 0) * gain));
-          data[index] = sample;
-          sum += sample * sample;
-        }
-        const rms = Math.sqrt(sum / data.length);
-        setLevel(Math.min(1, rms * 8));
-        const requestGeneration = wakeGeneration.current;
-        const samples = downsample(data, audioContext.sampleRate);
-        wakeQueue.current = wakeQueue.current
-          .then(async () => {
-            if (wakeGeneration.current !== requestGeneration) return;
-            if (!wakeFallback.current) {
-              const result = await sendWakeStreamChunk(samples);
-              if (!result.wake) return;
-              const phrase = config.voice.wake_phrases.find((candidate) =>
-                ["hey jarvis", "jarvis"].includes(
-                  normalizedWords(candidate).join(" "),
-                ),
-              );
-              await activateWake(phrase ?? "hey jarvis");
-              return;
-            }
-
-            const preRollSamples =
-              (audioContext.sampleRate * config.voice.pre_roll_ms) / 1000;
-            const updateRolling = () => {
-              wakeRolling.current.push(data);
-              let rollingSamples = wakeRolling.current.reduce(
-                (total, chunk) => total + chunk.length,
-                0,
-              );
-              while (
-                rollingSamples > preRollSamples &&
-                wakeRolling.current.length > 1
-              ) {
-                rollingSamples -= wakeRolling.current.shift()?.length ?? 0;
-              }
-              return rollingSamples;
-            };
-            const shouldConsultWorker =
-              wakeSpeechStarted.current || passesVoicePreGate(rms);
-            const result = shouldConsultWorker
-              ? await sendWakeStreamChunk(samples)
-              : ({ speech_prob: 0 } as WakeChunkResult);
-            const speechProbability = result.speech_prob ?? 0;
-            const startThreshold = vadProbabilityThreshold(
-              config.voice.vad_start_milli,
-            );
-            const stopThreshold = vadProbabilityThreshold(
-              config.voice.vad_stop_milli,
-            );
-            if (!wakeSpeechStarted.current) {
-              const rollingSamples = updateRolling();
-              if (speechProbability >= startThreshold) {
-                wakeSpeechStarted.current = true;
-                wakeCandidate.current = [...wakeRolling.current];
-                wakeCandidateSamples.current = rollingSamples;
-              }
-              return;
-            }
-
-            wakeCandidate.current.push(data);
-            wakeCandidateSamples.current += data.length;
-            const timedOut =
-              wakeCandidateSamples.current >= audioContext.sampleRate * 4;
-            if (speechProbability > stopThreshold && !timedOut) return;
-
-            const candidate = mergeChunks(wakeCandidate.current);
-            wakeCandidate.current = [];
-            wakeCandidateSamples.current = 0;
-            wakeRolling.current = [];
-            wakeSpeechStarted.current = false;
-            if (candidate.length < audioContext.sampleRate / 4) return;
-            const transcript = await invoke<{ text: string }>(
-              "voice_transcribe",
-              {
-                samples: downsample(candidate, audioContext.sampleRate),
-                sampleRateHz: 16_000,
-              },
-            );
-            if (wakeGeneration.current !== requestGeneration) return;
-            const match = matchWakePhrase(
-              transcript.text,
-              config.voice.wake_phrases,
-            );
-            if (!match) return;
-            await activateWake(match.phrase, match.remainder);
-          })
-          .catch((caught) => {
-            if (wakeGeneration.current !== requestGeneration) return;
-            setError(`Wake recognition failed: ${String(caught)}`);
-            void stopWakeCapture();
-            transition("error");
-          });
-      };
-      input.connect(node);
-      node.connect(silentOutput);
-      silentOutput.connect(audioContext.destination);
       wakeStream.current = media;
       wakeContext.current = audioContext;
       wakeSource.current = input;
+      const node = await createCaptureProcessor(
+        audioContext,
+        config.voice.input_gain_percent / 100,
+        (data) => {
+          if (wakeGeneration.current !== generation) return;
+          let sum = 0;
+          for (let index = 0; index < data.length; index += 1) {
+            const sample = data[index] ?? 0;
+            sum += sample * sample;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          setLevel(Math.min(1, rms * 8));
+          const requestGeneration = wakeGeneration.current;
+          wakeQueue.current = wakeQueue.current
+            .then(async () => {
+              if (wakeGeneration.current !== requestGeneration) return;
+              if (!wakeFallback.current) {
+                const result = await sendWakeStreamChunk(data);
+                if (!result.wake) return;
+                const phrase = config.voice.wake_phrases.find((candidate) =>
+                  ["hey jarvis", "jarvis"].includes(
+                    normalizedWords(candidate).join(" "),
+                  ),
+                );
+                await activateWake(phrase ?? "hey jarvis");
+                return;
+              }
+
+              const preRollSamples =
+                (VOICE_SAMPLE_RATE * config.voice.pre_roll_ms) / 1000;
+              const updateRolling = () => {
+                wakeRolling.current.push(data);
+                let rollingSamples = wakeRolling.current.reduce(
+                  (total, chunk) => total + chunk.length,
+                  0,
+                );
+                while (
+                  rollingSamples > preRollSamples &&
+                  wakeRolling.current.length > 1
+                ) {
+                  rollingSamples -= wakeRolling.current.shift()?.length ?? 0;
+                }
+                return rollingSamples;
+              };
+              const shouldConsultWorker =
+                wakeSpeechStarted.current || passesVoicePreGate(rms);
+              const result = shouldConsultWorker
+                ? await sendWakeStreamChunk(data)
+                : ({ speech_prob: 0 } as WakeChunkResult);
+              const speechProbability = result.speech_prob ?? 0;
+              const startThreshold = vadProbabilityThreshold(
+                config.voice.vad_start_milli,
+              );
+              const stopThreshold = vadProbabilityThreshold(
+                config.voice.vad_stop_milli,
+              );
+              if (!wakeSpeechStarted.current) {
+                const rollingSamples = updateRolling();
+                if (speechProbability >= startThreshold) {
+                  wakeSpeechStarted.current = true;
+                  wakeCandidate.current = [...wakeRolling.current];
+                  wakeCandidateSamples.current = rollingSamples;
+                }
+                return;
+              }
+
+              wakeCandidate.current.push(data);
+              wakeCandidateSamples.current += data.length;
+              const timedOut =
+                wakeCandidateSamples.current >= VOICE_SAMPLE_RATE * 4;
+              if (speechProbability > stopThreshold && !timedOut) return;
+
+              const candidate = mergeChunks(wakeCandidate.current);
+              wakeCandidate.current = [];
+              wakeCandidateSamples.current = 0;
+              wakeRolling.current = [];
+              wakeSpeechStarted.current = false;
+              if (candidate.length < VOICE_SAMPLE_RATE / 4) return;
+              const transcript = await invoke<{ text: string }>(
+                "voice_transcribe",
+                {
+                  samples: downsample(candidate, VOICE_SAMPLE_RATE),
+                  sampleRateHz: VOICE_SAMPLE_RATE,
+                },
+              );
+              if (wakeGeneration.current !== requestGeneration) return;
+              const match = matchWakePhrase(
+                transcript.text,
+                config.voice.wake_phrases,
+              );
+              if (!match) return;
+              await activateWake(match.phrase, match.remainder);
+            })
+            .catch((caught) => {
+              if (wakeGeneration.current !== requestGeneration) return;
+              setError(`Wake recognition failed: ${String(caught)}`);
+              void stopWakeCapture();
+              transition("error");
+            });
+        },
+      );
       wakeProcessor.current = node;
+      if (wakeGeneration.current !== generation || wakeSuspended) {
+        await stopWakeCapture(false);
+        return;
+      }
+      input.connect(node);
+      node.connect(silentOutput);
+      silentOutput.connect(audioContext.destination);
       const projection = await invoke<Projection>("microphone_state", {
         active: true,
         mode: "wake-only",
@@ -504,7 +554,10 @@ export function useVoiceCapture(
   const queueStreamChunk = useCallback(
     (audio: Float32Array, sampleRate: number) => {
       if (!neuralStreaming.current || !audio.length) return;
-      const samples = downsample(audio, sampleRate);
+      const samples =
+        sampleRate === VOICE_SAMPLE_RATE
+          ? audio
+          : downsample(audio, sampleRate);
       const audioEndMs = performance.now();
       streamQueue.current = streamQueue.current
         .then(async () => {
@@ -521,8 +574,7 @@ export function useVoiceCapture(
           const endpoint = advanceVadEndpoint(
             {
               speechStarted: speechStarted.current,
-              semanticConsultedForSilence:
-                semanticConsultedForSilence.current,
+              semanticConsultedForSilence: semanticConsultedForSilence.current,
             },
             result.speech_prob,
             config.voice.vad_start_milli,
@@ -531,10 +583,7 @@ export function useVoiceCapture(
           speechStarted.current = endpoint.state.speechStarted;
           semanticConsultedForSilence.current =
             endpoint.state.semanticConsultedForSilence;
-          if (
-            endpoint.consultSmartTurn &&
-            stateRef.current === "listening"
-          ) {
+          if (endpoint.consultSmartTurn && stateRef.current === "listening") {
             void considerEndpointRef.current();
           }
         })
@@ -550,8 +599,7 @@ export function useVoiceCapture(
       if (stopInFlight.current) return;
       if (
         stateRef.current === "loading_model" ||
-        (stateRef.current === "requesting" &&
-          (!stream.current || !context.current))
+        stateRef.current === "requesting"
       ) {
         stopRequested.current = true;
         return;
@@ -559,16 +607,11 @@ export function useVoiceCapture(
       if (!stream.current || !context.current) return;
       stopInFlight.current = true;
       transition(endpointDetected ? "endpointing" : "transcribing");
-      processor.current?.disconnect();
+      disconnectCaptureProcessor(processor.current);
       source.current?.disconnect();
       stream.current.getTracks().forEach((track) => track.stop());
-      const sampleRate = context.current.sampleRate;
+      const sampleRate = VOICE_SAMPLE_RATE;
       await context.current.close();
-      if (streamingChunks.current.length) {
-        queueStreamChunk(mergeChunks(streamingChunks.current), sampleRate);
-        streamingChunks.current = [];
-        streamingSamples.current = 0;
-      }
       const merged = mergeChunks(chunks.current);
       const audioEndMs = performance.now();
       chunks.current = [];
@@ -597,7 +640,7 @@ export function useVoiceCapture(
             void invoke("voice_stream_cancel").catch(() => undefined);
           transcript = await invoke<{ text: string }>("voice_transcribe", {
             samples: downsample(merged, sampleRate),
-            sampleRateHz: 16_000,
+            sampleRateHz: VOICE_SAMPLE_RATE,
           });
         }
         if (!transcript.text.trim())
@@ -636,7 +679,6 @@ export function useVoiceCapture(
       onProjection,
       onTranscript,
       publishPartial,
-      queueStreamChunk,
       transition,
     ],
   );
@@ -651,15 +693,6 @@ export function useVoiceCapture(
     turnCheckInFlight.current = true;
     transition("endpointing");
     try {
-      const audioContext = context.current;
-      if (audioContext && streamingChunks.current.length) {
-        queueStreamChunk(
-          mergeChunks(streamingChunks.current),
-          audioContext.sampleRate,
-        );
-        streamingChunks.current = [];
-        streamingSamples.current = 0;
-      }
       await streamQueue.current;
       const result =
         neuralStreaming.current && !streamFailure.current
@@ -667,9 +700,7 @@ export function useVoiceCapture(
               complete: boolean;
               probability?: number;
               decision?: "smart-turn" | "silence-fallback";
-            }>(
-              "voice_turn_complete",
-            )
+            }>("voice_turn_complete")
           : { complete: true };
       if (result.complete) {
         await stop(true);
@@ -682,7 +713,7 @@ export function useVoiceCapture(
     } finally {
       turnCheckInFlight.current = false;
     }
-  }, [queueStreamChunk, stop, transition]);
+  }, [stop, transition]);
 
   considerEndpointRef.current = considerEndpoint;
 
@@ -750,44 +781,49 @@ export function useVoiceCapture(
       const audioContext = new AudioContext();
       await audioContext.resume();
       const input = audioContext.createMediaStreamSource(media);
-      const node = audioContext.createScriptProcessor(4096, 1, 1);
       const silentOutput = audioContext.createGain();
       silentOutput.gain.value = 0;
       chunks.current = [];
-      streamingChunks.current = [];
-      streamingSamples.current = 0;
-      node.onaudioprocess = (event) => {
-        const data = new Float32Array(event.inputBuffer.getChannelData(0));
-        const gain = config.voice.input_gain_percent / 100;
-        let sum = 0;
-        for (let index = 0; index < data.length; index += 1) {
-          const sample = Math.max(-1, Math.min(1, (data[index] ?? 0) * gain));
-          data[index] = sample;
-          sum += sample * sample;
-        }
-        const rms = Math.sqrt(sum / data.length);
-        chunks.current.push(data);
-        if (speechStarted.current || passesVoicePreGate(rms)) {
-          streamingChunks.current.push(data);
-          streamingSamples.current += data.length;
-          if (streamingSamples.current >= audioContext.sampleRate * 0.08) {
-            queueStreamChunk(
-              mergeChunks(streamingChunks.current),
-              audioContext.sampleRate,
-            );
-            streamingChunks.current = [];
-            streamingSamples.current = 0;
-          }
-        }
-        setLevel(Math.min(1, rms * 8));
-      };
-      input.connect(node);
-      node.connect(silentOutput);
-      silentOutput.connect(audioContext.destination);
       stream.current = media;
       context.current = audioContext;
       source.current = input;
+      const node = await createCaptureProcessor(
+        audioContext,
+        config.voice.input_gain_percent / 100,
+        (data) => {
+          let sum = 0;
+          for (let index = 0; index < data.length; index += 1) {
+            const sample = data[index] ?? 0;
+            sum += sample * sample;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          chunks.current.push(data);
+          if (speechStarted.current || passesVoicePreGate(rms)) {
+            queueStreamChunk(data, VOICE_SAMPLE_RATE);
+          }
+          setLevel(Math.min(1, rms * 8));
+        },
+      );
       processor.current = node;
+      if (stopRequested.current) {
+        disconnectCaptureProcessor(node);
+        input.disconnect();
+        media.getTracks().forEach((track) => track.stop());
+        await audioContext.close();
+        stream.current = null;
+        context.current = null;
+        source.current = null;
+        processor.current = null;
+        chunks.current = [];
+        if (neuralStreaming.current)
+          void invoke("voice_stream_cancel").catch(() => undefined);
+        neuralStreaming.current = false;
+        transition("idle");
+        return;
+      }
+      input.connect(node);
+      node.connect(silentOutput);
+      silentOutput.connect(audioContext.destination);
       const projection = await invoke<Projection>("microphone_state", {
         active: true,
         mode: config.voice.mode,
@@ -796,7 +832,7 @@ export function useVoiceCapture(
       transition("listening");
       if (stopRequested.current) await stop();
     } catch (caught) {
-      processor.current?.disconnect();
+      disconnectCaptureProcessor(processor.current);
       source.current?.disconnect();
       stream.current?.getTracks().forEach((track) => track.stop());
       void context.current?.close();
@@ -807,6 +843,13 @@ export function useVoiceCapture(
       processor.current = null;
       source.current = null;
       setLevel(0);
+      if (stopRequested.current) {
+        neuralStreaming.current = false;
+        streamFailure.current = "";
+        setError("");
+        transition("idle");
+        return;
+      }
       void invoke<Projection>("microphone_state", {
         active: false,
         mode: config.voice.mode,
@@ -831,7 +874,7 @@ export function useVoiceCapture(
   const cancel = useCallback(() => {
     stopRequested.current = true;
     void stopWakeCapture();
-    processor.current?.disconnect();
+    disconnectCaptureProcessor(processor.current);
     source.current?.disconnect();
     stream.current?.getTracks().forEach((track) => track.stop());
     void context.current?.close();
