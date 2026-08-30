@@ -1,6 +1,6 @@
 //! Native offline STT/TTS process adapters used by the desktop host.
 
-use crate::{AudioError, Transcript};
+use crate::{AudioError, Transcript, native_output_device_name};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -54,6 +54,7 @@ pub struct NativeVoiceConfig {
 
 /// Locate bundled/downloaded engines, honoring validated explicit overrides.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // Discovery mirrors independently configured engine/model/device fields.
 #[allow(clippy::too_many_lines)] // A single probe preserves the explicit fallback order.
 pub fn discover_native_voice(
     voice_root: &Path,
@@ -63,6 +64,7 @@ pub fn discover_native_voice(
     whisper_model_override: &str,
     piper_override: &str,
     piper_model_override: &str,
+    output_device: &str,
 ) -> NativeVoiceStatus {
     let executable_name = |name: &str| {
         if cfg!(windows) {
@@ -102,6 +104,7 @@ pub fn discover_native_voice(
     let playback_command = ["pw-play", "paplay", "aplay", "ffplay"]
         .iter()
         .find_map(|name| command_path(name));
+    let native_output_device = native_output_device_name(output_device);
     let neural_python = first_file(&[Some(voice_root.join(if cfg!(windows) {
         "neural/venv/Scripts/python.exe"
     } else {
@@ -184,8 +187,29 @@ pub fn discover_native_voice(
                 .into(),
         );
     }
-    if playback_command.is_none() {
-        details.push("No supported native WAV playback command is available.".into());
+    match (&native_output_device, &playback_command) {
+        (Ok(device), Some(command)) => {
+            details.push(format!(
+                "Native rodio playback is available through cpal device `{device}`; `{}` remains subprocess fallback only.",
+                command
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("pw-play")
+            ));
+        }
+        (Ok(device), None) => details.push(format!(
+            "Native rodio playback is available through cpal device `{device}`."
+        )),
+        (Err(error), Some(command)) => details.push(format!(
+            "Native cpal playback is unavailable ({error}); `{}` is available as the subprocess fallback.",
+            command
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("pw-play")
+        )),
+        (Err(error), None) => details.push(format!(
+            "No native audio output is available: {error}. Configure a cpal output device or install pw-play."
+        )),
     }
     if wants_moonshine && !moonshine_ready {
         details
@@ -211,7 +235,7 @@ pub fn discover_native_voice(
     NativeVoiceStatus {
         stt_ready,
         tts_ready,
-        playback_ready: playback_command.is_some(),
+        playback_ready: native_output_device.is_ok() || playback_command.is_some(),
         configured_stt_backend: stt_backend.to_owned(),
         configured_tts_backend: tts_backend.to_owned(),
         active_stt_backend,
@@ -605,7 +629,7 @@ printf RIFF > "$output"
         )
         .expect("write Moonshine marker");
 
-        let status = discover_native_voice(&root, "moonshine", "qwen3-tts", "", "", "", "");
+        let status = discover_native_voice(&root, "moonshine", "qwen3-tts", "", "", "", "", "");
         assert!(status.moonshine_ready);
         assert!(status.smart_turn_ready);
         assert!(status.qwen_ready);
@@ -615,6 +639,32 @@ printf RIFF > "$output"
         fs::remove_dir_all(root).expect("remove neural fixture");
     }
 
+    #[test]
+    fn configured_output_status_uses_cpal_first_and_command_only_as_fallback() {
+        let root = std::env::temp_dir().join(request_stem("output-status-test"));
+        fs::create_dir_all(&root).expect("status fixture directory");
+        let missing_device = "personal-agent-test-device-that-does-not-exist";
+        let status = discover_native_voice(
+            &root,
+            "whisper.cpp",
+            "piper",
+            "",
+            "",
+            "",
+            "",
+            missing_device,
+        );
+        assert_eq!(status.playback_ready, status.playback_command.is_some());
+        assert!(status.details.iter().any(|detail| {
+            detail.contains("Native cpal playback is unavailable")
+                || detail.contains("No native audio output is available")
+        }));
+        assert!(!status.details.iter().any(|detail| {
+            detail.contains("Native rodio playback is available") && detail.contains(missing_device)
+        }));
+        fs::remove_dir_all(root).expect("remove status fixture");
+    }
+
     #[tokio::test]
     #[ignore = "requires installed Whisper and Piper assets"]
     async fn installed_voice_assets_round_trip_speech() {
@@ -622,7 +672,7 @@ printf RIFF > "$output"
             std::env::var("PERSONAL_AGENT_VOICE_SMOKE_ROOT")
                 .expect("set PERSONAL_AGENT_VOICE_SMOKE_ROOT"),
         );
-        let status = discover_native_voice(&root, "whisper.cpp", "piper", "", "", "", "");
+        let status = discover_native_voice(&root, "whisper.cpp", "piper", "", "", "", "", "");
         let working = root.join("runtime-smoke");
         let wav = synthesize_piper(
             status

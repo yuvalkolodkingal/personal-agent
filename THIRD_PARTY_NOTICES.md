@@ -8,9 +8,12 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `alloc-no-stdlib 2.0.4` — BSD-3-Clause — `pkg:cargo/alloc-no-stdlib@2.0.4`
 - `alloc-stdlib 0.2.4` — BSD-3-Clause — `pkg:cargo/alloc-stdlib@0.2.4`
 - `allocator-api2 0.2.21` — MIT OR Apache-2.0 — `pkg:cargo/allocator-api2@0.2.21`
+- `alsa-sys 0.3.1` — MIT — `pkg:cargo/alsa-sys@0.3.1`
+- `alsa 0.9.1` — Apache-2.0/MIT — `pkg:cargo/alsa@0.9.1`
 - `android_system_properties 0.1.6` — MIT OR Apache-2.0 — `pkg:cargo/android_system_properties@0.1.6`
 - `anyhow 1.0.104` — MIT OR Apache-2.0 — `pkg:cargo/anyhow@1.0.104`
 - `apple-native-keyring-store 1.0.2` — MIT OR Apache-2.0 — `pkg:cargo/apple-native-keyring-store@1.0.2`
+- `arrayvec 0.7.8` — MIT OR Apache-2.0 — `pkg:cargo/arrayvec@0.7.8`
 - `async-broadcast 0.7.2` — MIT OR Apache-2.0 — `pkg:cargo/async-broadcast@0.7.2`
 - `async-channel 2.5.0` — Apache-2.0 OR MIT — `pkg:cargo/async-channel@2.5.0`
 - `async-executor 1.14.0` — Apache-2.0 OR MIT — `pkg:cargo/async-executor@1.14.0`
@@ -70,6 +73,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `core-foundation 0.10.1` — MIT OR Apache-2.0 — `pkg:cargo/core-foundation@0.10.1`
 - `core-graphics-types 0.2.0` — MIT OR Apache-2.0 — `pkg:cargo/core-graphics-types@0.2.0`
 - `core-graphics 0.25.0` — MIT OR Apache-2.0 — `pkg:cargo/core-graphics@0.25.0`
+- `coreaudio-rs 0.13.0` — MIT/Apache-2.0 — `pkg:cargo/coreaudio-rs@0.13.0`
+- `cpal 0.16.0` — Apache-2.0 — `pkg:cargo/cpal@0.16.0`
 - `cpufeatures 0.2.17` — MIT OR Apache-2.0 — `pkg:cargo/cpufeatures@0.2.17`
 - `cpufeatures 0.3.0` — MIT OR Apache-2.0 — `pkg:cargo/cpufeatures@0.3.0`
 - `crc32fast 1.5.1` — MIT OR Apache-2.0 — `pkg:cargo/crc32fast@1.5.1`
@@ -87,6 +92,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `darling_core 0.23.0` — MIT — `pkg:cargo/darling_core@0.23.0`
 - `darling_macro 0.23.0` — MIT — `pkg:cargo/darling_macro@0.23.0`
 - `dashmap 6.1.0` — MIT — `pkg:cargo/dashmap@6.1.0`
+- `dasp_sample 0.11.0` — MIT OR Apache-2.0 — `pkg:cargo/dasp_sample@0.11.0`
 - `data-encoding 2.11.1` — MIT — `pkg:cargo/data-encoding@2.11.1`
 - `dbus 0.9.12` — Apache-2.0/MIT — `pkg:cargo/dbus@0.9.12`
 - `defmt-macros 1.1.1` — MIT OR Apache-2.0 — `pkg:cargo/defmt-macros@1.1.1`
@@ -119,6 +125,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `either 1.18.0` — MIT OR Apache-2.0 — `pkg:cargo/either@1.18.0`
 - `embed-resource 3.0.11` — MIT — `pkg:cargo/embed-resource@3.0.11`
 - `embed_plist 1.2.2` — MIT OR Apache-2.0 — `pkg:cargo/embed_plist@1.2.2`
+- `encoding_rs 0.8.35` — (Apache-2.0 OR MIT) AND BSD-3-Clause — `pkg:cargo/encoding_rs@0.8.35`
 - `endi 1.1.1` — MIT — `pkg:cargo/endi@1.1.1`
 - `enumflags2 0.7.12` — MIT OR Apache-2.0 — `pkg:cargo/enumflags2@0.7.12`
 - `enumflags2_derive 0.7.12` — MIT OR Apache-2.0 — `pkg:cargo/enumflags2_derive@0.7.12`
@@ -127,6 +134,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `errno 0.3.14` — MIT OR Apache-2.0 — `pkg:cargo/errno@0.3.14`
 - `event-listener-strategy 0.5.4` — Apache-2.0 OR MIT — `pkg:cargo/event-listener-strategy@0.5.4`
 - `event-listener 5.4.2` — Apache-2.0 OR MIT — `pkg:cargo/event-listener@5.4.2`
+- `extended 0.1.0` — MIT — `pkg:cargo/extended@0.1.0`
 - `fallible-iterator 0.3.0` — MIT/Apache-2.0 — `pkg:cargo/fallible-iterator@0.3.0`
 - `fallible-streaming-iterator 0.1.9` — MIT/Apache-2.0 — `pkg:cargo/fallible-streaming-iterator@0.1.9`
 - `fastrand 2.5.0` — Apache-2.0 OR MIT — `pkg:cargo/fastrand@2.5.0`
@@ -245,6 +253,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `lock_api 0.4.14` — MIT OR Apache-2.0 — `pkg:cargo/lock_api@0.4.14`
 - `log 0.4.34` — MIT OR Apache-2.0 — `pkg:cargo/log@0.4.34`
 - `mac-notification-sys 0.6.15` — MIT/Apache-2.0 — `pkg:cargo/mac-notification-sys@0.6.15`
+- `mach2 0.4.3` — BSD-2-Clause OR MIT OR Apache-2.0 — `pkg:cargo/mach2@0.4.3`
 - `markup5ever 0.38.0` — MIT OR Apache-2.0 — `pkg:cargo/markup5ever@0.38.0`
 - `memchr 2.8.3` — Unlicense OR MIT — `pkg:cargo/memchr@2.8.3`
 - `memoffset 0.9.1` — MIT — `pkg:cargo/memoffset@0.9.1`
@@ -254,6 +263,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `moxcms 0.7.11` — BSD-3-Clause OR Apache-2.0 — `pkg:cargo/moxcms@0.7.11`
 - `muda 0.19.3` — Apache-2.0 OR MIT — `pkg:cargo/muda@0.19.3`
 - `multimap 0.10.1` — MIT OR Apache-2.0 — `pkg:cargo/multimap@0.10.1`
+- `ndk-context 0.1.1` — MIT OR Apache-2.0 — `pkg:cargo/ndk-context@0.1.1`
 - `ndk-sys 0.6.0+11769913` — MIT OR Apache-2.0 — `pkg:cargo/ndk-sys@0.6.0+11769913`
 - `ndk 0.9.0` — MIT OR Apache-2.0 — `pkg:cargo/ndk@0.9.0`
 - `new_debug_unreachable 1.0.6` — MIT — `pkg:cargo/new_debug_unreachable@1.0.6`
@@ -262,6 +272,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `num-bigint 0.4.8` — MIT OR Apache-2.0 — `pkg:cargo/num-bigint@0.4.8`
 - `num-complex 0.4.6` — MIT OR Apache-2.0 — `pkg:cargo/num-complex@0.4.6`
 - `num-conv 0.2.2` — MIT OR Apache-2.0 — `pkg:cargo/num-conv@0.2.2`
+- `num-derive 0.4.2` — MIT OR Apache-2.0 — `pkg:cargo/num-derive@0.4.2`
 - `num-integer 0.1.47` — MIT OR Apache-2.0 — `pkg:cargo/num-integer@0.1.47`
 - `num-iter 0.1.46` — MIT OR Apache-2.0 — `pkg:cargo/num-iter@0.1.46`
 - `num-rational 0.4.2` — MIT OR Apache-2.0 — `pkg:cargo/num-rational@0.4.2`
@@ -270,7 +281,10 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `num_enum 0.7.6` — BSD-3-Clause OR MIT OR Apache-2.0 — `pkg:cargo/num_enum@0.7.6`
 - `num_enum_derive 0.7.6` — BSD-3-Clause OR MIT OR Apache-2.0 — `pkg:cargo/num_enum_derive@0.7.6`
 - `objc2-app-kit 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-app-kit@0.3.2`
+- `objc2-audio-toolbox 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-audio-toolbox@0.3.2`
 - `objc2-cloud-kit 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-cloud-kit@0.3.2`
+- `objc2-core-audio-types 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-core-audio-types@0.3.2`
+- `objc2-core-audio 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-core-audio@0.3.2`
 - `objc2-core-data 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-core-data@0.3.2`
 - `objc2-core-foundation 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-core-foundation@0.3.2`
 - `objc2-core-graphics 0.3.2` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/objc2-core-graphics@0.3.2`
@@ -364,6 +378,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `regex 1.13.1` — MIT OR Apache-2.0 — `pkg:cargo/regex@1.13.1`
 - `regress 0.11.1` — MIT OR Apache-2.0 — `pkg:cargo/regress@0.11.1`
 - `reqwest 0.13.4` — MIT OR Apache-2.0 — `pkg:cargo/reqwest@0.13.4`
+- `rodio 0.21.1` — MIT OR Apache-2.0 — `pkg:cargo/rodio@0.21.1`
 - `rusqlite 0.40.2` — MIT — `pkg:cargo/rusqlite@0.40.2`
 - `rustc-hash 2.1.3` — Apache-2.0 OR MIT — `pkg:cargo/rustc-hash@2.1.3`
 - `rustc_version 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/rustc_version@0.4.1`
@@ -422,6 +437,11 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `subtle 2.6.1` — BSD-3-Clause — `pkg:cargo/subtle@2.6.1`
 - `swift-rs 1.0.8` — MIT OR Apache-2.0 — `pkg:cargo/swift-rs@1.0.8`
 - `symlink 0.1.0` — MIT/Apache-2.0 — `pkg:cargo/symlink@0.1.0`
+- `symphonia-codec-pcm 0.5.5` — MPL-2.0 — `pkg:cargo/symphonia-codec-pcm@0.5.5`
+- `symphonia-core 0.5.5` — MPL-2.0 — `pkg:cargo/symphonia-core@0.5.5`
+- `symphonia-format-riff 0.5.5` — MPL-2.0 — `pkg:cargo/symphonia-format-riff@0.5.5`
+- `symphonia-metadata 0.5.5` — MPL-2.0 — `pkg:cargo/symphonia-metadata@0.5.5`
+- `symphonia 0.5.5` — MPL-2.0 — `pkg:cargo/symphonia@0.5.5`
 - `syn 1.0.109` — MIT OR Apache-2.0 — `pkg:cargo/syn@1.0.109`
 - `syn 2.0.119` — MIT OR Apache-2.0 — `pkg:cargo/syn@2.0.119`
 - `syn 3.0.4` — MIT OR Apache-2.0 — `pkg:cargo/syn@3.0.4`
@@ -534,6 +554,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `winapi 0.3.9` — MIT/Apache-2.0 — `pkg:cargo/winapi@0.3.9`
 - `window-vibrancy 0.6.0` — Apache-2.0 OR MIT — `pkg:cargo/window-vibrancy@0.6.0`
 - `windows-collections 0.2.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-collections@0.2.0`
+- `windows-core 0.54.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.54.0`
 - `windows-core 0.61.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.61.2`
 - `windows-core 0.62.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.62.2`
 - `windows-future 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-future@0.2.1`
@@ -543,6 +564,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `windows-link 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-link@0.2.1`
 - `windows-native-keyring-store 1.1.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-native-keyring-store@1.1.0`
 - `windows-numerics 0.2.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-numerics@0.2.0`
+- `windows-result 0.1.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.1.2`
 - `windows-result 0.3.4` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.3.4`
 - `windows-result 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.4.1`
 - `windows-strings 0.4.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-strings@0.4.2`
@@ -556,6 +578,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `windows-targets 0.53.5` — MIT OR Apache-2.0 — `pkg:cargo/windows-targets@0.53.5`
 - `windows-threading 0.1.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-threading@0.1.0`
 - `windows-version 0.1.7` — MIT OR Apache-2.0 — `pkg:cargo/windows-version@0.1.7`
+- `windows 0.54.0` — MIT OR Apache-2.0 — `pkg:cargo/windows@0.54.0`
 - `windows 0.61.3` — MIT OR Apache-2.0 — `pkg:cargo/windows@0.61.3`
 - `windows_aarch64_gnullvm 0.42.2` — MIT OR Apache-2.0 — `pkg:cargo/windows_aarch64_gnullvm@0.42.2`
 - `windows_aarch64_gnullvm 0.52.6` — MIT OR Apache-2.0 — `pkg:cargo/windows_aarch64_gnullvm@0.52.6`

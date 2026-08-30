@@ -17,6 +17,7 @@ LIMITS_US = {
     "startup_native_setup": 800_000,
     "bootstrap_ipc": 250_000,
     "desktop_snapshot_warm": 150_000,
+    "tts_first_audio_ms": 700_000,
 }
 
 

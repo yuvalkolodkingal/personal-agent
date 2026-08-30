@@ -55,6 +55,7 @@ struct DesktopState {
     active_session: tokio::sync::Mutex<Option<ActiveSession>>,
     pending_memory_sessions: tokio::sync::Mutex<BTreeSet<String>>,
     voice_playback: tokio::sync::Mutex<Option<VoicePlayback>>,
+    voice_capture_active: AtomicBool,
     voice_runtime: tokio::sync::Mutex<Option<personal_agent_audio::NeuralVoiceRuntime>>,
     voice_runtime_script: PathBuf,
     voice_runtime_pid: AtomicU32,
@@ -102,8 +103,9 @@ struct ActiveSession {
 
 struct VoicePlayback {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    native: Option<personal_agent_audio::NativePlaybackControl>,
     stopped: tokio::sync::oneshot::Receiver<()>,
-    wav: PathBuf,
+    wav: Option<PathBuf>,
     generation: u64,
 }
 
@@ -721,6 +723,7 @@ fn main() {
                         active_session: tokio::sync::Mutex::new(None),
                         pending_memory_sessions: tokio::sync::Mutex::new(BTreeSet::new()),
                         voice_playback: tokio::sync::Mutex::new(None),
+                        voice_capture_active: AtomicBool::new(false),
                         voice_runtime: tokio::sync::Mutex::new(None),
                         voice_runtime_script,
                         voice_runtime_pid: AtomicU32::new(0),

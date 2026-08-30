@@ -1,8 +1,9 @@
 use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime, perf};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
-    AudioError, NativeVoiceStatus, NeuralVoiceRuntime, discover_native_voice, play_wav,
-    synthesize_piper, transcribe_pcm, transcribe_wav, write_pcm_wav,
+    AudioError, NativePlaybackControl, NativePlaybackSink, NativeVoiceStatus, NeuralVoiceRuntime,
+    PlaybackEnd, discover_native_voice, play_wav, synthesize_piper, transcribe_pcm, transcribe_wav,
+    write_pcm_wav,
 };
 use personal_agent_core::{
     FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust, PersonalAgentConfig,
@@ -29,6 +30,7 @@ const E5_SMALL_INT8_DIMENSIONS: usize = 384;
 const VOICE_STREAM_SAMPLE_RATE_HZ: usize = 16_000;
 const VOICE_STREAM_MAX_SAMPLES: usize = VOICE_STREAM_SAMPLE_RATE_HZ * 2;
 const TTS_STREAM_MAX_REASSEMBLED_SAMPLES: usize = 24_000 * 180;
+const QWEN_TTS_SAMPLE_RATE_HZ: u32 = 24_000;
 
 fn decode_pcm16le_frame(frame: &[u8]) -> Result<Vec<f32>, String> {
     if frame.is_empty() || !frame.len().is_multiple_of(2) {
@@ -393,6 +395,7 @@ fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> Nativ
         &config.voice.stt_model_path,
         &config.voice.tts_executable,
         &config.voice.tts_model_path,
+        &config.voice.output_device,
     )
 }
 
@@ -436,12 +439,16 @@ async fn neural_voice_request(
     result.map_err(|error| error.to_string())
 }
 
-async fn neural_voice_tts_stream(
+async fn neural_voice_tts_stream<F>(
     state: &DesktopState,
     payload: Value,
     generation: u64,
     timeout: Duration,
-) -> Result<(Value, Vec<i16>), String> {
+    mut on_frame: F,
+) -> Result<Value, String>
+where
+    F: FnMut(&[i16]) -> Result<(), AudioError> + Send,
+{
     let config = config_snapshot(state)?;
     let status = voice_status_for(state, &config);
     let python = status
@@ -462,7 +469,6 @@ async fn neural_voice_tts_stream(
         *runtime = Some(worker);
     }
 
-    let mut samples = Vec::new();
     let result = runtime
         .as_mut()
         .expect("voice runtime was initialized")
@@ -472,15 +478,7 @@ async fn neural_voice_tts_stream(
             generation,
             timeout,
             || state.voice_generation.load(Ordering::SeqCst) == generation,
-            |frame| {
-                if samples.len().saturating_add(frame.len()) > TTS_STREAM_MAX_REASSEMBLED_SAMPLES {
-                    return Err(AudioError::Processing(
-                        "streamed speech exceeds the three-minute compatibility limit".into(),
-                    ));
-                }
-                samples.extend_from_slice(frame);
-                Ok(())
-            },
+            |frame| on_frame(frame),
         )
         .await;
     if result.is_err() {
@@ -490,9 +488,7 @@ async fn neural_voice_tts_stream(
         *runtime = None;
         state.voice_runtime_pid.store(0, Ordering::SeqCst);
     }
-    result
-        .map(|result| (result, samples))
-        .map_err(|error| error.to_string())
+    result.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1884,11 +1880,17 @@ pub(crate) fn voice_status(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned IPC arguments.
-pub(crate) fn microphone_state(
+pub(crate) async fn microphone_state(
     active: bool,
     mode: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
+    state.voice_capture_active.store(active, Ordering::SeqCst);
+    if let Some(playback) = state.voice_playback.lock().await.as_ref()
+        && let Some(native) = playback.native.as_ref()
+    {
+        native.set_capturing(active);
+    }
     let event = personal_agent_contracts::proto::EventEnvelope::new(
         1,
         "audio-capture",
@@ -2103,6 +2105,80 @@ fn endpoint_fallback_decision(active_stt_backend: &str, smart_turn_ready: bool) 
     (active_stt_backend != "moonshine" || !smart_turn_ready).then(silence_fallback_decision)
 }
 
+async fn register_native_playback(
+    state: &DesktopState,
+    app: &tauri::AppHandle,
+    generation: u64,
+    control: NativePlaybackControl,
+    completion: oneshot::Receiver<PlaybackEnd>,
+) {
+    control.set_capturing(state.voice_capture_active.load(Ordering::SeqCst));
+    let (stopped, stopped_receiver) = oneshot::channel();
+    *state.voice_playback.lock().await = Some(VoicePlayback {
+        cancel: None,
+        native: Some(control),
+        stopped: stopped_receiver,
+        wav: None,
+        generation,
+    });
+    let monitor_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = completion.await.unwrap_or(PlaybackEnd::Stopped);
+        let monitor_state = monitor_app.state::<DesktopState>();
+        let completed = {
+            let mut playback = monitor_state.voice_playback.lock().await;
+            if playback
+                .as_ref()
+                .is_some_and(|item| item.generation == generation)
+            {
+                playback.take()
+            } else {
+                None
+            }
+        };
+        if let Some(playback) = completed {
+            if let Some(wav) = playback.wav {
+                let _ = std::fs::remove_file(wav);
+            }
+            if outcome == PlaybackEnd::Completed
+                && monitor_state.voice_generation.load(Ordering::SeqCst) == generation
+            {
+                let _ = monitor_app.emit(
+                    "voice-state",
+                    json!({"state": "idle", "generation": generation}),
+                );
+            }
+        }
+        let _ = stopped.send(());
+    });
+}
+
+async fn discard_playback_generation(state: &DesktopState, generation: u64) {
+    let playback = {
+        let mut playback = state.voice_playback.lock().await;
+        if playback
+            .as_ref()
+            .is_some_and(|item| item.generation == generation)
+        {
+            playback.take()
+        } else {
+            None
+        }
+    };
+    if let Some(mut playback) = playback {
+        if let Some(native) = playback.native.take() {
+            let _ = native.stop();
+        }
+        if let Some(cancel) = playback.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut playback.stopped).await;
+        if let Some(wav) = playback.wav {
+            let _ = std::fs::remove_file(wav);
+        }
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_lines)] // Voice backend fallback and playback cleanup form one lifecycle transaction.
 pub(crate) async fn voice_speak(
@@ -2123,134 +2199,265 @@ pub(crate) async fn voice_speak(
         return Ok(json!({"spoken": false, "reason": "quiet mode"}));
     }
     let status = voice_status_for(&state, &config);
-    let player = status
-        .playback_command
-        .ok_or_else(|| status.details.join(" "))?;
     let mut engine = "piper";
-    let wav =
-        if status.active_tts_backend == "qwen3-tts" {
-            let output = state
-                .app_data
-                .join("voice/runtime")
-                .join(format!("tts-qwen-{}.wav", uuid::Uuid::new_v4()));
-            let _ = app.emit(
-                "voice-state",
-                json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
-            );
-            let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
-                && !config
-                    .voice
-                    .tts_model
-                    .to_ascii_lowercase()
-                    .contains("customvoice")
-            {
-                "base"
-            } else {
-                "custom"
-            };
-            state.voice_synthesis_active.store(true, Ordering::SeqCst);
-            let neural = neural_voice_tts_stream(
-                &state,
-                json!({
-                    "text": &text,
-                    "voice": &config.voice.tts_voice,
-                    "model_kind": model_kind,
-                    "reference_audio": &config.voice.tts_reference_audio,
-                    "reference_text": &config.voice.tts_reference_text,
-                }),
-                generation,
-                Duration::from_secs(180),
-            )
-            .await;
-            state.voice_synthesis_active.store(false, Ordering::SeqCst);
-            match neural {
-                Ok((value, samples)) => {
-                    if value.get("cancelled").and_then(Value::as_bool) == Some(true)
-                        || state.voice_generation.load(Ordering::SeqCst) != generation
-                    {
-                        return Ok(json!({"spoken": false, "reason": "interrupted"}));
-                    }
-                    let sample_rate_hz = value
-                        .get("sample_rate_hz")
-                        .and_then(Value::as_u64)
-                        .and_then(|rate| u32::try_from(rate).ok())
-                        .ok_or_else(|| "Qwen3-TTS stream returned no sample rate".to_owned())?;
-                    let normalized = samples
-                        .into_iter()
-                        .map(|sample| f32::from(sample) / f32::from(i16::MAX))
-                        .collect::<Vec<_>>();
-                    write_pcm_wav(&output, &normalized, sample_rate_hz)
-                        .map_err(|error| error.to_string())?;
-                    engine = "qwen3-tts";
-                    output
-                }
-                Err(error) => {
-                    if state.voice_generation.load(Ordering::SeqCst) != generation {
-                        let _ = std::fs::remove_file(&output);
-                        return Ok(json!({"spoken": false, "reason": "interrupted"}));
-                    }
-                    tracing::warn!(%error, "Qwen3-TTS failed; using private Piper fallback");
-                    let _ = app.emit(
-                        "voice-state",
-                        json!({"state": "recovering", "detail": error, "fallback": "piper"}),
-                    );
-                    let executable = status.piper_executable.as_ref().ok_or_else(|| {
-                        format!("Qwen3-TTS failed and Piper is unavailable: {error}")
-                    })?;
-                    let model = status.piper_model.as_ref().ok_or_else(|| {
-                        format!("Qwen3-TTS failed and Piper is unavailable: {error}")
-                    })?;
-                    synthesize_piper(
-                        executable,
-                        model,
-                        Some(&model.with_extension("onnx.json")),
-                        &state.app_data.join("voice/runtime"),
-                        &text,
-                        config.voice.speech_rate_percent,
-                    )
-                    .await
-                    .map_err(|fallback| {
-                        format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
-                    })?
-                }
+    let wav;
+    let mut native_unavailable = None;
+    if status.active_tts_backend == "qwen3-tts" {
+        let native = NativePlaybackSink::open(
+            &config.voice.output_device,
+            config.voice.volume_percent,
+            config.voice.ducking_percent,
+            state.voice_capture_active.load(Ordering::SeqCst),
+        );
+        let (mut native_sink, native_control) = match native {
+            Ok((sink, control, completion)) => {
+                register_native_playback(&state, &app, generation, control.clone(), completion)
+                    .await;
+                (Some(sink), Some(control))
             }
-        } else {
-            let executable = status
-                .piper_executable
-                .as_ref()
-                .ok_or_else(|| status.details.join(" "))?;
-            let model = status
-                .piper_model
-                .as_ref()
-                .ok_or_else(|| status.details.join(" "))?;
-            synthesize_piper(
-                executable,
-                model,
-                Some(&model.with_extension("onnx.json")),
-                &state.app_data.join("voice/runtime"),
-                &text,
-                config.voice.speech_rate_percent,
-            )
-            .await
-            .map_err(|error| error.to_string())?
+            Err(error) => {
+                tracing::warn!(%error, "cpal output unavailable; using subprocess playback fallback");
+                native_unavailable = Some(error.to_string());
+                (None, None)
+            }
         };
+        let output = state
+            .app_data
+            .join("voice/runtime")
+            .join(format!("tts-qwen-{}.wav", uuid::Uuid::new_v4()));
+        let _ = app.emit(
+            "voice-state",
+            json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+        );
+        let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
+            && !config
+                .voice
+                .tts_model
+                .to_ascii_lowercase()
+                .contains("customvoice")
+        {
+            "base"
+        } else {
+            "custom"
+        };
+        state.voice_synthesis_active.store(true, Ordering::SeqCst);
+        let mut samples = Vec::new();
+        let mut sample_count = 0_usize;
+        let mut speaking_emitted = false;
+        let stream_app = app.clone();
+        let stream_control = native_control.clone();
+        let neural = neural_voice_tts_stream(
+            &state,
+            json!({
+                "text": &text,
+                "voice": &config.voice.tts_voice,
+                "model_kind": model_kind,
+                "reference_audio": &config.voice.tts_reference_audio,
+                "reference_text": &config.voice.tts_reference_text,
+            }),
+            generation,
+            Duration::from_secs(180),
+            |frame| {
+                sample_count = sample_count.saturating_add(frame.len());
+                if sample_count > TTS_STREAM_MAX_REASSEMBLED_SAMPLES {
+                    return Err(AudioError::Processing(
+                        "streamed speech exceeds the three-minute compatibility limit".into(),
+                    ));
+                }
+                if let Some(control) = stream_control.as_ref() {
+                    control.append_pcm(frame, QWEN_TTS_SAMPLE_RATE_HZ, 1)?;
+                    if !speaking_emitted {
+                        let _ = stream_app.emit(
+                            "voice-state",
+                            json!({"state": "speaking", "engine": "qwen3-tts", "generation": generation}),
+                        );
+                        speaking_emitted = true;
+                    }
+                } else {
+                    samples.extend_from_slice(frame);
+                }
+                Ok(())
+            },
+        )
+        .await;
+        state.voice_synthesis_active.store(false, Ordering::SeqCst);
+        match neural {
+            Ok(value) => {
+                if value.get("cancelled").and_then(Value::as_bool) == Some(true)
+                    || state.voice_generation.load(Ordering::SeqCst) != generation
+                {
+                    discard_playback_generation(&state, generation).await;
+                    drop(native_sink.take());
+                    return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                }
+                let Some(sample_rate_hz) = value
+                    .get("sample_rate_hz")
+                    .and_then(Value::as_u64)
+                    .and_then(|rate| u32::try_from(rate).ok())
+                else {
+                    discard_playback_generation(&state, generation).await;
+                    drop(native_sink.take());
+                    return Err("Qwen3-TTS stream returned no sample rate".to_owned());
+                };
+                if sample_rate_hz != QWEN_TTS_SAMPLE_RATE_HZ {
+                    discard_playback_generation(&state, generation).await;
+                    drop(native_sink.take());
+                    return Err(format!(
+                        "Qwen3-TTS stream returned {sample_rate_hz} Hz; expected {QWEN_TTS_SAMPLE_RATE_HZ} Hz"
+                    ));
+                }
+                engine = "qwen3-tts";
+                if let Some(sink) = native_sink.take() {
+                    if let Err(error) = sink.finish() {
+                        discard_playback_generation(&state, generation).await;
+                        return Err(error.to_string());
+                    }
+                    return Ok(json!({
+                        "spoken": true,
+                        "engine": engine,
+                        "generation": generation,
+                        "playback": "rodio",
+                    }));
+                }
+                let normalized = samples
+                    .into_iter()
+                    .map(|sample| f32::from(sample) / 32_768.0)
+                    .collect::<Vec<_>>();
+                write_pcm_wav(&output, &normalized, sample_rate_hz)
+                    .map_err(|error| error.to_string())?;
+                wav = output;
+            }
+            Err(error) => {
+                if state.voice_generation.load(Ordering::SeqCst) != generation {
+                    discard_playback_generation(&state, generation).await;
+                    drop(native_sink.take());
+                    return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                }
+                discard_playback_generation(&state, generation).await;
+                drop(native_sink.take());
+                native_unavailable = None;
+                tracing::warn!(%error, "Qwen3-TTS failed; using private Piper fallback");
+                let _ = app.emit(
+                    "voice-state",
+                    json!({"state": "recovering", "detail": error, "fallback": "piper"}),
+                );
+                let executable = status
+                    .piper_executable
+                    .as_ref()
+                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
+                let model = status
+                    .piper_model
+                    .as_ref()
+                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
+                wav = synthesize_piper(
+                    executable,
+                    model,
+                    Some(&model.with_extension("onnx.json")),
+                    &state.app_data.join("voice/runtime"),
+                    &text,
+                    config.voice.speech_rate_percent,
+                )
+                .await
+                .map_err(|fallback| {
+                    format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
+                })?;
+            }
+        }
+    } else {
+        let executable = status
+            .piper_executable
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        let model = status
+            .piper_model
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        wav = synthesize_piper(
+            executable,
+            model,
+            Some(&model.with_extension("onnx.json")),
+            &state.app_data.join("voice/runtime"),
+            &text,
+            config.voice.speech_rate_percent,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
     if state.voice_generation.load(Ordering::SeqCst) != generation {
         let _ = std::fs::remove_file(&wav);
         return Ok(json!({"spoken": false, "reason": "interrupted"}));
     }
-    let mut child = play_wav(
+
+    if native_unavailable.is_none() {
+        match NativePlaybackSink::open(
+            &config.voice.output_device,
+            config.voice.volume_percent,
+            config.voice.ducking_percent,
+            state.voice_capture_active.load(Ordering::SeqCst),
+        ) {
+            Ok((sink, control, completion)) => {
+                register_native_playback(&state, &app, generation, control, completion).await;
+                {
+                    let mut playback = state.voice_playback.lock().await;
+                    if let Some(playback) = playback
+                        .as_mut()
+                        .filter(|playback| playback.generation == generation)
+                    {
+                        playback.wav = Some(wav.clone());
+                    }
+                }
+                if let Err(error) = sink.append_wav(&wav) {
+                    discard_playback_generation(&state, generation).await;
+                    return Err(error.to_string());
+                }
+                let _ = app.emit(
+                    "voice-state",
+                    json!({"state": "speaking", "engine": engine, "generation": generation}),
+                );
+                if let Err(error) = sink.finish() {
+                    discard_playback_generation(&state, generation).await;
+                    return Err(error.to_string());
+                }
+                return Ok(json!({
+                    "spoken": true,
+                    "engine": engine,
+                    "generation": generation,
+                    "playback": "rodio",
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cpal output unavailable; using subprocess playback fallback");
+                native_unavailable = Some(error.to_string());
+            }
+        }
+    }
+
+    let Some(player) = status.playback_command else {
+        let _ = std::fs::remove_file(&wav);
+        return Err(format!(
+            "{}. No pw-play compatible fallback is installed.",
+            native_unavailable.unwrap_or_else(|| "cpal output is unavailable".to_owned())
+        ));
+    };
+    let mut child = match play_wav(
         &player,
         &wav,
         &config.voice.output_device,
         config.voice.volume_percent,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&wav);
+            return Err(error.to_string());
+        }
+    };
     let (cancel, cancelled) = oneshot::channel();
     let (stopped, stopped_receiver) = oneshot::channel();
     *state.voice_playback.lock().await = Some(VoicePlayback {
         cancel: Some(cancel),
+        native: None,
         stopped: stopped_receiver,
-        wav: wav.clone(),
+        wav: Some(wav.clone()),
         generation,
     });
     let _ = app.emit(
@@ -2282,7 +2489,7 @@ pub(crate) async fn voice_speak(
         }
         let _ = stopped.send(());
     });
-    Ok(json!({"spoken": true, "engine": engine, "generation": generation}))
+    Ok(json!({"spoken": true, "engine": engine, "generation": generation, "playback": "pw-play"}))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2415,6 +2622,23 @@ async fn voice_stop_inner(
     interrupt_synthesis: bool,
 ) {
     state.voice_generation.fetch_add(1, Ordering::SeqCst);
+    let playback = { state.voice_playback.lock().await.take() };
+    let mut playback = playback;
+    if let Some(native) = playback
+        .as_mut()
+        .and_then(|playback| playback.native.take())
+    {
+        let latency = native.stop();
+        if latency >= Duration::from_millis(50) {
+            tracing::warn!(?latency, "native voice sink stop exceeded the 50 ms target");
+        }
+    }
+    if let Some(cancel) = playback
+        .as_mut()
+        .and_then(|playback| playback.cancel.take())
+    {
+        let _ = cancel.send(());
+    }
     if interrupt_synthesis && state.voice_synthesis_active.swap(false, Ordering::SeqCst) {
         let process_id = state.voice_runtime_pid.swap(0, Ordering::SeqCst);
         if process_id != 0 {
@@ -2427,11 +2651,7 @@ async fn voice_stop_inner(
             }
         }
     }
-    let playback = { state.voice_playback.lock().await.take() };
     if let Some(mut playback) = playback {
-        if let Some(cancel) = playback.cancel.take() {
-            let _ = cancel.send(());
-        }
         if tokio::time::timeout(Duration::from_secs(5), &mut playback.stopped)
             .await
             .is_err()
@@ -2441,7 +2661,9 @@ async fn voice_stop_inner(
                 "voice playback task did not stop within the shutdown deadline"
             );
         }
-        let _ = std::fs::remove_file(playback.wav);
+        if let Some(wav) = playback.wav {
+            let _ = std::fs::remove_file(wav);
+        }
     }
     if let Some(app) = app {
         let _ = app.emit("voice-state", json!({"state": "idle", "interrupted": true}));
@@ -2452,11 +2674,16 @@ pub(crate) async fn shutdown_voice_playback(state: &DesktopState) {
     state.voice_generation.fetch_add(1, Ordering::SeqCst);
     let playback = { state.voice_playback.lock().await.take() };
     if let Some(mut playback) = playback {
+        if let Some(native) = playback.native.take() {
+            let _ = native.stop();
+        }
         if let Some(cancel) = playback.cancel.take() {
             let _ = cancel.send(());
         }
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut playback.stopped).await;
-        let _ = std::fs::remove_file(playback.wav);
+        if let Some(wav) = playback.wav {
+            let _ = std::fs::remove_file(wav);
+        }
     }
 }
 

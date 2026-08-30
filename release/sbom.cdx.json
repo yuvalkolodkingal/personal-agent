@@ -77,6 +77,30 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT"
+        }
+      ],
+      "name": "alsa-sys",
+      "purl": "pkg:cargo/alsa-sys@0.3.1",
+      "type": "library",
+      "version": "0.3.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Apache-2.0/MIT"
+        }
+      ],
+      "name": "alsa",
+      "purl": "pkg:cargo/alsa@0.9.1",
+      "type": "library",
+      "version": "0.9.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -108,6 +132,18 @@
       "purl": "pkg:cargo/apple-native-keyring-store@1.0.2",
       "type": "library",
       "version": "1.0.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "arrayvec",
+      "purl": "pkg:cargo/arrayvec@0.7.8",
+      "type": "library",
+      "version": "0.7.8"
     },
     {
       "group": "crates.io",
@@ -821,6 +857,30 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "name": "coreaudio-rs",
+      "purl": "pkg:cargo/coreaudio-rs@0.13.0",
+      "type": "library",
+      "version": "0.13.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "name": "cpal",
+      "purl": "pkg:cargo/cpal@0.16.0",
+      "type": "library",
+      "version": "0.16.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -1020,6 +1080,18 @@
       "purl": "pkg:cargo/dashmap@6.1.0",
       "type": "library",
       "version": "6.1.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "dasp_sample",
+      "purl": "pkg:cargo/dasp_sample@0.11.0",
+      "type": "library",
+      "version": "0.11.0"
     },
     {
       "group": "crates.io",
@@ -1409,6 +1481,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+        }
+      ],
+      "name": "encoding_rs",
+      "purl": "pkg:cargo/encoding_rs@0.8.35",
+      "type": "library",
+      "version": "0.8.35"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT"
         }
       ],
@@ -1500,6 +1584,18 @@
       "purl": "pkg:cargo/event-listener@5.4.2",
       "type": "library",
       "version": "5.4.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "extended",
+      "purl": "pkg:cargo/extended@0.1.0",
+      "type": "library",
+      "version": "0.1.0"
     },
     {
       "group": "crates.io",
@@ -2921,6 +3017,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "BSD-2-Clause OR MIT OR Apache-2.0"
+        }
+      ],
+      "name": "mach2",
+      "purl": "pkg:cargo/mach2@0.4.3",
+      "type": "library",
+      "version": "0.4.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -3032,6 +3140,18 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
+      "name": "ndk-context",
+      "purl": "pkg:cargo/ndk-context@0.1.1",
+      "type": "library",
+      "version": "0.1.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
       "name": "ndk-sys",
       "purl": "pkg:cargo/ndk-sys@0.6.0+11769913",
       "type": "library",
@@ -3120,6 +3240,18 @@
       "purl": "pkg:cargo/num-conv@0.2.2",
       "type": "library",
       "version": "0.2.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "num-derive",
+      "purl": "pkg:cargo/num-derive@0.4.2",
+      "type": "library",
+      "version": "0.4.2"
     },
     {
       "group": "crates.io",
@@ -3224,8 +3356,44 @@
           "expression": "Zlib OR Apache-2.0 OR MIT"
         }
       ],
+      "name": "objc2-audio-toolbox",
+      "purl": "pkg:cargo/objc2-audio-toolbox@0.3.2",
+      "type": "library",
+      "version": "0.3.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
       "name": "objc2-cloud-kit",
       "purl": "pkg:cargo/objc2-cloud-kit@0.3.2",
+      "type": "library",
+      "version": "0.3.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "name": "objc2-core-audio-types",
+      "purl": "pkg:cargo/objc2-core-audio-types@0.3.2",
+      "type": "library",
+      "version": "0.3.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "name": "objc2-core-audio",
+      "purl": "pkg:cargo/objc2-core-audio@0.3.2",
       "type": "library",
       "version": "0.3.2"
     },
@@ -4349,6 +4517,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "rodio",
+      "purl": "pkg:cargo/rodio@0.21.1",
+      "type": "library",
+      "version": "0.21.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT"
         }
       ],
@@ -5040,6 +5220,66 @@
       "purl": "pkg:cargo/symlink@0.1.0",
       "type": "library",
       "version": "0.1.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MPL-2.0"
+        }
+      ],
+      "name": "symphonia-codec-pcm",
+      "purl": "pkg:cargo/symphonia-codec-pcm@0.5.5",
+      "type": "library",
+      "version": "0.5.5"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MPL-2.0"
+        }
+      ],
+      "name": "symphonia-core",
+      "purl": "pkg:cargo/symphonia-core@0.5.5",
+      "type": "library",
+      "version": "0.5.5"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MPL-2.0"
+        }
+      ],
+      "name": "symphonia-format-riff",
+      "purl": "pkg:cargo/symphonia-format-riff@0.5.5",
+      "type": "library",
+      "version": "0.5.5"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MPL-2.0"
+        }
+      ],
+      "name": "symphonia-metadata",
+      "purl": "pkg:cargo/symphonia-metadata@0.5.5",
+      "type": "library",
+      "version": "0.5.5"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MPL-2.0"
+        }
+      ],
+      "name": "symphonia",
+      "purl": "pkg:cargo/symphonia@0.5.5",
+      "type": "library",
+      "version": "0.5.5"
     },
     {
       "group": "crates.io",
@@ -6393,6 +6633,18 @@
         }
       ],
       "name": "windows-core",
+      "purl": "pkg:cargo/windows-core@0.54.0",
+      "type": "library",
+      "version": "0.54.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "windows-core",
       "purl": "pkg:cargo/windows-core@0.61.2",
       "type": "library",
       "version": "0.61.2"
@@ -6492,6 +6744,18 @@
       "purl": "pkg:cargo/windows-numerics@0.2.0",
       "type": "library",
       "version": "0.2.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "windows-result",
+      "purl": "pkg:cargo/windows-result@0.1.2",
+      "type": "library",
+      "version": "0.1.2"
     },
     {
       "group": "crates.io",
@@ -6648,6 +6912,18 @@
       "purl": "pkg:cargo/windows-version@0.1.7",
       "type": "library",
       "version": "0.1.7"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "windows",
+      "purl": "pkg:cargo/windows@0.54.0",
+      "type": "library",
+      "version": "0.54.0"
     },
     {
       "group": "crates.io",
@@ -7550,7 +7826,7 @@
       "version": "0.1.0"
     }
   },
-  "serialNumber": "urn:uuid:fdc5c513-6dfd-5634-a1ec-86b4bcc7fe85",
+  "serialNumber": "urn:uuid:d5e7897b-be74-5e24-9680-34cf034e00e6",
   "specVersion": "1.6",
   "version": 1
 }

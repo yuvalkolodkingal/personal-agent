@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 struct LocalRecognizer;
@@ -131,6 +132,15 @@ fn replay_desktop_snapshot_warm() -> Result<(), serde_json::Error> {
         .count();
     black_box((snapshot, actionable_nodes));
     Ok(())
+}
+
+fn replay_tts_first_audio(frame: &[i16]) -> Result<Duration, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let (producer, sink) = mpsc::sync_channel(1);
+    producer.send(frame.to_vec())?;
+    let first_frame = sink.recv()?;
+    black_box(first_frame.first().copied());
+    Ok(started.elapsed())
 }
 
 fn worker_cpu_ticks(process_id: u32) -> Result<u64, Box<dyn std::error::Error>> {
@@ -483,6 +493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut startup_native_setup = Vec::with_capacity(SAMPLES);
     let mut bootstrap_ipc = Vec::with_capacity(SAMPLES);
     let mut desktop_snapshot_warm = Vec::with_capacity(SAMPLES);
+    let mut tts_first_audio = Vec::with_capacity(SAMPLES);
+    let tts_frame = vec![512_i16; 480];
     for _ in 0..SAMPLES {
         let started = Instant::now();
         black_box(MicrophoneState::Listening);
@@ -515,6 +527,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = Instant::now();
         replay_desktop_snapshot_warm()?;
         desktop_snapshot_warm.push(started.elapsed());
+
+        tts_first_audio.push(replay_tts_first_audio(&tts_frame)?);
     }
     let (ambient_armed_cpu_replay, stt_endpoint_replay) = actual_worker_voice_replays().await?;
     let report = json!({
@@ -526,12 +540,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "startup_native_setup": summarize_latencies(&startup_native_setup)?,
         "bootstrap_ipc": summarize_latencies(&bootstrap_ipc)?,
         "desktop_snapshot_warm": summarize_latencies(&desktop_snapshot_warm)?,
+        "tts_first_audio_ms": summarize_latencies(&tts_first_audio)?,
         "ambient_armed_cpu_replay": ambient_armed_cpu_replay,
         "stt_endpoint_replay": stt_endpoint_replay,
         "replay_scope": {
             "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
             "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
             "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
+            "tts_first_audio_ms": "fake-engine PCM enqueue through a bounded in-memory sink; excludes physical device startup",
             "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required",
             "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set"
         },

@@ -4,6 +4,7 @@ mod arbiter;
 mod dictation;
 mod native;
 mod neural;
+mod sink;
 
 pub use arbiter::{
     AdmissionDenied, AdmissionPlan, DEFAULT_VRAM_CEILING_MIB, LocalModel, ModelArbiter,
@@ -20,6 +21,7 @@ pub use native::{
     transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 pub use neural::NeuralVoiceRuntime;
+pub use sink::{NativePlaybackControl, NativePlaybackSink, PlaybackEnd, native_output_device_name};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
