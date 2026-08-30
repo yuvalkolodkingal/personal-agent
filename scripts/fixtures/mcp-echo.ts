@@ -11,7 +11,6 @@ export {};
  * One implementation is exposed over the three transports the host supports:
  *   --transport=stdio  newline-delimited JSON-RPC on stdin/stdout
  *   --transport=http   MCP Streamable HTTP on POST/GET/DELETE /mcp
- *   --transport=sse    legacy HTTP+SSE: GET /sse plus POST /message
  *
  * The tool list carries every behaviour annotation so the host can be checked
  * for annotation preservation, and the `environment` tool reports the process
@@ -182,49 +181,6 @@ async function handleStreamableHttp(request: Request): Promise<Response> {
   return jsonResponse(body, isInitialize ? `fixture-${Date.now()}` : undefined);
 }
 
-type SseSession = { controller: ReadableStreamDefaultController<Uint8Array> };
-
-const sseSessions = new Map<string, SseSession>();
-const encoder = new TextEncoder();
-
-function sendEvent(session: SseSession, data: unknown, event?: string): void {
-  const prefix = event ? `event: ${event}\n` : "";
-  session.controller.enqueue(encoder.encode(`${prefix}data: ${JSON.stringify(data)}\n\n`));
-}
-
-function openSseStream(sessionId: string): Response {
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      sseSessions.set(sessionId, { controller });
-      controller.enqueue(
-        encoder.encode(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`),
-      );
-    },
-    cancel() {
-      sseSessions.delete(sessionId);
-    },
-  });
-  return new Response(stream, {
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-  });
-}
-
-async function handleLegacySse(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  if (request.method === "GET" && url.pathname === "/sse") {
-    return openSseStream(`fixture-${sseSessions.size}-${Date.now()}`);
-  }
-  if (request.method !== "POST" || url.pathname !== "/message") {
-    return new Response("not found", { status: 404 });
-  }
-  const session = sseSessions.get(url.searchParams.get("sessionId") ?? "");
-  if (!session) return new Response("unknown session", { status: 404 });
-  const message = (await request.json()) as JsonRpcRequest;
-  const response = dispatch(message);
-  if (response) sendEvent(session, response);
-  return new Response(null, { status: 202 });
-}
-
 function serve(handler: (request: Request) => Promise<Response>): void {
   const server = Bun.serve({ port: requestedPort, hostname: "127.0.0.1", fetch: handler });
   // The Rust test reads this line to learn the bound port.
@@ -235,8 +191,6 @@ if (transport === "stdio") {
   await runStdio();
 } else if (transport === "http") {
   serve(handleStreamableHttp);
-} else if (transport === "sse") {
-  serve(handleLegacySse);
 } else {
   throw new Error(`unsupported transport: ${transport}`);
 }

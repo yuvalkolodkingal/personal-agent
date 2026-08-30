@@ -267,30 +267,34 @@ async fn streamable_http_round_trip_uses_the_native_transport() {
 }
 
 #[tokio::test]
-async fn legacy_sse_round_trip_uses_the_native_sse_client() {
-    let fixture = HttpFixture::start("sse");
+async fn legacy_sse_is_refused_with_a_reason_and_a_remediation() {
     let host = host();
     let definition = definition(
         "sse_echo",
         TransportDefinition::LegacySse {
-            endpoint: fixture.url("/sse"),
+            endpoint: "http://127.0.0.1:1/sse".to_owned(),
             headers: Vec::new(),
             oauth: None,
         },
     );
-    let handshake = host
+
+    let error = host
         .connect(&definition)
         .await
-        .expect("the server connects");
-    assert!(handshake.latency_ms > 0);
-    assert_eq!(handshake.catalog.tools.len(), 4);
+        .expect_err("legacy HTTP+SSE is no longer supported");
 
-    let result = host
-        .call_tool(&definition, "echo", json!({"over": "sse"}))
-        .await
-        .expect("the echo tool answers");
-    assert_eq!(echoed(&result), &json!({"over": "sse"}));
-    assert!(host.health(&definition).await.expect("ping answers") > 0);
+    // The refusal must name the transport and the fix, never fail obscurely.
+    assert_eq!(error.code, "transport_unsupported");
+    assert!(
+        error.message.contains("HTTP+SSE"),
+        "the refusal must name the transport: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("Streamable HTTP"),
+        "the refusal must name the remediation: {}",
+        error.message
+    );
 }
 
 #[tokio::test]

@@ -129,27 +129,34 @@ mod tests {
     use std::sync::Arc;
 
     fn tool(annotations: Option<McpToolAnnotations>) -> Tool {
-        Tool {
-            name: "echo".into(),
-            title: None,
-            description: Some("echoes".into()),
-            input_schema: Arc::new(serde_json::Map::new()),
-            output_schema: None,
-            annotations,
-            icons: None,
-            meta: None,
-        }
+        let mut tool = Tool::new("echo", "echoes", Arc::new(serde_json::Map::new()));
+        tool.annotations = annotations;
+        tool
+    }
+
+    /// Build the server-supplied hints the way a server would send them.
+    fn hints(
+        read_only: Option<bool>,
+        destructive: Option<bool>,
+        idempotent: Option<bool>,
+        open_world: Option<bool>,
+    ) -> McpToolAnnotations {
+        let mut annotations = McpToolAnnotations::new();
+        annotations.read_only_hint = read_only;
+        annotations.destructive_hint = destructive;
+        annotations.idempotent_hint = idempotent;
+        annotations.open_world_hint = open_world;
+        annotations
     }
 
     #[test]
     fn server_supplied_hints_survive_translation() {
-        let annotations = tool_annotations(&tool(Some(McpToolAnnotations {
-            title: None,
-            read_only_hint: Some(false),
-            destructive_hint: Some(true),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(true),
-        })));
+        let annotations = tool_annotations(&tool(Some(hints(
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+        ))));
         assert!(!annotations.read_only);
         assert!(annotations.destructive);
         assert!(annotations.idempotent);
@@ -158,13 +165,12 @@ mod tests {
 
     #[test]
     fn read_only_wins_over_a_contradictory_destructive_hint() {
-        let annotations = tool_annotations(&tool(Some(McpToolAnnotations {
-            title: None,
-            read_only_hint: Some(true),
-            destructive_hint: Some(true),
-            idempotent_hint: None,
-            open_world_hint: Some(false),
-        })));
+        let annotations = tool_annotations(&tool(Some(hints(
+            Some(true),
+            Some(true),
+            None,
+            Some(false),
+        ))));
         assert!(annotations.read_only);
         assert!(!annotations.destructive);
         assert!(annotations.idempotent, "a read-only tool is safe to repeat");

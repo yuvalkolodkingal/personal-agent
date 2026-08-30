@@ -450,7 +450,11 @@ Done when: unit test hits cache on second request; ack phrase first-audio < 250 
 ## Workstream E — MCP + connectors + productivity (INT)
 
 Locked decisions: implement a **native MCP host** in Rust with the official `rmcp` SDK (stdio +
-streamable HTTP + legacy SSE), replacing the sidecar-owned MCP runtime (`StaticRuntimeAdapter`).
+streamable HTTP), replacing the sidecar-owned MCP runtime (`StaticRuntimeAdapter`). **Legacy SSE is
+dropped** (amended 2026-08-30): `rmcp` removed its legacy SSE client transport after 0.10.0, and
+HTTP+SSE is deprecated in the MCP specification itself in favour of Streamable HTTP. Keeping it
+would have pinned a networking SDK nine months behind upstream, so the host refuses a `LegacySse`
+definition with an explicit reason and remediation instead.
 Native **OAuth 2.1 + PKCE + dynamic client registration** for remote MCP servers. A **bundled
 signed catalog** verified with the existing ed25519 code in `crates/core/src/release.rs`.
 Connectors gain **Microsoft (Entra) OAuth**; Slack stays token-based (Slack OAuth requires a

@@ -11,7 +11,6 @@ use personal_agent_mcp_manager::{
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{ClientCapabilities, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService, ServiceExt as _};
-use rmcp::transport::sse_client::{SseClientConfig, SseClientTransport};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -56,17 +55,12 @@ fn client_info(config: &HostConfig, definition: &ServerDefinition) -> ClientInfo
         definition.preferred_protocol.as_str().to_owned(),
     ))
     .unwrap_or_default();
-    ClientInfo {
-        protocol_version,
-        capabilities: ClientCapabilities::default(),
-        client_info: Implementation {
-            name: config.client_name.clone(),
-            version: config.client_version.clone(),
-            title: None,
-            icons: None,
-            website_url: None,
-        },
-    }
+    let mut client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new(config.client_name.clone(), config.client_version.clone()),
+    );
+    client_info.protocol_version = protocol_version;
+    client_info
 }
 
 fn header_map(
@@ -171,46 +165,33 @@ async fn serve_streamable_http(
     stateless: bool,
     headers: &[HeaderBinding],
 ) -> Result<RunningService<RoleClient, ClientInfo>, AdapterError> {
-    let transport = StreamableHttpClientTransport::with_client(
-        http_client(secrets, headers)?,
-        StreamableHttpClientTransportConfig {
-            allow_stateless: stateless,
-            ..StreamableHttpClientTransportConfig::with_uri(endpoint)
-        },
-    );
+    let transport = StreamableHttpClientTransport::with_client(http_client(secrets, headers)?, {
+        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint);
+        transport_config.allow_stateless = stateless;
+        transport_config
+    });
     client_info(config, definition)
         .serve(transport)
         .await
         .map_err(|error| initialize_error(log, &error))
 }
 
-async fn serve_legacy_sse(
-    config: &HostConfig,
-    definition: &ServerDefinition,
-    secrets: &dyn SecretResolver,
-    log: &SharedLog,
-    endpoint: &str,
-    headers: &[HeaderBinding],
-) -> Result<RunningService<RoleClient, ClientInfo>, AdapterError> {
-    let transport = SseClientTransport::start_with_client(
-        http_client(secrets, headers)?,
-        SseClientConfig {
-            sse_endpoint: endpoint.into(),
-            ..SseClientConfig::default()
-        },
+/// Refuse the deprecated HTTP+SSE transport with a reason and remediation.
+///
+/// `rmcp` removed its legacy SSE client after 0.10.0, and the MCP specification
+/// itself deprecates HTTP+SSE in favour of Streamable HTTP. Rather than fail
+/// obscurely at connect time, say so and name the fix.
+fn refuse_legacy_sse(log: &SharedLog) -> AdapterError {
+    record(
+        log,
+        LogLevel::Error,
+        "legacy HTTP+SSE is not supported; use the Streamable HTTP endpoint".to_owned(),
+    );
+    adapter_error(
+        "transport_unsupported",
+        "This server is configured for the deprecated HTTP+SSE transport, which is no longer \
+         supported. Point the server at its Streamable HTTP endpoint instead.",
     )
-    .await
-    .map_err(|error| {
-        record(log, LogLevel::Error, format!("sse connect failed: {error}"));
-        adapter_error(
-            "transport_failed",
-            "The MCP server did not open a legacy SSE stream.",
-        )
-    })?;
-    client_info(config, definition)
-        .serve(transport)
-        .await
-        .map_err(|error| initialize_error(log, &error))
 }
 
 /// Opens one transport and completes MCP initialization.
@@ -246,9 +227,7 @@ pub(crate) async fn serve(
             )
             .await
         }
-        TransportDefinition::LegacySse {
-            endpoint, headers, ..
-        } => serve_legacy_sse(config, definition, secrets, log, endpoint, headers).await,
+        TransportDefinition::LegacySse { .. } => Err(refuse_legacy_sse(log)),
     }
 }
 

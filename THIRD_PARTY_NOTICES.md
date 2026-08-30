@@ -33,6 +33,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `aws-lc-sys 0.44.0` — ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) — `pkg:cargo/aws-lc-sys@0.44.0`
 - `base64 0.21.7` — MIT OR Apache-2.0 — `pkg:cargo/base64@0.21.7`
 - `base64 0.22.1` — MIT OR Apache-2.0 — `pkg:cargo/base64@0.22.1`
+- `base64 0.23.1` — MIT OR Apache-2.0 — `pkg:cargo/base64@0.23.1`
 - `base64ct 1.8.3` — Apache-2.0 OR MIT — `pkg:cargo/base64ct@1.8.3`
 - `bit-set 0.8.0` — Apache-2.0 OR MIT — `pkg:cargo/bit-set@0.8.0`
 - `bit-vec 0.8.0` — Apache-2.0 OR MIT — `pkg:cargo/bit-vec@0.8.0`
@@ -65,10 +66,14 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `cfg-if 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/cfg-if@1.0.4`
 - `cfg_aliases 0.2.2` — MIT — `pkg:cargo/cfg_aliases@0.2.2`
 - `chacha20 0.10.2` — MIT OR Apache-2.0 — `pkg:cargo/chacha20@0.10.2`
+- `chromiumoxide_cdp 0.9.1` — MIT OR Apache-2.0 — `pkg:cargo/chromiumoxide_cdp@0.9.1`
+- `chromiumoxide_pdl 0.9.1` — MIT OR Apache-2.0 — `pkg:cargo/chromiumoxide_pdl@0.9.1`
+- `chromiumoxide_types 0.9.1` — MIT OR Apache-2.0 — `pkg:cargo/chromiumoxide_types@0.9.1`
 - `chrono 0.4.45` — MIT OR Apache-2.0 — `pkg:cargo/chrono@0.4.45`
 - `cipher 0.4.4` — MIT OR Apache-2.0 — `pkg:cargo/cipher@0.4.4`
 - `cmake 0.1.58` — MIT OR Apache-2.0 — `pkg:cargo/cmake@0.1.58`
 - `combine 4.6.8` — MIT — `pkg:cargo/combine@4.6.8`
+- `command-fds 0.3.3` — Apache-2.0 — `pkg:cargo/command-fds@0.3.3`
 - `concurrent-queue 2.5.0` — Apache-2.0 OR MIT — `pkg:cargo/concurrent-queue@2.5.0`
 - `const-oid 0.10.2` — Apache-2.0 OR MIT — `pkg:cargo/const-oid@0.10.2`
 - `const-oid 0.9.6` — Apache-2.0 OR MIT — `pkg:cargo/const-oid@0.9.6`
@@ -92,11 +97,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `ctor 0.8.0` — Apache-2.0 OR MIT — `pkg:cargo/ctor@0.8.0`
 - `curve25519-dalek-derive 0.1.1` — MIT/Apache-2.0 — `pkg:cargo/curve25519-dalek-derive@0.1.1`
 - `curve25519-dalek 4.1.3` — BSD-3-Clause — `pkg:cargo/curve25519-dalek@4.1.3`
-- `darling 0.21.3` — MIT — `pkg:cargo/darling@0.21.3`
 - `darling 0.23.0` — MIT — `pkg:cargo/darling@0.23.0`
-- `darling_core 0.21.3` — MIT — `pkg:cargo/darling_core@0.21.3`
 - `darling_core 0.23.0` — MIT — `pkg:cargo/darling_core@0.23.0`
-- `darling_macro 0.21.3` — MIT — `pkg:cargo/darling_macro@0.21.3`
 - `darling_macro 0.23.0` — MIT — `pkg:cargo/darling_macro@0.23.0`
 - `dashmap 6.1.0` — MIT — `pkg:cargo/dashmap@6.1.0`
 - `dasp_sample 0.11.0` — MIT OR Apache-2.0 — `pkg:cargo/dasp_sample@0.11.0`
@@ -281,7 +283,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `ndk-sys 0.6.0+11769913` — MIT OR Apache-2.0 — `pkg:cargo/ndk-sys@0.6.0+11769913`
 - `ndk 0.9.0` — MIT OR Apache-2.0 — `pkg:cargo/ndk@0.9.0`
 - `new_debug_unreachable 1.0.6` — MIT — `pkg:cargo/new_debug_unreachable@1.0.6`
-- `nix 0.30.1` — MIT — `pkg:cargo/nix@0.30.1`
+- `nix 0.31.3` — MIT — `pkg:cargo/nix@0.31.3`
 - `notify-rust 4.18.0` — MIT OR Apache-2.0 — `pkg:cargo/notify-rust@4.18.0`
 - `nu-ansi-term 0.50.3` — MIT — `pkg:cargo/nu-ansi-term@0.50.3`
 - `num-bigint 0.4.8` — MIT OR Apache-2.0 — `pkg:cargo/num-bigint@0.4.8`
@@ -327,7 +329,6 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `parking 2.2.1` — Apache-2.0 OR MIT — `pkg:cargo/parking@2.2.1`
 - `parking_lot 0.12.5` — MIT OR Apache-2.0 — `pkg:cargo/parking_lot@0.12.5`
 - `parking_lot_core 0.9.12` — MIT OR Apache-2.0 — `pkg:cargo/parking_lot_core@0.9.12`
-- `pastey 0.2.3` — MIT OR Apache-2.0 — `pkg:cargo/pastey@0.2.3`
 - `percent-encoding 2.3.2` — MIT OR Apache-2.0 — `pkg:cargo/percent-encoding@2.3.2`
 - `petgraph 0.8.3` — MIT OR Apache-2.0 — `pkg:cargo/petgraph@0.8.3`
 - `phf 0.13.1` — MIT — `pkg:cargo/phf@0.13.1`
@@ -356,7 +357,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `proc-macro-error-attr 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro-error-attr@1.0.4`
 - `proc-macro-error 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro-error@1.0.4`
 - `proc-macro2 1.0.107` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro2@1.0.107`
-- `process-wrap 8.2.1` — Apache-2.0 OR MIT — `pkg:cargo/process-wrap@8.2.1`
+- `process-wrap 9.1.0` — Apache-2.0 OR MIT — `pkg:cargo/process-wrap@9.1.0`
 - `progenitor-client 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-client@0.14.0`
 - `progenitor-impl 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-impl@0.14.0`
 - `progenitor-macro 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-macro@0.14.0`
@@ -401,8 +402,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `regress 0.11.1` — MIT OR Apache-2.0 — `pkg:cargo/regress@0.11.1`
 - `reqwest 0.13.4` — MIT OR Apache-2.0 — `pkg:cargo/reqwest@0.13.4`
 - `ring 0.17.14` — Apache-2.0 AND ISC — `pkg:cargo/ring@0.17.14`
-- `rmcp-macros 0.10.0` — MIT — `pkg:cargo/rmcp-macros@0.10.0`
-- `rmcp 0.10.0` — MIT — `pkg:cargo/rmcp@0.10.0`
+- `rmcp 3.1.4` — Apache-2.0 — `pkg:cargo/rmcp@3.1.4`
 - `rodio 0.21.1` — MIT OR Apache-2.0 — `pkg:cargo/rodio@0.21.1`
 - `rusqlite 0.40.2` — MIT — `pkg:cargo/rusqlite@0.40.2`
 - `rustc-hash 2.1.3` — Apache-2.0 OR MIT — `pkg:cargo/rustc-hash@2.1.3`
@@ -422,7 +422,6 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `schemars 0.9.0` — MIT — `pkg:cargo/schemars@0.9.0`
 - `schemars 1.2.2` — MIT — `pkg:cargo/schemars@1.2.2`
 - `schemars_derive 0.8.22` — MIT — `pkg:cargo/schemars_derive@0.8.22`
-- `schemars_derive 1.2.2` — MIT — `pkg:cargo/schemars_derive@1.2.2`
 - `scopeguard 1.2.0` — MIT OR Apache-2.0 — `pkg:cargo/scopeguard@1.2.0`
 - `secrecy 0.10.3` — Apache-2.0 OR MIT — `pkg:cargo/secrecy@0.10.3`
 - `secret-service 5.1.0` — MIT OR Apache-2.0 — `pkg:cargo/secret-service@5.1.0`
@@ -435,7 +434,6 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `serde_core 1.0.229` — MIT OR Apache-2.0 — `pkg:cargo/serde_core@1.0.229`
 - `serde_derive 1.0.229` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive@1.0.229`
 - `serde_derive_internals 0.29.1` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive_internals@0.29.1`
-- `serde_derive_internals 0.30.0` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive_internals@0.30.0`
 - `serde_json 1.0.151` — MIT OR Apache-2.0 — `pkg:cargo/serde_json@1.0.151`
 - `serde_repr 0.1.21` — MIT OR Apache-2.0 — `pkg:cargo/serde_repr@0.1.21`
 - `serde_spanned 0.6.9` — MIT OR Apache-2.0 — `pkg:cargo/serde_spanned@0.6.9`
@@ -546,6 +544,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `tray-icon 0.24.2` — MIT OR Apache-2.0 — `pkg:cargo/tray-icon@0.24.2`
 - `try-lock 0.2.5` — MIT — `pkg:cargo/try-lock@0.2.5`
 - `tungstenite 0.30.0` — MIT OR Apache-2.0 — `pkg:cargo/tungstenite@0.30.0`
+- `typed-path 0.12.3` — MIT OR Apache-2.0 — `pkg:cargo/typed-path@0.12.3`
 - `typeid 1.0.3` — MIT OR Apache-2.0 — `pkg:cargo/typeid@1.0.3`
 - `typenum 1.20.1` — MIT OR Apache-2.0 — `pkg:cargo/typenum@1.20.1`
 - `typify-impl 0.6.2` — Apache-2.0 — `pkg:cargo/typify-impl@0.6.2`
@@ -596,16 +595,19 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `winapi 0.3.9` — MIT/Apache-2.0 — `pkg:cargo/winapi@0.3.9`
 - `window-vibrancy 0.6.0` — Apache-2.0 OR MIT — `pkg:cargo/window-vibrancy@0.6.0`
 - `windows-collections 0.2.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-collections@0.2.0`
+- `windows-collections 0.3.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-collections@0.3.2`
 - `windows-core 0.54.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.54.0`
 - `windows-core 0.61.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.61.2`
 - `windows-core 0.62.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-core@0.62.2`
 - `windows-future 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-future@0.2.1`
+- `windows-future 0.3.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-future@0.3.2`
 - `windows-implement 0.60.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-implement@0.60.2`
 - `windows-interface 0.59.3` — MIT OR Apache-2.0 — `pkg:cargo/windows-interface@0.59.3`
 - `windows-link 0.1.3` — MIT OR Apache-2.0 — `pkg:cargo/windows-link@0.1.3`
 - `windows-link 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-link@0.2.1`
 - `windows-native-keyring-store 1.1.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-native-keyring-store@1.1.0`
 - `windows-numerics 0.2.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-numerics@0.2.0`
+- `windows-numerics 0.3.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-numerics@0.3.1`
 - `windows-result 0.1.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.1.2`
 - `windows-result 0.3.4` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.3.4`
 - `windows-result 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-result@0.4.1`
@@ -620,9 +622,11 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `windows-targets 0.52.6` — MIT OR Apache-2.0 — `pkg:cargo/windows-targets@0.52.6`
 - `windows-targets 0.53.5` — MIT OR Apache-2.0 — `pkg:cargo/windows-targets@0.53.5`
 - `windows-threading 0.1.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-threading@0.1.0`
+- `windows-threading 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-threading@0.2.1`
 - `windows-version 0.1.7` — MIT OR Apache-2.0 — `pkg:cargo/windows-version@0.1.7`
 - `windows 0.54.0` — MIT OR Apache-2.0 — `pkg:cargo/windows@0.54.0`
 - `windows 0.61.3` — MIT OR Apache-2.0 — `pkg:cargo/windows@0.61.3`
+- `windows 0.62.2` — MIT OR Apache-2.0 — `pkg:cargo/windows@0.62.2`
 - `windows_aarch64_gnullvm 0.42.2` — MIT OR Apache-2.0 — `pkg:cargo/windows_aarch64_gnullvm@0.42.2`
 - `windows_aarch64_gnullvm 0.52.6` — MIT OR Apache-2.0 — `pkg:cargo/windows_aarch64_gnullvm@0.52.6`
 - `windows_aarch64_gnullvm 0.53.1` — MIT OR Apache-2.0 — `pkg:cargo/windows_aarch64_gnullvm@0.53.1`
@@ -675,6 +679,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `zerotrie 0.2.5` — Unicode-3.0 — `pkg:cargo/zerotrie@0.2.5`
 - `zerovec-derive 0.11.6` — Unicode-3.0 — `pkg:cargo/zerovec-derive@0.11.6`
 - `zerovec 0.11.8` — Unicode-3.0 — `pkg:cargo/zerovec@0.11.8`
+- `zip 8.6.0` — MIT — `pkg:cargo/zip@8.6.0`
+- `zlib-rs 0.6.7` — Zlib — `pkg:cargo/zlib-rs@0.6.7`
 - `zmij 1.0.23` — MIT — `pkg:cargo/zmij@1.0.23`
 - `zvariant 5.15.0` — MIT — `pkg:cargo/zvariant@5.15.0`
 - `zvariant_derive 5.15.0` — MIT — `pkg:cargo/zvariant_derive@5.15.0`

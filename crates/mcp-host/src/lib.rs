@@ -26,7 +26,7 @@ use std::time::Instant;
 use personal_agent_mcp_manager::{
     AdapterError, RuntimeAdapter, RuntimeHandshake, ServerDefinition,
 };
-use rmcp::model::{CallToolRequestParam, ClientRequest, PingRequest};
+use rmcp::model::{CallToolRequestParams, ClientRequest, PingRequest};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -371,19 +371,18 @@ impl Task {
     }
 
     async fn call_tool(&self, tool: &str, arguments: Value) -> Result<Value, AdapterError> {
-        let parameters = CallToolRequestParam {
-            name: tool.to_owned().into(),
-            arguments: match arguments {
-                Value::Null => None,
-                Value::Object(map) => Some(map),
-                _ => {
-                    return Err(adapter_error(
-                        "invalid_arguments",
-                        "MCP tool arguments must be a JSON object.",
-                    ));
-                }
-            },
+        let call_arguments = match arguments {
+            Value::Null => None,
+            Value::Object(map) => Some(map),
+            _ => {
+                return Err(adapter_error(
+                    "invalid_arguments",
+                    "MCP tool arguments must be a JSON object.",
+                ));
+            }
         };
+        let mut parameters = CallToolRequestParams::new(tool.to_owned());
+        parameters.arguments = call_arguments;
         let request = self.with_session(|session| {
             let peer = session.client.peer().clone();
             async move { peer.call_tool(parameters).await }
