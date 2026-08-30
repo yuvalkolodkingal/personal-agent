@@ -294,6 +294,49 @@ describe("AudioWorklet capture integration", () => {
     expect(node?.disconnect).toHaveBeenCalled();
   });
 
+  it("coalesces audio-meter state writes to the newest worklet frame per paint", async () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    const requestFrame = vi.fn((callback: FrameRequestCallback) => {
+      nextFrame += 1;
+      frames.set(nextFrame, callback);
+      return nextFrame;
+    });
+    const cancelFrame = vi.fn((frame: number) => frames.delete(frame));
+    vi.stubGlobal("requestAnimationFrame", requestFrame);
+    vi.stubGlobal("cancelAnimationFrame", cancelFrame);
+    const config = voiceConfig();
+    const onTranscript = vi.fn();
+    const onProjection = vi.fn();
+    const hook = renderHook(() =>
+      useVoiceCapture(config, onTranscript, onProjection, undefined, false),
+    );
+
+    await act(async () => hook.result.current.start());
+    const node = MockWorkletNode.instances[0];
+    expect(node).toBeDefined();
+    act(() => {
+      node?.emit(new Float32Array(320).fill(0.025));
+      node?.emit(new Float32Array(320).fill(0.075));
+    });
+
+    expect(requestFrame).toHaveBeenCalledOnce();
+    expect(hook.result.current.level).toBe(0);
+    const [firstFrame, paint] = [...frames.entries()][0] ?? [];
+    expect(firstFrame).toBe(1);
+    act(() => {
+      frames.delete(firstFrame!);
+      paint?.(performance.now());
+    });
+    expect(hook.result.current.level).toBeCloseTo(0.6);
+
+    act(() => node?.emit(new Float32Array(320).fill(0.05)));
+    expect(requestFrame).toHaveBeenCalledTimes(2);
+    const pendingFrame = [...frames.keys()][0];
+    act(() => hook.unmount());
+    expect(cancelFrame).toHaveBeenCalledWith(pendingFrame);
+  });
+
   it("uses the same 16 kHz binary worklet frames for wake capture", async () => {
     const onTranscript = vi.fn();
     const onProjection = vi.fn();

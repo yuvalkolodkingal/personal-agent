@@ -286,8 +286,33 @@ export function useVoiceCapture(
   const wakeSessionActive = useRef(false);
   const wakeGeneration = useRef(0);
   const lastWakeDetectedAt = useRef(0);
+  const latestLevel = useRef(0);
+  const levelFrame = useRef<number | null>(null);
 
   onTranscriptRef.current = onTranscript;
+
+  const publishLevel = useCallback((next: number) => {
+    latestLevel.current = Math.max(0, Math.min(1, next));
+    if (levelFrame.current !== null) return;
+    if (typeof window.requestAnimationFrame !== "function") {
+      setLevel(latestLevel.current);
+      return;
+    }
+    levelFrame.current = window.requestAnimationFrame(() => {
+      levelFrame.current = null;
+      setLevel(latestLevel.current);
+    });
+  }, []);
+
+  const resetLevel = useCallback(() => {
+    latestLevel.current = 0;
+    if (levelFrame.current !== null) {
+      if (typeof window.cancelAnimationFrame === "function")
+        window.cancelAnimationFrame(levelFrame.current);
+      levelFrame.current = null;
+    }
+    setLevel(0);
+  }, []);
 
   const transition = useCallback((next: VoiceCaptureState) => {
     stateRef.current = next;
@@ -327,7 +352,7 @@ export function useVoiceCapture(
         wakeSessionActive.current = false;
         workerStopped = invoke("voice_wake_stop").catch(() => undefined);
       }
-      setLevel(0);
+      resetLevel();
       if (publishPrivacy)
         void invoke<Projection>("microphone_state", {
           active: false,
@@ -339,7 +364,7 @@ export function useVoiceCapture(
         transition("idle");
       await workerStopped;
     },
-    [onProjection, transition],
+    [onProjection, resetLevel, transition],
   );
 
   const activateWake = useCallback(
@@ -430,7 +455,7 @@ export function useVoiceCapture(
             sum += sample * sample;
           }
           const rms = Math.sqrt(sum / data.length);
-          setLevel(Math.min(1, rms * 8));
+          publishLevel(rms * 8);
           const requestGeneration = wakeGeneration.current;
           wakeQueue.current = wakeQueue.current
             .then(async () => {
@@ -544,6 +569,7 @@ export function useVoiceCapture(
     activateWake,
     config.voice,
     onProjection,
+    publishLevel,
     publishPartial,
     stopWakeCapture,
     transition,
@@ -619,7 +645,7 @@ export function useVoiceCapture(
       context.current = null;
       processor.current = null;
       source.current = null;
-      setLevel(0);
+      resetLevel();
       try {
         const projection = await invoke<Projection>("microphone_state", {
           active: false,
@@ -679,6 +705,7 @@ export function useVoiceCapture(
       onProjection,
       onTranscript,
       publishPartial,
+      resetLevel,
       transition,
     ],
   );
@@ -801,7 +828,7 @@ export function useVoiceCapture(
           if (speechStarted.current || passesVoicePreGate(rms)) {
             queueStreamChunk(data, VOICE_SAMPLE_RATE);
           }
-          setLevel(Math.min(1, rms * 8));
+          publishLevel(rms * 8);
         },
       );
       processor.current = node;
@@ -842,7 +869,7 @@ export function useVoiceCapture(
       context.current = null;
       processor.current = null;
       source.current = null;
-      setLevel(0);
+      resetLevel();
       if (stopRequested.current) {
         neuralStreaming.current = false;
         streamFailure.current = "";
@@ -862,10 +889,12 @@ export function useVoiceCapture(
   }, [
     config.voice,
     onProjection,
+    publishLevel,
     publishPartial,
     queueStreamChunk,
     stop,
     stopWakeCapture,
+    resetLevel,
     transition,
   ]);
 

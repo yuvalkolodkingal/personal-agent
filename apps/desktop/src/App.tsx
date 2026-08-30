@@ -1,5 +1,7 @@
 import {
   lazy,
+  memo,
+  Profiler,
   Suspense,
   useCallback,
   useEffect,
@@ -113,10 +115,11 @@ type SlimBootstrap = {
   history: EventEnvelope[];
   voice: VoiceStatus;
 };
-type ChatMessage = {
+export type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
+  revision?: number;
   streaming?: boolean;
   failed?: boolean;
 };
@@ -143,6 +146,8 @@ type VoicePresentation = {
 };
 const DEFAULT_SESSION_LIMIT = 12;
 const SESSION_LIMIT_STEP = 12;
+const TRANSCRIPT_WINDOW_SIZE = 200;
+const ESTIMATED_MESSAGE_HEIGHT_PX = 88;
 
 const voiceStates: Record<
   string,
@@ -562,7 +567,7 @@ function extractMessages(value: unknown): ChatMessage[] {
       )
       .join("");
     return text
-      ? [{ id: String(info.id ?? `history-${index}`), role, text }]
+      ? [{ id: String(info.id ?? `history-${index}`), role, text, revision: 0 }]
       : [];
   });
 }
@@ -604,7 +609,73 @@ function Empty({ title, detail }: { title: string; detail: string }) {
   );
 }
 
-function ChatView({
+type MessageRowProps = {
+  message: ChatMessage;
+  personaName: string;
+  ttsReady: boolean;
+  streamStatus?: string;
+  onProfileRender?: React.ProfilerProps["onRender"];
+};
+
+/** Keep completed transcript rows isolated from streaming status and text updates. */
+export const MessageRow = memo(function MessageRow({
+  message,
+  personaName,
+  ttsReady,
+  streamStatus,
+  onProfileRender,
+}: MessageRowProps) {
+  const row = (
+    <article
+      className={`chat-message ${message.role} ${message.failed ? "failed" : ""}`}
+      data-message-id={message.id}
+      data-message-revision={message.revision ?? 0}
+    >
+      <div className="message-avatar">
+        {message.role === "user" ? "Y" : personaName.slice(0, 1)}
+      </div>
+      <div>
+        <header>
+          <strong>{message.role === "user" ? "You" : personaName}</strong>
+          {message.streaming && streamStatus && (
+            <span>
+              <i className="thinking-pulse" />
+              {streamStatus}
+            </span>
+          )}
+          {message.failed && (
+            <span className="message-failed">Stopped / failed</span>
+          )}
+        </header>
+        <p>{message.text || "…"}</p>
+        {message.role === "assistant" && message.text && (
+          <div className="message-actions">
+            <button
+              onClick={() => void navigator.clipboard.writeText(message.text)}
+            >
+              Copy
+            </button>
+            <button
+              disabled={!ttsReady}
+              onClick={() => void invoke("voice_speak", { text: message.text })}
+            >
+              Speak
+            </button>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+  return onProfileRender ? (
+    <Profiler id={`message:${message.id}`} onRender={onProfileRender}>
+      {row}
+    </Profiler>
+  ) : (
+    row
+  );
+});
+
+export function ChatView({
   config,
   catalog,
   projection,
@@ -621,6 +692,7 @@ function ChatView({
   onVoice,
   onOpenProviders,
   onVoicePresentation,
+  onMessageProfile,
 }: {
   config: AppConfig;
   catalog: RuntimeCatalog;
@@ -638,6 +710,7 @@ function ChatView({
   onVoice: (status: VoiceStatus) => void;
   onOpenProviders: () => void;
   onVoicePresentation?: (presentation: VoicePresentation) => void;
+  onMessageProfile?: React.ProfilerProps["onRender"];
 }) {
   const [composer, setComposer] = useState("");
   const [busy, setBusy] = useState(false);
@@ -681,6 +754,9 @@ function ChatView({
   const pushToTalkPressed = useRef(false);
   const completionHandled = useRef(false);
   const sendInFlight = useRef(false);
+  const streamingActive = useRef(
+    messages.some((message) => message.id === "streaming"),
+  );
   const busyRef = useRef(busy);
   const composerRef = useRef(composer);
   const voiceInputModeRef = useRef(voiceInputMode);
@@ -694,6 +770,46 @@ function ChatView({
     cancel: () => undefined,
   });
   const stopTurnRef = useRef<() => Promise<void>>(async () => undefined);
+  const pendingDelta = useRef("");
+  const streamedResponseText = useRef("");
+  const deltaFrame = useRef<number | null>(null);
+  const flushPendingDeltas = useCallback(() => {
+    if (deltaFrame.current !== null) {
+      if (typeof window.cancelAnimationFrame === "function")
+        window.cancelAnimationFrame(deltaFrame.current);
+      deltaFrame.current = null;
+    }
+    const delta = pendingDelta.current;
+    pendingDelta.current = "";
+    if (!delta) return;
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === "streaming"
+          ? {
+              ...item,
+              text: item.text + delta,
+              revision: (item.revision ?? 0) + 1,
+            }
+          : item,
+      ),
+    );
+  }, [setMessages]);
+  const queueResponseDelta = useCallback(
+    (delta: string) => {
+      pendingDelta.current += delta;
+      streamedResponseText.current += delta;
+      if (deltaFrame.current !== null) return;
+      if (typeof window.requestAnimationFrame !== "function") {
+        flushPendingDeltas();
+        return;
+      }
+      deltaFrame.current = window.requestAnimationFrame(() => {
+        deltaFrame.current = null;
+        flushPendingDeltas();
+      });
+    },
+    [flushPendingDeltas],
+  );
   composerRef.current = composer;
   busyRef.current = busy;
   voiceInputModeRef.current = voiceInputMode;
@@ -801,7 +917,11 @@ function ChatView({
     (payload: TurnCompletion) => {
       if (completionHandled.current) return;
       completionHandled.current = true;
+      flushPendingDeltas();
+      streamingActive.current = false;
       const failed = payload.status === "failed";
+      const completedText = payload.text || streamedResponseText.current;
+      streamedResponseText.current = "";
       setMessages((current) =>
         current.map((item) =>
           item.id === "streaming"
@@ -810,13 +930,14 @@ function ChatView({
                 id: crypto.randomUUID(),
                 text:
                   item.text ||
-                  payload.text ||
+                  completedText ||
                   payload.error ||
                   (failed
                     ? "The turn failed before a response was produced."
                     : "Completed without a text response."),
                 streaming: false,
                 failed,
+                revision: (item.revision ?? 0) + 1,
               }
             : item,
         ),
@@ -827,12 +948,12 @@ function ChatView({
       setTurnStage(failed ? "Needs attention" : "Ready");
       if (payload.error) setError(payload.error);
       void refreshCatalog();
-      if (payload.speak && payload.text && voiceStatus.tts_ready)
-        void invoke("voice_speak", { text: payload.text }).catch((caught) =>
+      if (payload.speak && completedText && voiceStatus.tts_ready)
+        void invoke("voice_speak", { text: completedText }).catch((caught) =>
           setError(String(caught)),
         );
     },
-    [refreshCatalog, setMessages, voiceStatus.tts_ready],
+    [flushPendingDeltas, refreshCatalog, setMessages, voiceStatus.tts_ready],
   );
 
   const send = useCallback(
@@ -840,7 +961,10 @@ function ChatView({
       const text = raw.trim();
       if (!text || busy || sendInFlight.current) return;
       sendInFlight.current = true;
+      streamingActive.current = true;
       completionHandled.current = false;
+      pendingDelta.current = "";
+      streamedResponseText.current = "";
       setPendingTurn(null);
       setBusy(true);
       setError("");
@@ -848,8 +972,14 @@ function ChatView({
       setTurnSeconds(0);
       setMessages((current) => [
         ...current,
-        { id: crypto.randomUUID(), role: "user", text },
-        { id: "streaming", role: "assistant", text: "", streaming: true },
+        { id: crypto.randomUUID(), role: "user", text, revision: 0 },
+        {
+          id: "streaming",
+          role: "assistant",
+          text: "",
+          revision: 0,
+          streaming: true,
+        },
       ]);
       composerRef.current = "";
       dictationBuffer.current.sync("");
@@ -877,6 +1007,7 @@ function ChatView({
             current.filter((item) => item.id !== "streaming").concat(extracted),
           );
           completionHandled.current = true;
+          streamingActive.current = false;
           setBusy(false);
           sendInFlight.current = false;
         } else {
@@ -910,6 +1041,7 @@ function ChatView({
         }
       } catch (caught) {
         completionHandled.current = true;
+        streamingActive.current = false;
         setMessages((current) =>
           current.filter((item) => item.id !== "streaming"),
         );
@@ -1279,6 +1411,14 @@ function ChatView({
             : config.voice.wake_enabled
               ? "armed"
               : "sleeping";
+  const transcriptWindowStart = Math.max(
+    0,
+    messages.length - TRANSCRIPT_WINDOW_SIZE,
+  );
+  const visibleMessages = useMemo(
+    () => messages.slice(transcriptWindowStart),
+    [messages, transcriptWindowStart],
+  );
 
   useEffect(
     () =>
@@ -1341,18 +1481,13 @@ function ChatView({
           `Provider retry ${String(eventPayload(payload).attempt ?? "")}`.trim(),
         );
       if (payload.type === "response.delta") {
-        setTurnStage("Responding");
         const delta = String(
           eventPayload(payload).delta ?? eventPayload(payload).text ?? "",
         );
-        if (delta)
-          setMessages((current) =>
-            current.map((item) =>
-              item.id === "streaming"
-                ? { ...item, text: item.text + delta }
-                : item,
-            ),
-          );
+        if (delta && streamingActive.current) {
+          setTurnStage("Responding");
+          queueResponseDelta(delta);
+        }
       }
     }).then(retainUnlistener);
     void listen<TurnCompletion>("runtime-turn-complete", ({ payload }) => {
@@ -1372,10 +1507,17 @@ function ChatView({
         setError(`Voice recovered with fallback: ${payload.detail}`);
     }).then(retainUnlistener);
     return () => {
+      flushPendingDeltas();
       disposed = true;
       unlisten.forEach((dispose) => dispose());
     };
-  }, [finalizeTurn, onHistory, refreshCatalog, setMessages]);
+  }, [
+    finalizeTurn,
+    flushPendingDeltas,
+    onHistory,
+    queueResponseDelta,
+    refreshCatalog,
+  ]);
 
   useEffect(() => {
     if (!busy || !pendingTurn) return;
@@ -1569,6 +1711,9 @@ function ChatView({
         title: null,
         confirmed: false,
       });
+      flushPendingDeltas();
+      streamedResponseText.current = "";
+      streamingActive.current = false;
       setMessages((current) =>
         current.map((item) =>
           item.id === "streaming"
@@ -1578,6 +1723,7 @@ function ChatView({
                 text: item.text || "Stopped.",
                 streaming: false,
                 failed: true,
+                revision: (item.revision ?? 0) + 1,
               }
             : item,
         ),
@@ -1982,53 +2128,26 @@ function ChatView({
               </small>
             </div>
           )}
-          {messages.map((message) => (
-            <article
-              key={message.id}
-              className={`chat-message ${message.role} ${message.failed ? "failed" : ""}`}
-            >
-              <div className="message-avatar">
-                {message.role === "user"
-                  ? "Y"
-                  : config.persona.name.slice(0, 1)}
-              </div>
-              <div>
-                <header>
-                  <strong>
-                    {message.role === "user" ? "You" : config.persona.name}
-                  </strong>
-                  {message.streaming && (
-                    <span>
-                      <i className="thinking-pulse" />
-                      {turnStage} · {turnSeconds}s
-                    </span>
-                  )}
-                  {message.failed && (
-                    <span className="message-failed">Stopped / failed</span>
-                  )}
-                </header>
-                <p>{message.text || "…"}</p>
-                {message.role === "assistant" && message.text && (
-                  <div className="message-actions">
-                    <button
-                      onClick={() =>
-                        void navigator.clipboard.writeText(message.text)
-                      }
-                    >
-                      Copy
-                    </button>
-                    <button
-                      disabled={!voiceStatus.tts_ready}
-                      onClick={() =>
-                        void invoke("voice_speak", { text: message.text })
-                      }
-                    >
-                      Speak
-                    </button>
-                  </div>
-                )}
-              </div>
-            </article>
+          {transcriptWindowStart > 0 && (
+            <div
+              aria-hidden="true"
+              data-testid="transcript-window-spacer"
+              style={{
+                height: transcriptWindowStart * ESTIMATED_MESSAGE_HEIGHT_PX,
+              }}
+            />
+          )}
+          {visibleMessages.map((message) => (
+            <MessageRow
+              key={`${message.id}:${message.revision ?? 0}`}
+              message={message}
+              personaName={config.persona.name}
+              ttsReady={voiceStatus.tts_ready}
+              streamStatus={
+                message.streaming ? `${turnStage} · ${turnSeconds}s` : undefined
+              }
+              onProfileRender={onMessageProfile}
+            />
           ))}
         </div>
         {voice.partialTranscript && capturing && (
