@@ -104,6 +104,28 @@ function mergeChunks(chunks: Float32Array[]) {
   return merged;
 }
 
+/** Encode one fixed-rate voice stream frame without per-sample JSON serialization. */
+export function encodePcm16Le(samples: ArrayLike<number>): ArrayBuffer {
+  const frame = new ArrayBuffer(samples.length * Int16Array.BYTES_PER_ELEMENT);
+  const view = new DataView(frame);
+  for (let index = 0; index < samples.length; index += 1) {
+    const source = samples[index] ?? 0;
+    const sample = Number.isFinite(source)
+      ? Math.max(-1, Math.min(1, source))
+      : 0;
+    const pcm = Math.round(sample < 0 ? sample * 32_768 : sample * 32_767);
+    view.setInt16(index * Int16Array.BYTES_PER_ELEMENT, pcm, true);
+  }
+  return frame;
+}
+
+export function sendVoiceStreamChunk(samples: ArrayLike<number>) {
+  return invoke<{ text?: string }>(
+    "voice_stream_chunk",
+    encodePcm16Le(samples),
+  );
+}
+
 export function useVoiceCapture(
   config: AppConfig,
   onTranscript: (text: string, meta: VoiceTranscriptMeta) => void,
@@ -406,10 +428,7 @@ export function useVoiceCapture(
       streamQueue.current = streamQueue.current
         .then(async () => {
           if (streamFailure.current) return;
-          const result = await invoke<{ text?: string }>("voice_stream_chunk", {
-            samples,
-            sampleRateHz: 16_000,
-          });
+          const result = await sendVoiceStreamChunk(samples);
           if (result.text?.trim())
             publishPartial(result.text.trim(), {
               final: false,

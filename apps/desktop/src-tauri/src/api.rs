@@ -26,6 +26,28 @@ use tokio::sync::oneshot;
 
 const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
 const E5_SMALL_INT8_DIMENSIONS: usize = 384;
+const VOICE_STREAM_SAMPLE_RATE_HZ: usize = 16_000;
+const VOICE_STREAM_MAX_SAMPLES: usize = VOICE_STREAM_SAMPLE_RATE_HZ * 2;
+
+fn decode_pcm16le_frame(frame: &[u8]) -> Result<Vec<f32>, String> {
+    if frame.is_empty() || !frame.len().is_multiple_of(2) {
+        return Err(
+            "voice stream chunks must be non-empty little-endian i16 PCM frames".to_owned(),
+        );
+    }
+    let sample_count = frame.len() / 2;
+    if sample_count > VOICE_STREAM_MAX_SAMPLES {
+        return Err(
+            "voice stream chunks must contain at most two seconds of 16 kHz mono audio".to_owned(),
+        );
+    }
+    Ok(frame
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32_768.0)
+        .collect())
+}
 
 fn parse_worker_embedding(value: &Value) -> Result<Vec<f32>, String> {
     if value.get("model").and_then(Value::as_str) != Some(E5_SMALL_INT8_MODEL_ID) {
@@ -1898,19 +1920,19 @@ pub(crate) async fn voice_stream_start(
 
 #[tauri::command]
 pub(crate) async fn voice_stream_chunk(
-    samples: Vec<f32>,
-    sample_rate_hz: u32,
+    request: tauri::ipc::Request<'_>,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
-    if samples.is_empty() || samples.len() > 32_000 || sample_rate_hz != 16_000 {
-        return Err(
-            "voice stream chunks must contain at most two seconds of 16 kHz mono audio".to_owned(),
-        );
-    }
+    let samples = match request.body() {
+        tauri::ipc::InvokeBody::Raw(frame) => decode_pcm16le_frame(frame)?,
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("voice stream chunks require a raw PCM16LE invoke body".to_owned());
+        }
+    };
     neural_voice_request(
         &state,
         "stt_chunk",
-        json!({"samples": samples, "sample_rate_hz": sample_rate_hz}),
+        json!({"samples": samples, "sample_rate_hz": VOICE_STREAM_SAMPLE_RATE_HZ}),
         Duration::from_secs(30),
     )
     .await
@@ -2704,6 +2726,29 @@ pub(crate) async fn voice_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_little_endian_pcm16_voice_frame() {
+        let samples = decode_pcm16le_frame(&[
+            0x00, 0x80, // -32768
+            0x00, 0xc0, // -16384
+            0x00, 0x00, // 0
+            0x00, 0x40, // 16384
+            0xff, 0x7f, // 32767
+        ])
+        .expect("valid PCM16LE frame");
+
+        assert_eq!(samples.len(), 5);
+        for (actual, expected) in samples
+            .iter()
+            .zip([-1.0, -0.5, 0.0, 0.5, 32_767.0 / 32_768.0])
+        {
+            assert!((*actual - expected).abs() < f32::EPSILON);
+        }
+        assert!(decode_pcm16le_frame(&[]).is_err());
+        assert!(decode_pcm16le_frame(&[0]).is_err());
+        assert!(decode_pcm16le_frame(&vec![0; (VOICE_STREAM_MAX_SAMPLES + 1) * 2]).is_err());
+    }
 
     #[test]
     fn empty_or_idle_session_status_is_terminal() {
