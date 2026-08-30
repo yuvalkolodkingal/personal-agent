@@ -19,7 +19,10 @@ const eventCallbacks = vi.hoisted(
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
-vi.mock("./useVoiceCapture", () => ({
+// Only the hook is faked here; the barge-in capability helpers stay real so the
+// routing tests still render the measured UI strings.
+vi.mock("./useVoiceCapture", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useVoiceCapture")>()),
   useVoiceCapture: (
     _config: unknown,
     onFinal: (text: string, meta: VoiceTranscriptMeta) => void,
@@ -29,7 +32,7 @@ vi.mock("./useVoiceCapture", () => ({
     voiceCallbacks.final = onFinal;
     voiceCallbacks.partial = onPartial;
     return {
-      state: "idle",
+      state: "idle" as const,
       error: "",
       level: 0,
       partialTranscript: "",
@@ -37,6 +40,12 @@ vi.mock("./useVoiceCapture", () => ({
       stop: vi.fn(async () => undefined),
       cancel: vi.fn(),
       armWake: vi.fn(async () => undefined),
+      bargeIn: {
+        enabled: true,
+        monitoring: false,
+        echoCancellation: "unknown" as const,
+        duplex: "full" as const,
+      },
       wakeArmed: false,
     };
   },

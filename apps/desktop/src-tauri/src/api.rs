@@ -1210,6 +1210,32 @@ impl TurnSpeechQueue {
     }
 }
 
+/// Which `voice-state` transition each streamed clause still owes the UI.
+///
+/// The renderer's half-duplex barge-in guard (no usable `echoCancellation`)
+/// only listens through the gap between clauses, so every clause re-enters
+/// `speaking` on its first frame and opens `between-clauses` when it ends.
+#[derive(Default)]
+struct ClauseSpeechStates {
+    speaking: bool,
+}
+
+impl ClauseSpeechStates {
+    /// True when this frame is the first audio of a clause.
+    fn enter_speaking(&mut self) -> bool {
+        let first = !self.speaking;
+        self.speaking = true;
+        first
+    }
+
+    /// True when a clause that produced audio has just finished.
+    fn open_clause_gap(&mut self) -> bool {
+        let spoke = self.speaking;
+        self.speaking = false;
+        spoke
+    }
+}
+
 async fn begin_turn_speech(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -1293,7 +1319,7 @@ async fn run_turn_speech(
                     json!({"state": "synthesizing", "engine": backend, "generation": generation}),
                 );
                 let mut current_clause = Some(first_clause);
-                let mut speaking_emitted = false;
+                let mut clause_states = ClauseSpeechStates::default();
                 let mut stream_error = None;
                 while let Some(clause) = current_clause {
                     if state.voice_generation.load(Ordering::SeqCst) != generation {
@@ -1314,12 +1340,11 @@ async fn run_turn_speech(
                             if let Some(sender) = first_audio.take() {
                                 let _ = sender.send(Ok(()));
                             }
-                            if !speaking_emitted {
+                            if clause_states.enter_speaking() {
                                 let _ = stream_app.emit(
                                     "voice-state",
                                     json!({"state": "speaking", "engine": backend, "generation": generation}),
                                 );
-                                speaking_emitted = true;
                             }
                             Ok(())
                         },
@@ -1352,6 +1377,14 @@ async fn run_turn_speech(
                         }
                     }
 
+                    // The finished clause is the only window a half-duplex wake
+                    // path can listen through, so publish the gap before waiting.
+                    if clause_states.open_clause_gap() {
+                        let _ = app.emit(
+                            "voice-state",
+                            json!({"state": "between-clauses", "engine": backend, "generation": generation}),
+                        );
+                    }
                     // `neural_voice_tts_stream` releases the worker mutex before
                     // this wait, so an idle clause queue never monopolizes voice.
                     current_clause = clauses.recv().await;
@@ -3353,10 +3386,18 @@ pub(crate) async fn voice_wake_chunk(
             return Err("wake stream chunks require a raw PCM16LE invoke body".to_owned());
         }
     };
+    // Barge-in only needs the Silero probability while we are actually
+    // speaking, so the ambient armed path stays free of VAD inference and
+    // keeps STT-1's wake-CPU reduction intact.
+    let monitor_speech = { state.voice_playback.lock().await.is_some() };
     neural_voice_request(
         &state,
         "wake_chunk",
-        json!({"samples": samples, "sample_rate_hz": VOICE_STREAM_SAMPLE_RATE_HZ}),
+        json!({
+            "samples": samples,
+            "sample_rate_hz": VOICE_STREAM_SAMPLE_RATE_HZ,
+            "speech_prob": monitor_speech,
+        }),
         Duration::from_secs(5),
     )
     .await
@@ -5005,6 +5046,41 @@ mod tests {
         assert_eq!(assistant_text_for_parent(&messages, "msg_other"), None);
     }
 
+    #[test]
+    fn streamed_clauses_publish_a_between_clauses_gap_for_barge_in() {
+        let mut states = ClauseSpeechStates::default();
+        let mut emitted = Vec::new();
+        // Three clauses, two PCM frames each, exactly as the sink receives them.
+        for _ in 0..3 {
+            for _ in 0..2 {
+                if states.enter_speaking() {
+                    emitted.push("speaking");
+                }
+            }
+            if states.open_clause_gap() {
+                emitted.push("between-clauses");
+            }
+        }
+        assert_eq!(
+            emitted,
+            [
+                "speaking",
+                "between-clauses",
+                "speaking",
+                "between-clauses",
+                "speaking",
+                "between-clauses"
+            ]
+        );
+
+        // A clause that never produced audio must not fake a playback gap.
+        let mut silent = ClauseSpeechStates::default();
+        assert!(!silent.open_clause_gap());
+        assert!(silent.enter_speaking());
+        assert!(silent.open_clause_gap());
+        assert!(!silent.open_clause_gap());
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // The integration trace keeps runtime, dispatcher, fake engine, and sink ordering visible.
     async fn fake_runtime_streams_first_clause_audio_before_turn_completion() {
@@ -5925,6 +6001,61 @@ runtime_module["PROTOCOL_STDOUT"].flush()
         std::fs::remove_dir_all(root).expect("remove worker test root");
     }
 
+    /// TTS-5 barge-in needs a Silero probability on the neural wake path, but
+    /// only while audio is playing. Ambient chunks must stay VAD-free so
+    /// STT-1's armed wake cost is unchanged.
+    async fn assert_barge_in_speech_probability_is_playback_gated(
+        stdin: &mut tokio::process::ChildStdin,
+        stdout: &mut BufReader<tokio::process::ChildStdout>,
+    ) {
+        let ambient = worker_test_request(
+            stdin,
+            stdout,
+            &json!({
+                "id": 90_001,
+                "command": "wake_chunk",
+                "samples": vec![0.0_f32; 1_280],
+                "sample_rate_hz": 16_000,
+            }),
+        )
+        .await;
+        assert_eq!(ambient.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(
+            ambient.pointer("/result/speech_prob").is_none(),
+            "ambient wake chunks must not run Silero VAD"
+        );
+
+        let monitored = worker_test_request(
+            stdin,
+            stdout,
+            &json!({
+                "id": 90_002,
+                "command": "wake_chunk",
+                "samples": vec![0.0_f32; 1_280],
+                "sample_rate_hz": 16_000,
+                "speech_prob": true,
+            }),
+        )
+        .await;
+        assert_eq!(monitored.get("ok").and_then(Value::as_bool), Some(true));
+        let speech_prob = monitored
+            .pointer("/result/speech_prob")
+            .and_then(Value::as_f64)
+            .expect("barge-in monitoring reports a Silero speech probability");
+        assert!(
+            speech_prob.is_finite() && (0.0..=1.0).contains(&speech_prob),
+            "speech probability {speech_prob} is out of range"
+        );
+        assert!(
+            speech_prob < 0.9,
+            "digital silence must not cross the barge-in speech floor"
+        );
+        assert_eq!(
+            monitored.pointer("/result/vad_model"),
+            Some(&json!("silero-vad-v5.1.2"))
+        );
+    }
+
     #[tokio::test]
     async fn live_openwakeword_protocol_detects_bundled_hey_jarvis_when_enabled() {
         if std::env::var("PERSONAL_AGENT_OPENWAKEWORD_LIVE_TEST").as_deref() != Ok("1") {
@@ -6022,6 +6153,8 @@ runtime_module["PROTOCOL_STDOUT"].flush()
             detected,
             "pinned hey-jarvis model did not detect replay; maximum score {maximum_score}"
         );
+
+        assert_barge_in_speech_probability_is_playback_gated(&mut stdin, &mut stdout).await;
         drop(stdin);
         child.start_kill().expect("stop live voice worker");
         child.wait().await.expect("reap live voice worker");

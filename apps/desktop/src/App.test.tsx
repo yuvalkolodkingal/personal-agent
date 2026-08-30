@@ -919,4 +919,155 @@ describe("desktop workspace", () => {
       await screen.findByRole("dialog", { name: "Complete provider sign in" }),
     ).toBeInTheDocument();
   });
+  describe("voice barge-in", () => {
+    class MockWorkletNode {
+      static instances: MockWorkletNode[] = [];
+      readonly connect = vi.fn();
+      readonly disconnect = vi.fn();
+      readonly port = {
+        onmessage: null as ((event: MessageEvent<Float32Array>) => void) | null,
+      };
+
+      constructor() {
+        MockWorkletNode.instances.push(this);
+      }
+
+      emit(frame: Float32Array) {
+        this.port.onmessage?.({ data: frame } as MessageEvent<Float32Array>);
+      }
+    }
+
+    class MockAudioContext {
+      readonly sampleRate = 16_000;
+      readonly destination = {} as AudioDestinationNode;
+      readonly audioWorklet = {
+        addModule: vi.fn(async () => undefined),
+      } as unknown as AudioWorklet;
+      readonly close = vi.fn(async () => undefined);
+      readonly resume = vi.fn(async () => undefined);
+      readonly createMediaStreamSource = vi.fn(() => ({
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+      }));
+      readonly createGain = vi.fn(() => ({
+        gain: { value: 1 },
+        connect: vi.fn(),
+      }));
+      readonly createScriptProcessor = vi.fn();
+    }
+
+    const trackStop = vi.fn();
+    const getUserMedia = vi.fn();
+    const track = {
+      stop: trackStop,
+      applyConstraints: vi.fn(async () => undefined),
+      getSettings: () => ({ echoCancellation: true }),
+    };
+    const voiceReadyConfig = {
+      ...fallbackConfig,
+      voice: { ...fallbackConfig.voice, wake_enabled: true, barge_in: true },
+    };
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    beforeEach(() => {
+      MockWorkletNode.instances = [];
+      trackStop.mockClear();
+      track.applyConstraints.mockClear();
+      getUserMedia.mockReset().mockResolvedValue({
+        getTracks: () => [track],
+        getAudioTracks: () => [track],
+      });
+      vi.stubGlobal("AudioContext", MockAudioContext);
+      vi.stubGlobal("AudioWorkletNode", MockWorkletNode);
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: { getUserMedia },
+      });
+      invoke.mockImplementation((command: string) => {
+        if (command === "bootstrap")
+          return Promise.resolve({
+            config: voiceReadyConfig,
+            projection,
+            history: [],
+            voice: {
+              stt_ready: true,
+              tts_ready: true,
+              playback_ready: true,
+              details: [],
+            },
+          });
+        if (command === "voice_wake_start")
+          return Promise.resolve({ fallback: "stt-match" });
+        if (command === "voice_wake_chunk")
+          return Promise.resolve({
+            wake: false,
+            score: 0,
+            fallback: "stt-match",
+            speech_prob: 0.95,
+          });
+        if (command === "voice_stream_start")
+          return Promise.resolve({ streaming: true });
+        if (command === "voice_stream_chunk")
+          return Promise.resolve({ speech_prob: 0.8 });
+        if (command === "microphone_state") return Promise.resolve(projection);
+        return baseInvoke(command);
+      });
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: undefined,
+      });
+    });
+
+    it("keeps wake capture live through playback and stops the sink on speech", async () => {
+      render(<App />);
+      await waitFor(
+        () => expect(invoke).toHaveBeenCalledWith("voice_wake_start"),
+        { timeout: 3_000 },
+      );
+      await waitFor(() => expect(MockWorkletNode.instances).toHaveLength(1));
+
+      await act(async () => {
+        listeners.get("voice-state")?.({
+          payload: { state: "speaking", engine: "qwen3-tts" },
+        });
+        await flush();
+      });
+
+      // The wake stream survives playback instead of being suspended, and the
+      // rail card reports the measured capability rather than the config flag.
+      expect(trackStop).not.toHaveBeenCalled();
+      expect(track.applyConstraints).toHaveBeenCalledWith({
+        echoCancellation: true,
+      });
+      const bargeInRow = screen.getByText("Barge-in").closest("div");
+      expect(bargeInRow).not.toBeNull();
+      await waitFor(() =>
+        expect(
+          within(bargeInRow as HTMLElement).getByText("listening · AEC on"),
+        ).toBeInTheDocument(),
+      );
+      // Chrome status and rail card both render the measured capability.
+      expect(
+        screen.getAllByText("qwen3-tts · barge-in listening · AEC on"),
+      ).toHaveLength(2);
+
+      const node = MockWorkletNode.instances[0];
+      await act(async () => {
+        for (let frame = 0; frame < 20; frame += 1)
+          node?.emit(new Float32Array(320).fill(0.3));
+        await flush();
+      });
+
+      await waitFor(() => expect(invoke).toHaveBeenCalledWith("voice_stop"));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: /^Listening\./ }),
+        ).toBeInTheDocument(),
+      );
+    });
+  });
 });

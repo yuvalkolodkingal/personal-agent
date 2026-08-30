@@ -1307,7 +1307,25 @@ class VoiceRuntime:
                 score,
                 max((float(value) for value in predictions.values()), default=0.0),
             )
-        return {"wake": score >= self.wake_threshold, "score": score}
+        result = {"wake": score >= self.wake_threshold, "score": score}
+        # Barge-in (TTS-5) trips on sustained speech, not just a wake phrase, so
+        # the neural path reports the same Silero probability as the stt-match
+        # fallback. The caller asks for it only while audio is playing, which
+        # keeps STT-1's ambient armed cost free of VAD inference. A missing or
+        # unloadable VAD must not break wake detection: the caller simply loses
+        # the speech-energy trigger and keeps the raised-threshold wake trigger.
+        if not request.get("speech_prob"):
+            return result
+        try:
+            speech_prob, vad_frames = self._speech_probability(
+                samples, int(request.get("sample_rate_hz", 16_000))
+            )
+        except Exception:
+            return result
+        result["speech_prob"] = speech_prob
+        result["vad_frames"] = vad_frames
+        result["vad_model"] = f"silero-vad-{SILERO_VAD_VERSION}"
+        return result
 
     def wake_stop(self, _request: dict[str, Any]) -> dict[str, Any]:
         was_active = self.wake_active

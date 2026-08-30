@@ -26,6 +26,80 @@ export type WakePhraseMatch = {
   remainder: string;
 };
 
+/** Sustained speech that interrupts playback even without a wake phrase. */
+export const BARGE_IN_SPEECH_MS = 400;
+export const BARGE_IN_SPEECH_PROBABILITY = 0.9;
+
+export type EchoCancellationState = "unknown" | "on" | "off";
+
+/** Measured — never assumed — barge-in readiness for the UI to render. */
+export type BargeInCapability = {
+  enabled: boolean;
+  monitoring: boolean;
+  echoCancellation: EchoCancellationState;
+  duplex: "full" | "half";
+};
+
+export type BargeInReason = "wake" | "speech";
+
+export type VoicePlaybackContext = {
+  /** True while the native sink is synthesizing or speaking. */
+  active: boolean;
+  /** True while the sink reports `voice-state: between-clauses`. */
+  betweenClauses: boolean;
+  /** `voice.barge_in` from config. */
+  bargeIn: boolean;
+  /** Fired right after `voice_stop` so the shell can settle playback UI. */
+  onBargeIn?: (reason: BargeInReason) => void;
+};
+
+const IDLE_PLAYBACK: VoicePlaybackContext = {
+  active: false,
+  betweenClauses: false,
+  bargeIn: false,
+};
+
+/**
+ * Speaker leakage raises the wake score floor, so during playback a hit must
+ * clear half the remaining headroom above the configured threshold.
+ */
+export function bargeInWakeThresholdMilli(baseMilli: number) {
+  const base = Math.max(0, Math.min(1_000, Math.round(baseMilli)));
+  return Math.round(base + (1_000 - base) / 2);
+}
+
+export function describeBargeIn(capability: BargeInCapability) {
+  if (!capability.enabled) return "disabled";
+  if (!capability.monitoring)
+    return capability.echoCancellation === "unknown"
+      ? "enabled · not measured"
+      : `enabled · AEC ${capability.echoCancellation}`;
+  if (capability.duplex === "half") return "listening · half-duplex (AEC off)";
+  return capability.echoCancellation === "on"
+    ? "listening · AEC on"
+    : "listening · AEC unmeasured";
+}
+
+/**
+ * Ask the live capture track for echo cancellation and report what the device
+ * actually granted. `unknown` means the webview exposed no setting at all.
+ */
+async function measureEchoCancellation(
+  media: MediaStream,
+  desired: boolean,
+): Promise<EchoCancellationState> {
+  const track = (media.getAudioTracks?.() ?? media.getTracks?.() ?? [])[0];
+  if (!track) return "unknown";
+  try {
+    await track.applyConstraints?.({ echoCancellation: desired });
+  } catch {
+    // A device without AEC rejects the constraint; getSettings still reports it.
+  }
+  const granted = track.getSettings?.()?.echoCancellation;
+  if (typeof granted !== "boolean") return "unknown";
+  return granted ? "on" : "off";
+}
+
 export type VoiceTranscriptMeta = {
   final: boolean;
   source: "capture" | "wake";
@@ -249,11 +323,14 @@ export function useVoiceCapture(
   onPartialTranscript?: (text: string, meta: VoiceTranscriptMeta) => void,
   wakeReady = true,
   wakeSuspended = false,
+  playback: VoicePlaybackContext = IDLE_PLAYBACK,
 ) {
   const [state, setState] = useState<VoiceCaptureState>("idle");
   const [error, setError] = useState("");
   const [level, setLevel] = useState(0);
   const [partialTranscript, setPartialTranscript] = useState("");
+  const [echoCancellation, setEchoCancellation] =
+    useState<EchoCancellationState>("unknown");
   const stateRef = useRef<VoiceCaptureState>("idle");
   const stopRequested = useRef(false);
   const stopInFlight = useRef(false);
@@ -288,8 +365,17 @@ export function useVoiceCapture(
   const lastWakeDetectedAt = useRef(0);
   const latestLevel = useRef(0);
   const levelFrame = useRef<number | null>(null);
+  const bargeInActive = playback.active && playback.bargeIn;
+  const playbackActive = useRef(false);
+  const betweenClauses = useRef(false);
+  const bargeInSpeechMs = useRef(0);
+  const echoCancellationRef = useRef<EchoCancellationState>("unknown");
+  const onBargeInRef = useRef(playback.onBargeIn);
 
   onTranscriptRef.current = onTranscript;
+  playbackActive.current = bargeInActive;
+  betweenClauses.current = playback.betweenClauses;
+  onBargeInRef.current = playback.onBargeIn;
 
   const publishLevel = useCallback((next: number) => {
     latestLevel.current = Math.max(0, Math.min(1, next));
@@ -347,6 +433,9 @@ export function useVoiceCapture(
       wakeCandidateSamples.current = 0;
       wakeSpeechStarted.current = false;
       wakeFallback.current = false;
+      bargeInSpeechMs.current = 0;
+      echoCancellationRef.current = "unknown";
+      setEchoCancellation("unknown");
       let workerStopped: Promise<unknown> = Promise.resolve();
       if (wakeSessionActive.current) {
         wakeSessionActive.current = false;
@@ -367,6 +456,13 @@ export function useVoiceCapture(
     [onProjection, resetLevel, transition],
   );
 
+  /** Stop the sink and cancel synthesis before the microphone takes over. */
+  const interruptPlayback = useCallback(async (reason: BargeInReason) => {
+    bargeInSpeechMs.current = 0;
+    await invoke("voice_stop").catch(() => undefined);
+    onBargeInRef.current?.(reason);
+  }, []);
+
   const activateWake = useCallback(
     async (phrase: string, remainder = "") => {
       const detectedAt = performance.now();
@@ -374,6 +470,7 @@ export function useVoiceCapture(
         return;
       lastWakeDetectedAt.current = detectedAt;
       publishPartial(phrase, { final: false, source: "wake" }, false);
+      if (playbackActive.current) await interruptPlayback("wake");
       await stopWakeCapture();
       transition("wake_detected");
       if (remainder) {
@@ -386,7 +483,37 @@ export function useVoiceCapture(
         await startRef.current();
       }
     },
-    [config.voice.refractory_ms, publishPartial, stopWakeCapture, transition],
+    [
+      config.voice.refractory_ms,
+      interruptPlayback,
+      publishPartial,
+      stopWakeCapture,
+      transition,
+    ],
+  );
+
+  /**
+   * Barge-in without a wake phrase: sustained confident speech from the worker
+   * VAD stops the sink and hands the microphone to the capture path.
+   */
+  const bargeInOnSpeech = useCallback(
+    async (probability: number | undefined, sampleCount: number) => {
+      if (!playbackActive.current) return false;
+      if (typeof probability !== "number" || !Number.isFinite(probability))
+        return false;
+      if (probability <= BARGE_IN_SPEECH_PROBABILITY) {
+        bargeInSpeechMs.current = 0;
+        return false;
+      }
+      bargeInSpeechMs.current += (sampleCount / VOICE_SAMPLE_RATE) * 1_000;
+      if (bargeInSpeechMs.current < BARGE_IN_SPEECH_MS) return false;
+      await interruptPlayback("speech");
+      await stopWakeCapture();
+      transition("wake_detected");
+      await startRef.current();
+      return true;
+    },
+    [interruptPlayback, stopWakeCapture, transition],
   );
 
   const armWake = useCallback(async () => {
@@ -422,7 +549,10 @@ export function useVoiceCapture(
       const media = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: config.voice.input_device || undefined,
-          echoCancellation: config.voice.echo_cancellation,
+          // Barge-in listens through our own playback, so AEC is mandatory
+          // while the sink is active regardless of the configured preference.
+          echoCancellation:
+            playbackActive.current || config.voice.echo_cancellation,
           noiseSuppression: config.voice.noise_suppression,
           autoGainControl: config.voice.automatic_gain_control,
           channelCount: 1,
@@ -432,6 +562,16 @@ export function useVoiceCapture(
         media.getTracks().forEach((track) => track.stop());
         return;
       }
+      const measured = await measureEchoCancellation(
+        media,
+        playbackActive.current || config.voice.echo_cancellation,
+      );
+      if (wakeGeneration.current !== generation || wakeSuspended) {
+        media.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      echoCancellationRef.current = measured;
+      setEchoCancellation(measured);
       const audioContext = new AudioContext();
       await audioContext.resume();
       const input = audioContext.createMediaStreamSource(media);
@@ -449,6 +589,16 @@ export function useVoiceCapture(
         config.voice.input_gain_percent / 100,
         (data) => {
           if (wakeGeneration.current !== generation) return;
+          // Half-duplex guard: with no AEC our own speaker audio owns the
+          // capture path, so only the sink's inter-clause gaps are listenable.
+          if (
+            playbackActive.current &&
+            echoCancellationRef.current === "off" &&
+            !betweenClauses.current
+          ) {
+            bargeInSpeechMs.current = 0;
+            return;
+          }
           let sum = 0;
           for (let index = 0; index < data.length; index += 1) {
             const sample = data[index] ?? 0;
@@ -460,9 +610,19 @@ export function useVoiceCapture(
           wakeQueue.current = wakeQueue.current
             .then(async () => {
               if (wakeGeneration.current !== requestGeneration) return;
+              const duringPlayback = playbackActive.current;
               if (!wakeFallback.current) {
                 const result = await sendWakeStreamChunk(data);
+                if (await bargeInOnSpeech(result.speech_prob, data.length))
+                  return;
                 if (!result.wake) return;
+                const score = Number.isFinite(result.score) ? result.score : 0;
+                if (
+                  duringPlayback &&
+                  score * 1_000 <
+                    bargeInWakeThresholdMilli(config.voice.wake_threshold_milli)
+                )
+                  return;
                 const phrase = config.voice.wake_phrases.find((candidate) =>
                   ["hey jarvis", "jarvis"].includes(
                     normalizedWords(candidate).join(" "),
@@ -494,6 +654,13 @@ export function useVoiceCapture(
                 ? await sendWakeStreamChunk(data)
                 : ({ speech_prob: 0 } as WakeChunkResult);
               const speechProbability = result.speech_prob ?? 0;
+              if (duringPlayback) {
+                // Transcribing ambient audio during playback would feed our own
+                // speech back into STT, so the sustained-speech rule is the only
+                // barge-in trigger on the fallback wake path.
+                await bargeInOnSpeech(result.speech_prob, data.length);
+                return;
+              }
               const startThreshold = vadProbabilityThreshold(
                 config.voice.vad_start_milli,
               );
@@ -567,6 +734,7 @@ export function useVoiceCapture(
     }
   }, [
     activateWake,
+    bargeInOnSpeech,
     config.voice,
     onProjection,
     publishLevel,
@@ -941,7 +1109,34 @@ export function useVoiceCapture(
     return () => window.clearTimeout(timer);
   }, [armWake, state, wakeShouldRun]);
 
+  // Re-measure AEC whenever playback starts or stops: the wake stream keeps
+  // running across that boundary, so the constraint has to be re-applied live.
+  useEffect(() => {
+    bargeInSpeechMs.current = 0;
+    const media = wakeStream.current;
+    if (!media) return;
+    let disposed = false;
+    void measureEchoCancellation(
+      media,
+      bargeInActive || config.voice.echo_cancellation,
+    ).then((measured) => {
+      if (disposed || wakeStream.current !== media) return;
+      echoCancellationRef.current = measured;
+      setEchoCancellation(measured);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [bargeInActive, config.voice.echo_cancellation]);
+
   useEffect(() => () => cancel(), [cancel]);
+
+  const bargeIn: BargeInCapability = {
+    enabled: playback.bargeIn,
+    monitoring: bargeInActive && state === "armed",
+    echoCancellation,
+    duplex: bargeInActive && echoCancellation === "off" ? "half" : "full",
+  };
 
   return {
     state,
@@ -952,6 +1147,7 @@ export function useVoiceCapture(
     stop,
     cancel,
     armWake,
+    bargeIn,
     wakeArmed: state === "armed",
   };
 }

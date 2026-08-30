@@ -29,7 +29,11 @@ import {
   type DictationMode,
   type NativeDictationStatus,
 } from "./dictation";
-import { useVoiceCapture, type VoiceTranscriptMeta } from "./useVoiceCapture";
+import {
+  describeBargeIn,
+  useVoiceCapture,
+  type VoiceTranscriptMeta,
+} from "./useVoiceCapture";
 
 const GoalsTasks = lazy(() =>
   import("./GoalsTasks").then(({ GoalsTasks: component }) => ({
@@ -247,7 +251,7 @@ const voiceStates: Record<
   speaking: {
     glyph: "◀",
     label: "Speaking",
-    hint: "Qwen3-TTS · barge-in enabled",
+    hint: "Qwen3-TTS · barge-in not measured",
     color: "#5bc98f",
     stoppable: true,
   },
@@ -274,9 +278,13 @@ const voiceStates: Record<
   },
 };
 
-function voicePresentation(state: string, level = 0): VoicePresentation {
+function voicePresentation(
+  state: string,
+  level = 0,
+  hint?: string,
+): VoicePresentation {
   const value = voiceStates[state] ?? voiceStates.sleeping!;
-  return { state, level, ...value };
+  return { state, level, ...value, ...(hint ? { hint } : {}) };
 }
 
 type Diagnostic = {
@@ -738,6 +746,7 @@ export function ChatView({
   const [turnStage, setTurnStage] = useState("Ready");
   const [turnSeconds, setTurnSeconds] = useState(0);
   const [playbackState, setPlaybackState] = useState("idle");
+  const [betweenClauses, setBetweenClauses] = useState(false);
   const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(null);
   const [voiceInputMode, setVoiceInputMode] = useState<"agent" | "dictation">(
     "agent",
@@ -1340,13 +1349,31 @@ export function ChatView({
     [ingestDictation],
   );
 
+  const playbackActive =
+    playbackState !== "idle" && playbackState !== "interrupted";
+  const handleBargeIn = useCallback(() => {
+    setBetweenClauses(false);
+    setPlaybackState("interrupted");
+    window.setTimeout(() => setPlaybackState("idle"), 1200);
+  }, []);
+  const voicePlayback = useMemo(
+    () => ({
+      active: playbackActive,
+      betweenClauses,
+      bargeIn: config.voice.barge_in,
+      onBargeIn: handleBargeIn,
+    }),
+    [betweenClauses, config.voice.barge_in, handleBargeIn, playbackActive],
+  );
   const voice = useVoiceCapture(
     config,
     (transcript, meta) => void handleFinalVoiceTranscript(transcript, meta),
     onProjection,
     handlePartialVoiceTranscript,
     voiceStatus.stt_ready,
-    busy || playbackState !== "idle" || voiceMuted,
+    // Playback no longer suspends the wake stream: barge-in needs it live.
+    voiceMuted || (playbackActive ? !config.voice.barge_in : busy),
+    voicePlayback,
   );
   voiceActionsRef.current.cancel = voice.cancel;
   const activeStt = voiceStatus.stt_ready
@@ -1392,8 +1419,12 @@ export function ChatView({
       await invoke("voice_stop").catch(() => undefined);
     await voice.start();
   }, [config.voice.barge_in, voice.start]);
+  // Wake listening now runs *through* playback, so the ambient armed/arming
+  // states must not mask the sink state the user is actually hearing.
+  const wakeBackgroundState =
+    voice.state === "armed" || voice.state === "arming";
   const presentedVoiceState =
-    voice.state !== "idle"
+    voice.state !== "idle" && !(wakeBackgroundState && playbackState !== "idle")
       ? voice.state
       : playbackState !== "idle"
         ? playbackState
@@ -1407,6 +1438,18 @@ export function ChatView({
             : config.voice.wake_enabled
               ? "armed"
               : "sleeping";
+  const bargeInSummary = describeBargeIn(voice.bargeIn);
+  const presentation = useMemo(
+    () =>
+      voicePresentation(
+        presentedVoiceState,
+        voice.level,
+        presentedVoiceState === "speaking"
+          ? `${activeTts} · barge-in ${bargeInSummary}`
+          : undefined,
+      ),
+    [activeTts, bargeInSummary, presentedVoiceState, voice.level],
+  );
   const transcriptWindowStart = Math.max(
     0,
     messages.length - TRANSCRIPT_WINDOW_SIZE,
@@ -1417,11 +1460,8 @@ export function ChatView({
   );
 
   useEffect(
-    () =>
-      onVoicePresentation?.(
-        voicePresentation(presentedVoiceState, voice.level),
-      ),
-    [onVoicePresentation, presentedVoiceState, voice.level],
+    () => onVoicePresentation?.(presentation),
+    [onVoicePresentation, presentation],
   );
   useEffect(() => {
     const open = () => setModelPalette(true);
@@ -1496,7 +1536,17 @@ export function ChatView({
       interrupted?: boolean;
     }>("voice-state", ({ payload }) => {
       if (disposed) return;
-      setPlaybackState(payload.interrupted ? "interrupted" : payload.state);
+      // `between-clauses` is a gap inside one utterance: playback is still
+      // active, but the half-duplex wake guard may listen through it.
+      const clauseGap = payload.state === "between-clauses";
+      setBetweenClauses(clauseGap);
+      setPlaybackState(
+        payload.interrupted
+          ? "interrupted"
+          : clauseGap
+            ? "speaking"
+            : payload.state,
+      );
       if (payload.interrupted)
         window.setTimeout(() => setPlaybackState("idle"), 1200);
       if (payload.state === "recovering" && payload.detail)
@@ -2353,15 +2403,11 @@ export function ChatView({
           <div className={`rail-card voice-status-card ${presentedVoiceState}`}>
             <header>
               <span className="eyebrow">VOICE STATE</span>
-              <b
-                style={{ color: voicePresentation(presentedVoiceState).color }}
-              >
-                {voicePresentation(presentedVoiceState).glyph}
-              </b>
+              <b style={{ color: presentation.color }}>{presentation.glyph}</b>
             </header>
-            <strong>{voicePresentation(presentedVoiceState).label}</strong>
-            <small>{voicePresentation(presentedVoiceState).hint}</small>
-            {voicePresentation(presentedVoiceState).stoppable && (
+            <strong>{presentation.label}</strong>
+            <small>{presentation.hint}</small>
+            {presentation.stoppable && (
               <button
                 onClick={() =>
                   window.dispatchEvent(new Event("personal-agent:voice-stop"))
@@ -2389,7 +2435,7 @@ export function ChatView({
               </div>
               <div>
                 <dt>Barge-in</dt>
-                <dd>{config.voice.barge_in ? "enabled" : "disabled"}</dd>
+                <dd>{bargeInSummary}</dd>
               </div>
             </dl>
           </div>

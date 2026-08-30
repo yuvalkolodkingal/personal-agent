@@ -7,18 +7,24 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import {
   advanceVadEndpoint,
+  bargeInWakeThresholdMilli,
+  describeBargeIn,
   matchWakePhrase,
   passesVoicePreGate,
   sendVoiceStreamChunk,
   sendWakeStreamChunk,
   useVoiceCapture,
   vadProbabilityThreshold,
+  type VoicePlaybackContext,
 } from "./useVoiceCapture";
 import type { AppConfig, Projection } from "./types";
 
 const projection = {} as Projection;
 
-function voiceConfig(wakeEnabled = false) {
+function voiceConfig(
+  wakeEnabled = false,
+  overrides: Record<string, unknown> = {},
+) {
   return {
     voice: {
       enabled: true,
@@ -26,6 +32,7 @@ function voiceConfig(wakeEnabled = false) {
       input_device: "",
       input_gain_percent: 100,
       wake_phrases: ["hey jarvis", "jarvis"],
+      wake_threshold_milli: 930,
       vad_start_milli: 600,
       vad_stop_milli: 350,
       pre_roll_ms: 300,
@@ -35,6 +42,8 @@ function voiceConfig(wakeEnabled = false) {
       echo_cancellation: true,
       noise_suppression: true,
       automatic_gain_control: true,
+      barge_in: true,
+      ...overrides,
     },
   } as unknown as AppConfig;
 }
@@ -42,6 +51,7 @@ function voiceConfig(wakeEnabled = false) {
 const addModule = vi.fn<() => Promise<void>>();
 const getUserMedia = vi.fn();
 const trackStop = vi.fn();
+const applyConstraints = vi.fn<(constraints: MediaTrackConstraints) => void>();
 const sourceConnect = vi.fn();
 const sourceDisconnect = vi.fn();
 
@@ -107,12 +117,29 @@ class MockAudioContext {
   }
 }
 
-function installCaptureMocks(workletSupported = true) {
+/**
+ * Mirror a real capture track: the browser reports what AEC it actually
+ * granted, and `undefined` models a webview that exposes no setting at all.
+ */
+function installCaptureMocks(
+  workletSupported = true,
+  echoCancellation: boolean | undefined = undefined,
+) {
   MockWorkletNode.instances = [];
   MockAudioContext.instances = [];
   addModule.mockReset().mockResolvedValue(undefined);
+  applyConstraints.mockReset();
+  const track = {
+    stop: trackStop,
+    applyConstraints: (constraints: MediaTrackConstraints) => {
+      applyConstraints(constraints);
+      return Promise.resolve();
+    },
+    getSettings: () => ({ echoCancellation }),
+  };
   getUserMedia.mockReset().mockResolvedValue({
-    getTracks: () => [{ stop: trackStop }],
+    getTracks: () => [track],
+    getAudioTracks: () => [track],
   });
   trackStop.mockReset();
   sourceConnect.mockReset();
@@ -465,4 +492,240 @@ describe("AudioWorklet capture integration", () => {
       act(() => hook.unmount());
     },
   );
+});
+
+describe("barge-in during playback", () => {
+  const idlePlayback: VoicePlaybackContext = {
+    active: false,
+    betweenClauses: false,
+    bargeIn: true,
+  };
+
+  function installWakeInvoke(
+    wakeStart: Record<string, unknown>,
+    chunk: () => Record<string, unknown>,
+  ) {
+    invoke.mockImplementation((command: string) => {
+      if (command === "voice_wake_start") return Promise.resolve(wakeStart);
+      if (command === "voice_wake_chunk") return Promise.resolve(chunk());
+      if (command === "voice_stream_start")
+        return Promise.resolve({ streaming: true });
+      if (command === "voice_stream_chunk")
+        return Promise.resolve({ speech_prob: 0.8 });
+      if (command === "microphone_state") return Promise.resolve(projection);
+      return Promise.resolve({});
+    });
+  }
+
+  /** 320 samples at 16 kHz is one 20 ms wake frame. */
+  async function emitWakeFrames(count: number) {
+    const node = MockWorkletNode.instances[0];
+    expect(node).toBeDefined();
+    await act(async () => {
+      for (let index = 0; index < count; index += 1)
+        node?.emit(new Float32Array(320).fill(0.3));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  function renderVoice(config: AppConfig, onBargeIn: () => void) {
+    // Stable callback identities: a fresh `onProjection` per render would
+    // re-run the unmount cleanup and tear the wake stream down.
+    const onTranscript = vi.fn();
+    const onProjection = vi.fn();
+    return renderHook(
+      ({ playback }: { playback: VoicePlaybackContext }) =>
+        useVoiceCapture(
+          config,
+          onTranscript,
+          onProjection,
+          undefined,
+          true,
+          false,
+          { ...playback, onBargeIn },
+        ),
+      { initialProps: { playback: idlePlayback } },
+    );
+  }
+
+  beforeEach(() => invoke.mockReset());
+
+  it("stops the sink and listens after 400 ms of speech through live playback", async () => {
+    installCaptureMocks(true, true);
+    installWakeInvoke({ fallback: "stt-match" }, () => ({
+      wake: false,
+      score: 0,
+      fallback: "stt-match",
+      speech_prob: 0.95,
+    }));
+    const onBargeIn = vi.fn();
+    const hook = renderVoice(voiceConfig(true), onBargeIn);
+
+    await act(async () => hook.result.current.armWake());
+    expect(hook.result.current.state).toBe("armed");
+    expect(hook.result.current.bargeIn.monitoring).toBe(false);
+
+    await act(async () => {
+      hook.rerender({ playback: { ...idlePlayback, active: true } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // The wake stream survives playback instead of being suspended.
+    expect(trackStop).not.toHaveBeenCalled();
+    expect(applyConstraints).toHaveBeenCalledWith({ echoCancellation: true });
+    await waitFor(() =>
+      expect(hook.result.current.bargeIn).toEqual({
+        enabled: true,
+        monitoring: true,
+        echoCancellation: "on",
+        duplex: "full",
+      }),
+    );
+
+    await emitWakeFrames(20);
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("voice_stop"));
+    await waitFor(() => expect(hook.result.current.state).toBe("listening"));
+    expect(onBargeIn).toHaveBeenCalledWith("speech");
+    act(() => hook.unmount());
+  });
+
+  it("never interrupts playback at or below the barge-in probability floor", async () => {
+    installCaptureMocks(true, true);
+    installWakeInvoke({ fallback: "stt-match" }, () => ({
+      wake: false,
+      score: 0,
+      fallback: "stt-match",
+      speech_prob: 0.9,
+    }));
+    const onBargeIn = vi.fn();
+    const hook = renderVoice(voiceConfig(true), onBargeIn);
+
+    await act(async () => hook.result.current.armWake());
+    await act(async () => {
+      hook.rerender({ playback: { ...idlePlayback, active: true } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await emitWakeFrames(40);
+
+    expect(
+      invoke.mock.calls.some(([command]) => command === "voice_stop"),
+    ).toBe(false);
+    expect(onBargeIn).not.toHaveBeenCalled();
+    expect(hook.result.current.state).toBe("armed");
+    act(() => hook.unmount());
+  });
+
+  it("listens only between clauses when the device reports no echo cancellation", async () => {
+    installCaptureMocks(true, false);
+    installWakeInvoke({ fallback: "stt-match" }, () => ({
+      wake: false,
+      score: 0,
+      fallback: "stt-match",
+      speech_prob: 0.95,
+    }));
+    const onBargeIn = vi.fn();
+    const hook = renderVoice(voiceConfig(true), onBargeIn);
+
+    await act(async () => hook.result.current.armWake());
+    await act(async () => {
+      hook.rerender({ playback: { ...idlePlayback, active: true } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() =>
+      expect(hook.result.current.bargeIn).toEqual({
+        enabled: true,
+        monitoring: true,
+        echoCancellation: "off",
+        duplex: "half",
+      }),
+    );
+
+    invoke.mockClear();
+    await emitWakeFrames(30);
+    expect(
+      invoke.mock.calls.some(([command]) => command === "voice_wake_chunk"),
+    ).toBe(false);
+    expect(hook.result.current.state).toBe("armed");
+
+    await act(async () => {
+      hook.rerender({
+        playback: { ...idlePlayback, active: true, betweenClauses: true },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await emitWakeFrames(20);
+
+    expect(
+      invoke.mock.calls.some(([command]) => command === "voice_wake_chunk"),
+    ).toBe(true);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("voice_stop"));
+    await waitFor(() => expect(hook.result.current.state).toBe("listening"));
+    act(() => hook.unmount());
+  });
+
+  it("raises the wake score bar while our own speaker audio is in the room", async () => {
+    installCaptureMocks(true, true);
+    let score = 0.94;
+    installWakeInvoke({}, () => ({ wake: true, score }));
+    const onBargeIn = vi.fn();
+    const hook = renderVoice(voiceConfig(true), onBargeIn);
+
+    await act(async () => hook.result.current.armWake());
+    await act(async () => {
+      hook.rerender({ playback: { ...idlePlayback, active: true } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // 0.94 clears the configured 0.930 threshold but not the playback bar.
+    await emitWakeFrames(2);
+    expect(
+      invoke.mock.calls.some(([command]) => command === "voice_stop"),
+    ).toBe(false);
+    expect(hook.result.current.state).toBe("armed");
+
+    score = 0.98;
+    await emitWakeFrames(1);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("voice_stop"));
+    await waitFor(() => expect(hook.result.current.state).toBe("listening"));
+    expect(onBargeIn).toHaveBeenCalledWith("wake");
+    act(() => hook.unmount());
+  });
+
+  it("derives the barge-in threshold and UI string from measured state", () => {
+    expect(bargeInWakeThresholdMilli(930)).toBe(965);
+    expect(bargeInWakeThresholdMilli(0)).toBe(500);
+    expect(bargeInWakeThresholdMilli(1_000)).toBe(1_000);
+    expect(bargeInWakeThresholdMilli(-50)).toBe(500);
+
+    const base = {
+      enabled: true,
+      monitoring: false,
+      echoCancellation: "unknown",
+      duplex: "full",
+    } as const;
+    expect(describeBargeIn({ ...base, enabled: false })).toBe("disabled");
+    expect(describeBargeIn(base)).toBe("enabled · not measured");
+    expect(describeBargeIn({ ...base, echoCancellation: "off" })).toBe(
+      "enabled · AEC off",
+    );
+    expect(
+      describeBargeIn({
+        ...base,
+        monitoring: true,
+        echoCancellation: "on",
+      }),
+    ).toBe("listening · AEC on");
+    expect(
+      describeBargeIn({
+        ...base,
+        monitoring: true,
+        echoCancellation: "off",
+        duplex: "half",
+      }),
+    ).toBe("listening · half-duplex (AEC off)");
+    expect(describeBargeIn({ ...base, monitoring: true })).toBe(
+      "listening · AEC unmeasured",
+    );
+  });
 });
