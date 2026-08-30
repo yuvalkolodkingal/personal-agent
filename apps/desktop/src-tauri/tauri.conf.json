@@ -21,11 +21,15 @@
         "fullscreen": false
       }
     ],
-    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'" }
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
+    }
   },
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/opencode"],
+    "externalBin": [
+      "binaries/opencode"
+    ],
     "resources": {
       "../../../packages/opencode-plugin/src/index.ts": "opencode-plugin/index.ts",
       "../../../scripts/voice-runtime.py": "voice-runtime/voice-runtime.py",
@@ -42,6 +46,26 @@
     "category": "Productivity",
     "shortDescription": "Safe, bounded, fully agentic desktop assistant",
     "longDescription": "Personal Agent combines a voice HUD with a durable workspace for goals, tasks, approvals, tools, memory, and automations.",
-    "copyright": "Copyright 2026 Personal Agent contributors"
+    "copyright": "Copyright 2026 Personal Agent contributors",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libayatana-appindicator3-1",
+          "librsvg2-2",
+          "libasound2t64 | libasound2"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "webkit2gtk4.1",
+          "gtk3",
+          "libappindicator-gtk3",
+          "librsvg2",
+          "alsa-lib"
+        ]
+      }
+    }
   }
 }
