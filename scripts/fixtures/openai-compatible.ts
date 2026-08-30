@@ -3,7 +3,7 @@
 
 type ChatMessage = { role?: unknown };
 type ChatTool = { name?: unknown; function?: { name?: unknown } };
-type ChatRequest = { messages?: ChatMessage[]; tools?: ChatTool[] };
+type ChatRequest = { model?: unknown; messages?: ChatMessage[]; tools?: ChatTool[] };
 type RequestMetadata = {
   bodyKeys: string[];
   hasToolResult: boolean;
@@ -47,6 +47,63 @@ function chunk(delta: unknown, finishReason: string | null = null): unknown {
   };
 }
 
+/**
+ * Terminal usage chunk in the shape a caller gets back after asking for
+ * `stream_options.include_usage`, including the cached-prompt breakdown and
+ * the provider-reported cost OpenRouter adds. Selected by model name so the
+ * default `deterministic` path stays byte-identical.
+ */
+function usageStream(): Response {
+  return eventStream([
+    chunk({ role: "assistant" }),
+    chunk({ content: "usage probe complete" }),
+    chunk({}, "stop"),
+    {
+      id: "chatcmpl_fixture",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deterministic-usage",
+      choices: [],
+      usage: {
+        prompt_tokens: 41,
+        prompt_tokens_details: { cached_tokens: 11 },
+        completion_tokens: 7,
+        total_tokens: 48,
+        cost: 0.00042,
+      },
+    },
+  ]);
+}
+
+/**
+ * A stream that keeps producing deltas for ~20 s and never finishes, so a
+ * client-side abort is observable rather than a race against a buffered body.
+ */
+function slowStream(): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    async start(controller): Promise<void> {
+      try {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk({ role: "assistant" }))}\n\n`));
+        for (let index = 0; index < 200; index += 1) {
+          await Bun.sleep(100);
+          const frame = JSON.stringify(chunk({ content: `tick ${index} ` }));
+          controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+        }
+        controller.close();
+      } catch {
+        // The client aborted; the stream is already torn down.
+      }
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream",
+    },
+  });
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
@@ -70,6 +127,10 @@ const server = Bun.serve({
       toolNames,
     });
     await Bun.write(metadataPath, `${JSON.stringify(requestMetadata)}\n`);
+    const model = typeof payload.model === "string" ? payload.model : "";
+    if (model === "deterministic-usage") return usageStream();
+    if (model === "deterministic-abort") return slowStream();
+
     if (hasToolResult && requestMetadata.length >= 3) {
       return eventStream([
         chunk({ role: "assistant" }),
