@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -59,6 +60,10 @@ class VoiceRuntime:
         self.turn_audio: list[float] = []
         self.embed_session = None
         self.embed_tokenizer = None
+        # STT-3 and DESK-5 populate these slots. Defining them now keeps the
+        # unload protocol stable before those optional GPU engines are installed.
+        self.faster_whisper = None
+        self.vision_grounding = None
 
     def _moonshine_marker(self) -> dict[str, Any]:
         marker = self.root / "moonshine.json"
@@ -272,8 +277,36 @@ class VoiceRuntime:
             "embed_ready": embed_model.is_file() and embed_tokenizer.is_file(),
             "moonshine_loaded": self.moonshine is not None,
             "qwen_loaded": self.qwen is not None,
+            "faster_whisper_loaded": self.faster_whisper is not None,
+            "vision_grounding_loaded": self.vision_grounding is not None,
             "embed_loaded": self.embed_session is not None,
         }
+
+    def unload(self, request: dict[str, Any]) -> dict[str, Any]:
+        model = str(request.get("model", "")).strip()
+        attributes = {
+            "qwen3-tts": "qwen",
+            "faster-whisper-large-v3-turbo-int8": "faster_whisper",
+            "vision-grounding": "vision_grounding",
+        }
+        attribute = attributes.get(model)
+        if attribute is None:
+            raise RuntimeError(f"unknown or CPU-only model cannot be unloaded: {model}")
+
+        resident = getattr(self, attribute)
+        setattr(self, attribute, None)
+        if model == "qwen3-tts":
+            self.qwen_kind = ""
+        was_loaded = resident is not None
+        del resident
+        gc.collect()
+        # A GPU-backed model necessarily imported torch while loading. Avoid
+        # importing it merely to acknowledge an idempotent unload on a fresh
+        # worker, which keeps this protocol command asset-independent.
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {"model": model, "unloaded": was_loaded, "loaded": False}
 
     def stt_start(self, request: dict[str, Any]) -> dict[str, Any]:
         self._load_moonshine([str(item) for item in request.get("vocabulary", [])])
@@ -400,6 +433,7 @@ class VoiceRuntime:
         command = str(request.get("command", ""))
         handlers = {
             "status": self.status,
+            "unload": lambda: self.unload(request),
             "stt_start": lambda: self.stt_start(request),
             "stt_chunk": lambda: self.stt_chunk(request),
             "stt_stop": lambda: self.stt_stop(request),
