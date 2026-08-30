@@ -713,6 +713,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT"
+        }
+      ],
+      "name": "cfg_aliases",
+      "purl": "pkg:cargo/cfg_aliases@0.2.2",
+      "type": "library",
+      "version": "0.2.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -1041,6 +1053,18 @@
         }
       ],
       "name": "darling",
+      "purl": "pkg:cargo/darling@0.21.3",
+      "type": "library",
+      "version": "0.21.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "darling",
       "purl": "pkg:cargo/darling@0.23.0",
       "type": "library",
       "version": "0.23.0"
@@ -1053,9 +1077,33 @@
         }
       ],
       "name": "darling_core",
+      "purl": "pkg:cargo/darling_core@0.21.3",
+      "type": "library",
+      "version": "0.21.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "darling_core",
       "purl": "pkg:cargo/darling_core@0.23.0",
       "type": "library",
       "version": "0.23.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "darling_macro",
+      "purl": "pkg:cargo/darling_macro@0.21.3",
+      "type": "library",
+      "version": "0.21.3"
     },
     {
       "group": "crates.io",
@@ -1894,6 +1942,18 @@
       ],
       "name": "futures-util",
       "purl": "pkg:cargo/futures-util@0.3.34",
+      "type": "library",
+      "version": "0.3.34"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "futures",
+      "purl": "pkg:cargo/futures@0.3.34",
       "type": "library",
       "version": "0.3.34"
     },
@@ -3185,6 +3245,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT"
+        }
+      ],
+      "name": "nix",
+      "purl": "pkg:cargo/nix@0.30.1",
+      "type": "library",
+      "version": "0.30.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -3716,6 +3788,18 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
+      "name": "pastey",
+      "purl": "pkg:cargo/pastey@0.2.3",
+      "type": "library",
+      "version": "0.2.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
       "name": "percent-encoding",
       "purl": "pkg:cargo/percent-encoding@2.3.2",
       "type": "library",
@@ -4044,6 +4128,18 @@
       "purl": "pkg:cargo/proc-macro2@1.0.107",
       "type": "library",
       "version": "1.0.107"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "name": "process-wrap",
+      "purl": "pkg:cargo/process-wrap@8.2.1",
+      "type": "library",
+      "version": "8.2.1"
     },
     {
       "group": "crates.io",
@@ -4517,6 +4613,30 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT"
+        }
+      ],
+      "name": "rmcp-macros",
+      "purl": "pkg:cargo/rmcp-macros@0.10.0",
+      "type": "library",
+      "version": "0.10.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "rmcp",
+      "purl": "pkg:cargo/rmcp@0.10.0",
+      "type": "library",
+      "version": "0.10.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -4661,6 +4781,18 @@
       "group": "crates.io",
       "licenses": [
         {
+          "expression": "MIT"
+        }
+      ],
+      "name": "schemars_derive",
+      "purl": "pkg:cargo/schemars_derive@1.2.2",
+      "type": "library",
+      "version": "1.2.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
           "expression": "MIT OR Apache-2.0"
         }
       ],
@@ -4800,6 +4932,18 @@
       "purl": "pkg:cargo/serde_derive_internals@0.29.1",
       "type": "library",
       "version": "0.29.1"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "serde_derive_internals",
+      "purl": "pkg:cargo/serde_derive_internals@0.30.0",
+      "type": "library",
+      "version": "0.30.0"
     },
     {
       "group": "crates.io",
@@ -5136,6 +5280,18 @@
       "purl": "pkg:cargo/spki@0.7.3",
       "type": "library",
       "version": "0.7.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "sse-stream",
+      "purl": "pkg:cargo/sse-stream@0.2.5",
+      "type": "library",
+      "version": "0.2.5"
     },
     {
       "group": "crates.io",
@@ -5724,6 +5880,18 @@
       "purl": "pkg:cargo/tokio-macros@2.7.2",
       "type": "library",
       "version": "2.7.2"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "name": "tokio-stream",
+      "purl": "pkg:cargo/tokio-stream@0.1.19",
+      "type": "library",
+      "version": "0.1.19"
     },
     {
       "group": "crates.io",
@@ -7748,10 +7916,34 @@
           "expression": "SEE-PACKAGE"
         }
       ],
+      "name": "dompurify",
+      "purl": "pkg:npm/dompurify@3.4.14",
+      "type": "library",
+      "version": "3.4.14"
+    },
+    {
+      "group": "npm",
+      "licenses": [
+        {
+          "expression": "SEE-PACKAGE"
+        }
+      ],
       "name": "jsdom",
       "purl": "pkg:npm/jsdom@30.0.1",
       "type": "library",
       "version": "30.0.1"
+    },
+    {
+      "group": "npm",
+      "licenses": [
+        {
+          "expression": "SEE-PACKAGE"
+        }
+      ],
+      "name": "marked",
+      "purl": "pkg:npm/marked@18.0.11",
+      "type": "library",
+      "version": "18.0.11"
     },
     {
       "group": "npm",
@@ -7826,7 +8018,7 @@
       "version": "0.1.0"
     }
   },
-  "serialNumber": "urn:uuid:d5e7897b-be74-5e24-9680-34cf034e00e6",
+  "serialNumber": "urn:uuid:2075804e-e297-593a-8f10-aac9d5c46cb5",
   "specVersion": "1.6",
   "version": 1
 }

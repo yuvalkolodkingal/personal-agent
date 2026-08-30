@@ -1,4 +1,4 @@
-//! Persistent GUI MCP manager bound to the authenticated `OpenCode` MCP runtime.
+//! Persistent GUI MCP manager bound to the native `rmcp` MCP host.
 
 #![allow(clippy::needless_pass_by_value)] // Tauri deserializes and owns IPC arguments.
 #![allow(clippy::large_enum_variant)] // The tagged IPC enum is serialized only at the command boundary.
@@ -6,11 +6,11 @@
 use super::DesktopState;
 use async_trait::async_trait;
 use personal_agent_core::{EgressRecord, EgressSource};
+use personal_agent_mcp_host::{HostConfig, McpHost, ResolvedAdapter};
 use personal_agent_mcp_manager::{
-    AdapterError, CURRENT_PROTOCOL_VERSION, CapabilityCatalog, GatewayToolRequest, ImportSource,
-    InstalledRelease, InvocationContext, LifecycleState, McpManager, OperationConsent,
-    PackageAdapter, ProtocolVersion, RuntimeAdapter, RuntimeHandshake, ServerDefinition,
-    ToolAnnotations, ToolDescriptor, ToolRoute, TransportDefinition, import_server_json,
+    AdapterError, CURRENT_PROTOCOL_VERSION, GatewayToolRequest, ImportSource, InstalledRelease,
+    InvocationContext, LifecycleState, McpManager, OperationConsent, PackageAdapter,
+    ServerDefinition, ToolDescriptor, ToolRoute, TransportDefinition, import_server_json,
 };
 use personal_agent_policy::{
     ConsentGrant, DataZone, Effect, Idempotency, Risk, ToolDescriptor as PolicyToolDescriptor,
@@ -35,9 +35,11 @@ pub(crate) struct McpHostState {
     manager: Mutex<Arc<McpManager>>,
     persistence: Arc<McpPersistence>,
     oauth_attempts: Mutex<OAuthAttemptRegistry>,
+    /// Native transports. This host owns every MCP process and network handle;
+    /// the sidecar no longer sees MCP configuration at all.
+    host: Arc<McpHost>,
 }
 
-const MCP_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(330);
 const MCP_OAUTH_ATTEMPT_TTL: Duration = Duration::from_secs(360);
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -178,7 +180,7 @@ impl OAuthAttemptRegistry {
 }
 
 impl McpHostState {
-    pub(crate) fn load(app_data: &Path) -> Result<Self, String> {
+    pub(crate) fn load(app_data: &Path, working_directory: &Path) -> Result<Self, String> {
         let path = app_data.join("mcp/manager.json");
         let mut manager = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
@@ -187,11 +189,14 @@ impl McpHostState {
             McpManager::default()
         };
         manager.recover_after_restart();
+        let host = McpHost::new(HostConfig::new(working_directory))
+            .map_err(|error| format!("MCP host could not start: {error}"))?;
         let state = Self {
             path,
             manager: Mutex::new(Arc::new(manager)),
             persistence: Arc::new(McpPersistence::default()),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
+            host: Arc::new(host),
         };
         Ok(state)
     }
@@ -419,28 +424,23 @@ pub(crate) async fn mcp_manager_execute(
             result.message = Some("Imported MCP definitions as disabled drafts.".into());
         }
         ManagerAction::Connect { server_id } => {
-            if let Err(error) = connect_server(&host, &desktop, server_id).await {
+            if let Err(error) = connect_server(&host, server_id).await {
                 record_connection_failure(&host, &app, server_id, &error)?;
                 if is_authentication_required(&host, server_id)? {
-                    result.message = Some(oauth_result_message(
-                        start_oauth(&host, &desktop, server_id).await?,
-                    ));
+                    result.message = Some(start_oauth(&host, server_id)?);
                 } else {
                     return Err(error);
                 }
             } else {
-                result.message =
-                    Some("Server connected through the local OpenCode runtime.".into());
+                result.message = Some("Server connected.".into());
             }
         }
         ManagerAction::Restart { server_id } => {
-            disconnect_runtime(&desktop, &host, server_id).await.ok();
-            if let Err(error) = connect_server(&host, &desktop, server_id).await {
+            disconnect_server(&host, server_id).await.ok();
+            if let Err(error) = connect_server(&host, server_id).await {
                 record_connection_failure(&host, &app, server_id, &error)?;
                 if is_authentication_required(&host, server_id)? {
-                    result.message = Some(oauth_result_message(
-                        start_oauth(&host, &desktop, server_id).await?,
-                    ));
+                    result.message = Some(start_oauth(&host, server_id)?);
                 } else {
                     return Err(error);
                 }
@@ -449,19 +449,20 @@ pub(crate) async fn mcp_manager_execute(
             }
         }
         ManagerAction::Disable { server_id } => {
-            disconnect_runtime(&desktop, &host, server_id).await?;
+            disconnect_server(&host, server_id).await?;
             result.message = Some("Server disabled; configuration was retained.".into());
         }
         ManagerAction::Health { server_id } => {
-            let start = Instant::now();
-            let response = runtime_mcp_state(&desktop).await;
-            let latency = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let definition = server_definition(&host, server_id)?;
+            let measured = host.host.health(&definition).await;
+            let healthy = measured.is_ok();
             with_manager(&host, |manager| {
-                let mut adapter = StaticRuntimeAdapter::health(response.is_ok(), latency);
-                manager.check_health(server_id, &mut adapter).map(|_| ())
+                manager
+                    .check_health(server_id, &mut ResolvedAdapter::measured(measured))
+                    .map(|_| ())
             })?;
             result.message = Some(
-                if response.is_ok() {
+                if healthy {
                     "Server is healthy."
                 } else {
                     "Health check failed."
@@ -635,6 +636,7 @@ pub(crate) async fn mcp_manager_execute(
                     let operation = request.tool_name.clone();
                     let start = Instant::now();
                     let content = execute_through_tool_gateway(
+                        Arc::clone(&host.host),
                         &definition,
                         &advertised_tool,
                         request,
@@ -692,16 +694,14 @@ pub(crate) async fn mcp_manager_execute(
         }
         ManagerAction::StartOauth { server_id } => {
             if !is_authentication_required(&host, server_id)?
-                && let Err(error) = connect_server(&host, &desktop, server_id).await
+                && let Err(error) = connect_server(&host, server_id).await
             {
                 record_connection_failure(&host, &app, server_id, &error)?;
                 if !is_authentication_required(&host, server_id)? {
                     return Err(error);
                 }
             }
-            result.message = Some(oauth_result_message(
-                start_oauth(&host, &desktop, server_id).await?,
-            ));
+            result.message = Some(start_oauth(&host, server_id)?);
         }
         ManagerAction::OpenKeychainSetup {
             server_id,
@@ -817,11 +817,13 @@ fn is_authentication_required(host: &McpHostState, server_id: Uuid) -> Result<bo
     })
 }
 
-async fn start_oauth(
-    host: &McpHostState,
-    desktop: &DesktopState,
-    server_id: Uuid,
-) -> Result<OAuthStartResult, String> {
+/// Remote MCP sign-in.
+///
+/// The sidecar's `/mcp/{name}/auth/authenticate` route is gone with the rest of
+/// the `OpenCode` MCP runtime. Native RFC 8414 discovery, RFC 7591 registration,
+/// and PKCE live in `crates/mcp-host` (INT-2); until that lands this returns an
+/// explicit reason and remediation rather than silently doing nothing.
+fn start_oauth(host: &McpHostState, server_id: Uuid) -> Result<String, String> {
     let server = read_manager(host, |manager| manager.server(server_id).cloned())?;
     if !matches!(
         server.definition.transport,
@@ -830,65 +832,17 @@ async fn start_oauth(
         return Err("OAuth is available only for remote MCP servers".into());
     }
     let Some(_attempt) = OAuthAttemptGuard::reserve(host, server_id)? else {
-        return Ok(OAuthStartResult::AlreadyInProgress);
+        return Ok(MCP_OAUTH_IN_PROGRESS.to_owned());
     };
-    let directory = desktop
-        .config
-        .read()
-        .map_err(|_| "configuration lock is poisoned".to_owned())?
-        .runtime
-        .working_directory
-        .clone();
-    // `authenticate` owns OpenCode's callback waiter for up to five minutes.
-    // Clone the authenticated API client so this long wait never holds the
-    // runtime lifecycle mutex and block chat/session operations.
-    let runtime_api = {
-        let runtime = desktop.runtime.lock().await;
-        runtime.api_client().map_err(|error| error.to_string())?
-    };
-    runtime_api
-        .request_json_with_timeout(
-            reqwest::Method::POST,
-            &oauth_authenticate_route(&server.definition.namespace),
-            &[("directory", directory)],
-            None,
-            Some(MCP_OAUTH_CALLBACK_TIMEOUT),
-        )
-        .await
-        .map_err(|error| {
-            format!(
-                "MCP sign-in did not complete: {error}. Close any stale or expired authorization pages, then retry Sign in."
-            )
-        })?;
-    connect_server(host, desktop, server_id)
-        .await
-        .map_err(|error| {
-            format!("Sign-in completed, but the MCP server could not connect: {error}")
-        })?;
-    Ok(OAuthStartResult::Connected)
+    Err(format!(
+        "{} needs browser sign-in, which the native MCP host cannot start yet. \
+         Supply a bearer token as a header binding for this server, or wait for native MCP OAuth.",
+        server.definition.name
+    ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OAuthStartResult {
-    Connected,
-    AlreadyInProgress,
-}
-
-fn oauth_result_message(result: OAuthStartResult) -> String {
-    match result {
-        OAuthStartResult::Connected => {
-            "Sign-in completed and the MCP server connected.".into()
-        }
-        OAuthStartResult::AlreadyInProgress => {
-            "Sign-in is already in progress. Finish the existing browser authorization; a second flow was not started."
-                .into()
-        }
-    }
-}
-
-fn oauth_authenticate_route(namespace: &str) -> String {
-    format!("/mcp/{namespace}/auth/authenticate")
-}
+/// Shown when a second sign-in is requested while one is already open.
+const MCP_OAUTH_IN_PROGRESS: &str = "Sign-in is already in progress. Finish the existing browser authorization; a second flow was not started.";
 
 struct OAuthAttemptGuard<'a> {
     host: &'a McpHostState,
@@ -989,6 +943,7 @@ fn policy_descriptor(tool: &ToolDescriptor) -> PolicyToolDescriptor {
 
 struct McpGatewayImplementation {
     descriptor: PolicyToolDescriptor,
+    host: Arc<McpHost>,
     definition: ServerDefinition,
     tool_name: String,
     timeout_ms: u64,
@@ -1017,21 +972,23 @@ impl ToolImplementation for McpGatewayImplementation {
     async fn execute(&self, call: &ToolCall) -> Result<Value, ToolError> {
         tokio::time::timeout(
             std::time::Duration::from_millis(self.timeout_ms),
-            test_mcp_tool(&self.definition, &self.tool_name, call.input.clone()),
+            self.host
+                .call_tool(&self.definition, &self.tool_name, call.input.clone()),
         )
         .await
         .map_err(|_| ToolError::Execution("MCP tool exceeded its policy timeout".into()))?
-        .map_err(ToolError::Execution)
+        .map_err(|error| ToolError::Execution(error.message))
     }
 
     async fn verify(&self, _call: &ToolCall, _output: &Value) -> Result<(), ToolError> {
-        // Transport helpers accept only successful MCP JSON-RPC results, which
-        // is the observable postcondition for this explicit test invocation.
+        // The native host accepts only successful MCP results and rejects any
+        // `isError` payload, which is the observable postcondition here.
         Ok(())
     }
 }
 
 async fn execute_through_tool_gateway(
+    host: Arc<McpHost>,
     definition: &ServerDefinition,
     advertised_tool: &ToolDescriptor,
     request: GatewayToolRequest,
@@ -1042,6 +999,7 @@ async fn execute_through_tool_gateway(
     let effect = descriptor.effect;
     let implementation = Arc::new(McpGatewayImplementation {
         descriptor,
+        host,
         definition: definition.clone(),
         tool_name: request.tool_name,
         timeout_ms: request.timeout_ms,
@@ -1085,80 +1043,31 @@ async fn execute_through_tool_gateway(
         .map_err(|error| error.to_string())
 }
 
-async fn connect_server(
-    host: &McpHostState,
-    desktop: &DesktopState,
-    server_id: Uuid,
-) -> Result<(), String> {
-    let definition = read_manager(host, |manager| {
+fn server_definition(host: &McpHostState, server_id: Uuid) -> Result<ServerDefinition, String> {
+    read_manager(host, |manager| {
         manager
             .server(server_id)
             .map(|server| server.definition.clone())
-    })?;
-    let entry = opencode_mcp_entry(&definition)?;
-    let directory = desktop
-        .config
-        .read()
-        .map_err(|_| "configuration lock is poisoned".to_owned())?
-        .runtime
-        .working_directory
-        .clone();
-    let query = [("directory", directory)];
-    let runtime = desktop.runtime.lock().await;
-    let state = runtime
-        .request_json(
-            reqwest::Method::POST,
-            "/mcp",
-            &query,
-            Some(json!({"name": definition.namespace.clone(), "config": entry})),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    drop(runtime);
-    let catalog = catalog_from_runtime(&definition.namespace, &state);
-    with_manager(host, |manager| {
-        let runtime_server = state.get(&definition.namespace).unwrap_or(&state);
-        let runtime_status = runtime_server
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("failed");
-        let mut adapter = match runtime_status {
-            "connected" => {
-                StaticRuntimeAdapter::connected(definition.supported_protocols.clone(), catalog)
-            }
-            "needs_auth" | "needs_client_registration" => {
-                StaticRuntimeAdapter::connection_failure(AdapterError {
-                    code: "authentication_required".into(),
-                    message: "This MCP server requires browser sign-in".into(),
-                    authentication_required: true,
-                })
-            }
-            "disabled" => StaticRuntimeAdapter::connection_failure(adapter_error(
-                "runtime_disabled",
-                "OpenCode registered the MCP server in a disabled state",
-            )),
-            _ => StaticRuntimeAdapter::connection_failure(adapter_error(
-                "runtime_failed",
-                runtime_server
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("OpenCode could not connect the MCP server"),
-            )),
-        };
-        manager.connect(server_id, &mut adapter)
     })
 }
 
-/// Rehydrates persisted desired-enabled definitions into the fresh `OpenCode`
-/// sidecar. One broken server cannot prevent the remaining runtime from
-/// completing startup.
+/// Opens a native MCP session and replays the outcome into the manager.
+async fn connect_server(host: &McpHostState, server_id: Uuid) -> Result<(), String> {
+    let definition = server_definition(host, server_id)?;
+    let outcome = host.host.connect(&definition).await;
+    with_manager(host, |manager| {
+        manager.connect(server_id, &mut ResolvedAdapter::connected(outcome))
+    })
+}
+
+/// Rehydrates persisted desired-enabled definitions into the native host. One
+/// broken server cannot prevent the remaining servers from being restored.
 pub(crate) async fn restore_enabled_servers(
     host: &McpHostState,
-    desktop: &DesktopState,
 ) -> Result<personal_agent_mcp_manager::ManagerSnapshot, String> {
     let server_ids = read_manager(host, |manager| Ok(manager.enabled_server_ids()))?;
     for server_id in server_ids {
-        if let Err(error) = connect_server(host, desktop, server_id).await {
+        if let Err(error) = connect_server(host, server_id).await {
             tracing::warn!(%server_id, %error, "persisted MCP server could not be restored");
             preserve_auth_or_record_failure(host, server_id, &error)?;
         }
@@ -1166,211 +1075,15 @@ pub(crate) async fn restore_enabled_servers(
     read_manager(host, |manager| Ok(manager.snapshot()))
 }
 
-async fn disconnect_runtime(
-    desktop: &DesktopState,
-    host: &McpHostState,
-    server_id: Uuid,
-) -> Result<(), String> {
-    let definition = read_manager(host, |manager| {
-        manager
-            .server(server_id)
-            .map(|server| server.definition.clone())
-    })?;
-    let directory = desktop
-        .config
-        .read()
-        .map_err(|_| "configuration lock is poisoned".to_owned())?
-        .runtime
-        .working_directory
-        .clone();
-    let runtime = desktop.runtime.lock().await;
-    if let Err(error) = runtime
-        .request_json(
-            reqwest::Method::POST,
-            &format!("/mcp/{}/disconnect", definition.namespace),
-            &[("directory", directory.clone())],
-            None,
-        )
-        .await
-    {
-        tracing::warn!(%error, namespace = %definition.namespace, "OpenCode MCP disconnect reported an error");
+/// Terminates the native session and records the disabled state.
+async fn disconnect_server(host: &McpHostState, server_id: Uuid) -> Result<(), String> {
+    let definition = server_definition(host, server_id)?;
+    if let Err(error) = host.host.disconnect(&definition).await {
+        tracing::warn!(%server_id, code = %error.code, "native MCP disconnect reported an error");
     }
-    drop(runtime);
     with_manager(host, |manager| {
-        manager.disable(server_id, &mut StaticRuntimeAdapter::disconnected())
+        manager.disable(server_id, &mut ResolvedAdapter::disconnected())
     })
-}
-
-async fn runtime_mcp_state(desktop: &DesktopState) -> Result<Value, String> {
-    let directory = desktop
-        .config
-        .read()
-        .map_err(|_| "configuration lock is poisoned".to_owned())?
-        .runtime
-        .working_directory
-        .clone();
-    desktop
-        .runtime
-        .lock()
-        .await
-        .request_json(
-            reqwest::Method::GET,
-            "/mcp",
-            &[("directory", directory)],
-            None,
-        )
-        .await
-        .map_err(|error| error.to_string())
-}
-
-fn opencode_mcp_entry(definition: &ServerDefinition) -> Result<Value, String> {
-    match &definition.transport {
-        TransportDefinition::Stdio {
-            executable,
-            arguments,
-            working_directory,
-            environment,
-        } => {
-            let mut command = vec![executable.clone()];
-            command.extend(arguments.clone());
-            let mut env = serde_json::Map::new();
-            for binding in environment {
-                match &binding.value {
-                    personal_agent_mcp_manager::BindingValue::NonSecret { value } => { env.insert(binding.name.clone(), json!(value)); }
-                    personal_agent_mcp_manager::BindingValue::Keychain { .. } => return Err("OpenCode-managed stdio servers cannot receive keychain bindings until you complete keychain setup".into()),
-                }
-            }
-            Ok(
-                json!({"type": "local", "command": command, "environment": env, "enabled": true, "cwd": working_directory}),
-            )
-        }
-        TransportDefinition::StreamableHttp {
-            endpoint, headers, ..
-        }
-        | TransportDefinition::LegacySse {
-            endpoint, headers, ..
-        } => {
-            let mut values = serde_json::Map::new();
-            for header in headers {
-                match &header.value {
-                    personal_agent_mcp_manager::BindingValue::NonSecret { value } => {
-                        values.insert(header.name.clone(), json!(value));
-                    }
-                    personal_agent_mcp_manager::BindingValue::Keychain { .. } => {
-                        return Err(
-                            "Complete keychain/OAuth setup before connecting this remote server"
-                                .into(),
-                        );
-                    }
-                }
-            }
-            Ok(json!({"type": "remote", "url": endpoint, "headers": values, "enabled": true}))
-        }
-    }
-}
-
-fn catalog_from_runtime(namespace: &str, state: &Value) -> CapabilityCatalog {
-    let server = state.get(namespace).unwrap_or(state);
-    let tools = server
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| {
-            let name = tool.get("name").and_then(Value::as_str)?.to_owned();
-            Some(ToolDescriptor {
-                resolved_name: format!("{namespace}.{name}"),
-                name,
-                title: tool.get("title").and_then(Value::as_str).map(str::to_owned),
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                input_schema: tool
-                    .get("inputSchema")
-                    .or_else(|| tool.get("input_schema"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object"})),
-                output_schema: tool
-                    .get("outputSchema")
-                    .or_else(|| tool.get("output_schema"))
-                    .cloned(),
-                annotations: ToolAnnotations::default(),
-            })
-        })
-        .collect();
-    CapabilityCatalog {
-        tools,
-        ..CapabilityCatalog::default()
-    }
-}
-
-struct StaticRuntimeAdapter {
-    handshake: Option<RuntimeHandshake>,
-    connection_error: Option<AdapterError>,
-    health: Result<u64, AdapterError>,
-}
-
-impl StaticRuntimeAdapter {
-    fn connected(protocols: BTreeSet<ProtocolVersion>, catalog: CapabilityCatalog) -> Self {
-        Self {
-            handshake: Some(RuntimeHandshake {
-                server_protocols: protocols,
-                catalog,
-                latency_ms: 1,
-            }),
-            connection_error: None,
-            health: Ok(1),
-        }
-    }
-    fn connection_failure(error: AdapterError) -> Self {
-        Self {
-            handshake: None,
-            connection_error: Some(error),
-            health: Ok(0),
-        }
-    }
-    fn health(healthy: bool, latency: u64) -> Self {
-        Self {
-            handshake: None,
-            connection_error: None,
-            health: if healthy {
-                Ok(latency)
-            } else {
-                Err(adapter_error(
-                    "health_failed",
-                    "OpenCode MCP health endpoint failed",
-                ))
-            },
-        }
-    }
-    fn disconnected() -> Self {
-        Self {
-            handshake: None,
-            connection_error: None,
-            health: Ok(0),
-        }
-    }
-}
-
-impl RuntimeAdapter for StaticRuntimeAdapter {
-    fn connect(
-        &mut self,
-        _definition: &ServerDefinition,
-    ) -> Result<RuntimeHandshake, AdapterError> {
-        self.handshake.take().ok_or_else(|| {
-            self.connection_error.take().unwrap_or_else(|| {
-                adapter_error("not_initialized", "MCP handshake was unavailable")
-            })
-        })
-    }
-    fn health(&mut self, _definition: &ServerDefinition) -> Result<u64, AdapterError> {
-        self.health.clone()
-    }
-    fn disconnect(&mut self, _definition: &ServerDefinition) -> Result<(), AdapterError> {
-        Ok(())
-    }
 }
 
 fn adapter_error(code: &str, message: &str) -> AdapterError {
@@ -1458,138 +1171,91 @@ fn uninstall_command(
     }
 }
 
-async fn test_mcp_tool(
-    definition: &ServerDefinition,
-    tool: &str,
-    arguments: Value,
-) -> Result<Value, String> {
-    match &definition.transport {
-        TransportDefinition::StreamableHttp {
-            endpoint, headers, ..
-        } => {
-            let mut request = reqwest::Client::new().post(endpoint).header("Accept", "application/json, text/event-stream").json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":arguments}}));
-            for header in headers {
-                if let personal_agent_mcp_manager::BindingValue::NonSecret { value } = &header.value
-                {
-                    request = request.header(&header.name, value);
-                }
-            }
-            let response = request.send().await.map_err(|error| error.to_string())?;
-            let status = response.status();
-            let value = response
-                .json::<Value>()
-                .await
-                .map_err(|error| error.to_string())?;
-            if status.is_success() {
-                Ok(value.get("result").cloned().unwrap_or(value))
-            } else {
-                Err(format!("MCP HTTP {status}"))
-            }
-        }
-        TransportDefinition::LegacySse { .. } => {
-            Err("legacy SSE tool tests use the connected OpenCode agent runtime".into())
-        }
-        TransportDefinition::Stdio {
-            executable,
-            arguments: server_args,
-            environment,
-            working_directory,
-        } => {
-            test_stdio_tool(
-                executable,
-                server_args,
-                environment,
-                working_directory.as_deref(),
-                tool,
-                arguments,
-            )
-            .await
-        }
-    }
-}
-
-async fn test_stdio_tool(
-    executable: &str,
-    server_args: &[String],
-    environment: &[personal_agent_mcp_manager::EnvironmentBinding],
-    cwd: Option<&str>,
-    tool: &str,
-    arguments: Value,
-) -> Result<Value, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut command = tokio::process::Command::new(executable);
-    command
-        .args(server_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    for binding in environment {
-        if let personal_agent_mcp_manager::BindingValue::NonSecret { value } = &binding.value {
-            command.env(&binding.name, value);
-        }
-    }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "MCP stdin is unavailable".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "MCP stdout is unavailable".to_owned())?;
-    let messages = [
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":personal_agent_mcp_manager::CURRENT_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"Personal Agent","version":env!("CARGO_PKG_VERSION")}}}),
-        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
-    ];
-    for message in messages {
-        stdin
-            .write_all(
-                serde_json::to_string(&message)
-                    .map_err(|error| error.to_string())?
-                    .as_bytes(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    stdin.flush().await.map_err(|error| error.to_string())?;
-    let read = async {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
-            let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-            if value.get("id").and_then(Value::as_i64) == Some(2) {
-                return value.get("result").cloned().ok_or_else(|| {
-                    value
-                        .get("error")
-                        .cloned()
-                        .unwrap_or(Value::String("tool call failed".into()))
-                        .to_string()
-                });
-            }
-        }
-        Err("MCP server closed before returning the tool result".into())
-    };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), read)
-        .await
-        .map_err(|_| "MCP tool test timed out".to_owned())?;
-    let _ = child.kill().await;
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use personal_agent_mcp_manager::{
-        BindingValue, EnvironmentBinding, KeychainReference, LifecycleState, ServerSource,
+        BindingValue, CapabilityCatalog, EnvironmentBinding, KeychainReference, LifecycleState,
+        ProtocolVersion, RuntimeHandshake, ServerSource, ToolAnnotations,
     };
+    use std::process::Child;
+
+    /// Locates the bundled MCP echo fixture used by the transport tests.
+    fn fixture_script() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/fixtures/mcp-echo.ts")
+            .canonicalize()
+            .expect("the MCP echo fixture exists")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A Streamable HTTP echo server on a loopback port, killed with the test.
+    struct EchoFixture {
+        child: Child,
+        port: u16,
+    }
+
+    impl EchoFixture {
+        fn start() -> Self {
+            let mut child = Command::new("bun")
+                .arg(fixture_script())
+                .arg("--transport=http")
+                .arg("--port=0")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the bun fixture starts");
+            let stdout = child.stdout.take().expect("the fixture stdout is piped");
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+                .expect("the fixture announces its port");
+            let port = line
+                .trim()
+                .strip_prefix("listening ")
+                .and_then(|port| port.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected fixture banner: {line}"));
+            Self { child, port }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}/mcp", self.port)
+        }
+    }
+
+    impl Drop for EchoFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Builds a definition pointing at a live echo fixture.
+    fn fixture_definition(namespace: &str, fixture: &EchoFixture) -> ServerDefinition {
+        let mut definition = definition("Fixture", namespace);
+        let preferred = ProtocolVersion::new("2025-03-26").expect("a valid revision");
+        definition.supported_protocols = BTreeSet::from([preferred.clone()]);
+        definition.preferred_protocol = preferred;
+        definition.transport = TransportDefinition::StreamableHttp {
+            endpoint: fixture.endpoint(),
+            stateless: false,
+            headers: Vec::new(),
+            oauth: None,
+        };
+        definition
+    }
+
+    fn handshake(protocols: BTreeSet<ProtocolVersion>) -> RuntimeHandshake {
+        RuntimeHandshake {
+            server_protocols: protocols,
+            catalog: CapabilityCatalog::default(),
+            latency_ms: 3,
+        }
+    }
+
+    fn test_host(directory: &Path) -> McpHostState {
+        McpHostState::load(directory, directory).expect("the MCP host state loads")
+    }
 
     fn definition(name: &str, namespace: &str) -> ServerDefinition {
         let protocols = BTreeSet::from([
@@ -1623,11 +1289,11 @@ mod tests {
         let definition = definition("OAuth", "oauth");
         let id = definition.id;
         manager.add_server(definition).unwrap();
-        let mut adapter = StaticRuntimeAdapter::connection_failure(AdapterError {
+        let mut adapter = ResolvedAdapter::connected(Err(AdapterError {
             code: "authentication_required".into(),
             message: "Browser sign-in required".into(),
             authentication_required: true,
-        });
+        }));
         assert!(manager.connect(id, &mut adapter).is_err());
         let server = manager.server(id).unwrap();
         assert!(server.enabled);
@@ -1637,7 +1303,7 @@ mod tests {
     #[test]
     fn persisted_definition_and_desired_enabled_state_survive_host_reload() {
         let directory = tempfile::tempdir().unwrap();
-        let host = McpHostState::load(directory.path()).unwrap();
+        let host = test_host(directory.path());
         let definition = definition("Persistent", "persistent");
         let id = definition.id;
         let protocols = definition.supported_protocols.clone();
@@ -1645,7 +1311,7 @@ mod tests {
         with_manager(&host, |manager| {
             manager.connect(
                 id,
-                &mut StaticRuntimeAdapter::connected(protocols, CapabilityCatalog::default()),
+                &mut ResolvedAdapter::connected(Ok(handshake(protocols))),
             )
         })
         .unwrap();
@@ -1653,7 +1319,7 @@ mod tests {
 
         let manager_path = directory.path().join("mcp/manager.json");
         let persisted_before_reload = fs::read(&manager_path).unwrap();
-        let restored = McpHostState::load(directory.path()).unwrap();
+        let restored = test_host(directory.path());
         assert_eq!(fs::read(&manager_path).unwrap(), persisted_before_reload);
         let snapshot = read_manager(&restored, |manager| Ok(manager.snapshot())).unwrap();
         let server = snapshot
@@ -1686,6 +1352,9 @@ mod tests {
             manager: Mutex::new(Arc::new(McpManager::default())),
             persistence: Arc::new(McpPersistence::default()),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
+            host: Arc::new(
+                McpHost::new(HostConfig::new(directory.path())).expect("the MCP host starts"),
+            ),
         };
         let result = with_manager(&host, |manager| {
             manager.add_server(definition("Rejected", "rejected"))
@@ -1704,6 +1373,9 @@ mod tests {
             manager: Mutex::new(Arc::new(McpManager::default())),
             persistence: Arc::new(McpPersistence::default()),
             oauth_attempts: Mutex::new(OAuthAttemptRegistry::default()),
+            host: Arc::new(
+                McpHost::new(HostConfig::new(directory.path())).expect("the MCP host starts"),
+            ),
         };
 
         let result = with_manager_critical(&host, |manager| {
@@ -1720,7 +1392,7 @@ mod tests {
     #[test]
     fn mutation_burst_is_coalesced_into_one_mcp_snapshot_write() {
         let directory = tempfile::tempdir().unwrap();
-        let host = McpHostState::load(directory.path()).unwrap();
+        let host = test_host(directory.path());
         for index in 0..10 {
             with_manager(&host, |manager| {
                 manager.add_server(definition(
@@ -1732,7 +1404,7 @@ mod tests {
         }
         std::thread::sleep(SNAPSHOT_DEBOUNCE + Duration::from_millis(100));
         assert_eq!(host.persistence.successful_writes.load(Ordering::SeqCst), 1);
-        let restored = McpHostState::load(directory.path()).unwrap();
+        let restored = test_host(directory.path());
         assert_eq!(
             read_manager(&restored, |manager| Ok(manager.snapshot().servers.len())).unwrap(),
             10
@@ -1742,7 +1414,7 @@ mod tests {
     #[test]
     fn pending_mcp_snapshot_flushes_synchronously_for_shutdown() {
         let directory = tempfile::tempdir().unwrap();
-        let host = McpHostState::load(directory.path()).unwrap();
+        let host = test_host(directory.path());
         with_manager(&host, |manager| {
             manager.add_server(definition("Shutdown", "shutdown"))
         })
@@ -1753,7 +1425,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_sync_never_materializes_keychain_references_as_values() {
+    fn native_connect_never_materializes_keychain_references_as_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(directory.path());
         let mut definition = definition("Keychain", "keychain");
         definition.transport = TransportDefinition::Stdio {
             executable: "mcp-test".into(),
@@ -1770,9 +1444,14 @@ mod tests {
                 },
             }],
         };
-        let error = opencode_mcp_entry(&definition).unwrap_err();
-        assert!(error.contains("keychain"));
-        assert!(!error.contains("github-token"));
+        let error = personal_agent_mcp_manager::RuntimeAdapter::connect(
+            &mut host.host.adapter(),
+            &definition,
+        )
+        .expect_err("an unresolved keychain binding refuses the spawn");
+        assert!(error.authentication_required);
+        assert!(error.message.contains("keychain setup"));
+        assert!(!error.message.contains("GITHUB_TOKEN"));
     }
 
     #[test]
@@ -1796,15 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_uses_callback_owning_route_and_single_flight_state() {
-        let route = oauth_authenticate_route("composio");
-        assert_eq!(route, "/mcp/composio/auth/authenticate");
-        assert_ne!(route, "/mcp/composio/auth");
-        assert_eq!(
-            oauth_result_message(OAuthStartResult::Connected),
-            "Sign-in completed and the MCP server connected."
-        );
-
+    fn oauth_sign_in_is_single_flight_per_server() {
         let server_id = Uuid::new_v4();
         let other_server_id = Uuid::new_v4();
         let now = Instant::now();
@@ -1827,31 +1498,16 @@ mod tests {
 
     #[tokio::test]
     async fn ready_mcp_request_executes_through_gateway_and_redacts_output() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let response = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
-            let body =
-                r#"{"jsonrpc":"2.0","id":1,"result":{"token":"do-not-render","name":"visible"}}"#;
-            let message = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(message.as_bytes()).await.unwrap();
-        });
-        let mut definition = definition("Gateway", "gateway");
-        definition.transport = TransportDefinition::StreamableHttp {
-            endpoint: format!("http://{address}"),
-            stateless: true,
-            headers: Vec::new(),
-            oauth: None,
-        };
+        let fixture = EchoFixture::start();
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(directory.path());
+        let definition = fixture_definition("gateway", &fixture);
+        host.host
+            .connect(&definition)
+            .await
+            .expect("the fixture server connects natively");
         let advertised = ToolDescriptor {
-            name: "read".into(),
+            name: "echo".into(),
             title: None,
             description: "Read data".into(),
             input_schema: json!({"type":"object"}),
@@ -1862,28 +1518,34 @@ mod tests {
                 idempotent: true,
                 open_world: false,
             },
-            resolved_name: "gateway.read".into(),
+            resolved_name: "gateway.echo".into(),
         };
         let request = GatewayToolRequest {
             request_id: Uuid::new_v4(),
             server_id: definition.id,
-            tool_name: "read".into(),
-            resolved_name: "gateway.read".into(),
-            arguments: json!({}),
-            protocol_version: ProtocolVersion::current(),
+            tool_name: "echo".into(),
+            resolved_name: "gateway.echo".into(),
+            arguments: json!({"token":"do-not-render","name":"visible"}),
+            protocol_version: definition.preferred_protocol.clone(),
             execution_zone: "mcp-restricted".into(),
-            timeout_ms: 5_000,
-            max_output_bytes: 4_096,
+            timeout_ms: 20_000,
+            max_output_bytes: 8_192,
             requires_approval: false,
             destructive: false,
             open_world: false,
         };
-        let output = execute_through_tool_gateway(&definition, &advertised, request, false)
-            .await
-            .unwrap();
-        response.await.unwrap();
-        assert_eq!(output["token"], "[REDACTED]");
-        assert_eq!(output["name"], "visible");
+        let output = execute_through_tool_gateway(
+            Arc::clone(&host.host),
+            &definition,
+            &advertised,
+            request,
+            false,
+        )
+        .await
+        .unwrap();
+        let echoed = &output["structuredContent"]["echoed"];
+        assert_eq!(echoed["token"], "[REDACTED]");
+        assert_eq!(echoed["name"], "visible");
     }
 
     #[tokio::test]
@@ -1917,9 +1579,17 @@ mod tests {
             destructive: true,
             open_world: true,
         };
-        let error = execute_through_tool_gateway(&definition, &advertised, request, false)
-            .await
-            .unwrap_err();
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(directory.path());
+        let error = execute_through_tool_gateway(
+            Arc::clone(&host.host),
+            &definition,
+            &advertised,
+            request,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("requires approval"));
     }
 

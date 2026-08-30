@@ -1,0 +1,24 @@
+[package]
+name = "personal-agent-mcp-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+futures-util.workspace = true
+http.workspace = true
+personal-agent-mcp-manager = { path = "../mcp-manager", version = "=0.1.0" }
+reqwest.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sse-stream.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

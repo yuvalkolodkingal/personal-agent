@@ -21,6 +21,7 @@ personal-agent-contracts = { path = "../../../crates/contracts", version = "=0.1
 personal-agent-core = { path = "../../../crates/core", version = "=0.1.0" }
 personal-agent-migration = { path = "../../../crates/migration", version = "=0.1.0" }
 personal-agent-local-execution = { path = "../../../crates/local-execution", version = "=0.1.0" }
+personal-agent-mcp-host = { path = "../../../crates/mcp-host", version = "=0.1.0" }
 personal-agent-mcp-manager = { path = "../../../crates/mcp-manager", version = "=0.1.0" }
 personal-agent-platform = { path = "../../../crates/platform", version = "=0.1.0" }
 personal-agent-runtime = { path = "../../../crates/runtime", version = "=0.1.0" }

@@ -61,6 +61,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `cfb 0.7.3` — MIT — `pkg:cargo/cfb@0.7.3`
 - `cfg-expr 0.15.8` — MIT OR Apache-2.0 — `pkg:cargo/cfg-expr@0.15.8`
 - `cfg-if 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/cfg-if@1.0.4`
+- `cfg_aliases 0.2.2` — MIT — `pkg:cargo/cfg_aliases@0.2.2`
 - `chacha20 0.10.2` — MIT OR Apache-2.0 — `pkg:cargo/chacha20@0.10.2`
 - `chrono 0.4.45` — MIT OR Apache-2.0 — `pkg:cargo/chrono@0.4.45`
 - `cipher 0.4.4` — MIT OR Apache-2.0 — `pkg:cargo/cipher@0.4.4`
@@ -88,8 +89,11 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `ctor 0.8.0` — Apache-2.0 OR MIT — `pkg:cargo/ctor@0.8.0`
 - `curve25519-dalek-derive 0.1.1` — MIT/Apache-2.0 — `pkg:cargo/curve25519-dalek-derive@0.1.1`
 - `curve25519-dalek 4.1.3` — BSD-3-Clause — `pkg:cargo/curve25519-dalek@4.1.3`
+- `darling 0.21.3` — MIT — `pkg:cargo/darling@0.21.3`
 - `darling 0.23.0` — MIT — `pkg:cargo/darling@0.23.0`
+- `darling_core 0.21.3` — MIT — `pkg:cargo/darling_core@0.21.3`
 - `darling_core 0.23.0` — MIT — `pkg:cargo/darling_core@0.23.0`
+- `darling_macro 0.21.3` — MIT — `pkg:cargo/darling_macro@0.21.3`
 - `darling_macro 0.23.0` — MIT — `pkg:cargo/darling_macro@0.23.0`
 - `dashmap 6.1.0` — MIT — `pkg:cargo/dashmap@6.1.0`
 - `dasp_sample 0.11.0` — MIT OR Apache-2.0 — `pkg:cargo/dasp_sample@0.11.0`
@@ -160,6 +164,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `futures-sink 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-sink@0.3.34`
 - `futures-task 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-task@0.3.34`
 - `futures-util 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-util@0.3.34`
+- `futures 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures@0.3.34`
 - `gdk-pixbuf-sys 0.18.0` — MIT — `pkg:cargo/gdk-pixbuf-sys@0.18.0`
 - `gdk-pixbuf 0.18.5` — MIT — `pkg:cargo/gdk-pixbuf@0.18.5`
 - `gdk-sys 0.18.2` — MIT — `pkg:cargo/gdk-sys@0.18.2`
@@ -267,6 +272,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `ndk-sys 0.6.0+11769913` — MIT OR Apache-2.0 — `pkg:cargo/ndk-sys@0.6.0+11769913`
 - `ndk 0.9.0` — MIT OR Apache-2.0 — `pkg:cargo/ndk@0.9.0`
 - `new_debug_unreachable 1.0.6` — MIT — `pkg:cargo/new_debug_unreachable@1.0.6`
+- `nix 0.30.1` — MIT — `pkg:cargo/nix@0.30.1`
 - `notify-rust 4.18.0` — MIT OR Apache-2.0 — `pkg:cargo/notify-rust@4.18.0`
 - `nu-ansi-term 0.50.3` — MIT — `pkg:cargo/nu-ansi-term@0.50.3`
 - `num-bigint 0.4.8` — MIT OR Apache-2.0 — `pkg:cargo/num-bigint@0.4.8`
@@ -311,6 +317,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `parking 2.2.1` — Apache-2.0 OR MIT — `pkg:cargo/parking@2.2.1`
 - `parking_lot 0.12.5` — MIT OR Apache-2.0 — `pkg:cargo/parking_lot@0.12.5`
 - `parking_lot_core 0.9.12` — MIT OR Apache-2.0 — `pkg:cargo/parking_lot_core@0.9.12`
+- `pastey 0.2.3` — MIT OR Apache-2.0 — `pkg:cargo/pastey@0.2.3`
 - `percent-encoding 2.3.2` — MIT OR Apache-2.0 — `pkg:cargo/percent-encoding@2.3.2`
 - `petgraph 0.8.3` — MIT OR Apache-2.0 — `pkg:cargo/petgraph@0.8.3`
 - `phf 0.13.1` — MIT — `pkg:cargo/phf@0.13.1`
@@ -339,6 +346,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `proc-macro-error-attr 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro-error-attr@1.0.4`
 - `proc-macro-error 1.0.4` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro-error@1.0.4`
 - `proc-macro2 1.0.107` — MIT OR Apache-2.0 — `pkg:cargo/proc-macro2@1.0.107`
+- `process-wrap 8.2.1` — Apache-2.0 OR MIT — `pkg:cargo/process-wrap@8.2.1`
 - `progenitor-client 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-client@0.14.0`
 - `progenitor-impl 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-impl@0.14.0`
 - `progenitor-macro 0.14.0` — MPL-2.0 — `pkg:cargo/progenitor-macro@0.14.0`
@@ -378,6 +386,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `regex 1.13.1` — MIT OR Apache-2.0 — `pkg:cargo/regex@1.13.1`
 - `regress 0.11.1` — MIT OR Apache-2.0 — `pkg:cargo/regress@0.11.1`
 - `reqwest 0.13.4` — MIT OR Apache-2.0 — `pkg:cargo/reqwest@0.13.4`
+- `rmcp-macros 0.10.0` — MIT — `pkg:cargo/rmcp-macros@0.10.0`
+- `rmcp 0.10.0` — MIT — `pkg:cargo/rmcp@0.10.0`
 - `rodio 0.21.1` — MIT OR Apache-2.0 — `pkg:cargo/rodio@0.21.1`
 - `rusqlite 0.40.2` — MIT — `pkg:cargo/rusqlite@0.40.2`
 - `rustc-hash 2.1.3` — Apache-2.0 OR MIT — `pkg:cargo/rustc-hash@2.1.3`
@@ -390,6 +400,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `schemars 0.9.0` — MIT — `pkg:cargo/schemars@0.9.0`
 - `schemars 1.2.2` — MIT — `pkg:cargo/schemars@1.2.2`
 - `schemars_derive 0.8.22` — MIT — `pkg:cargo/schemars_derive@0.8.22`
+- `schemars_derive 1.2.2` — MIT — `pkg:cargo/schemars_derive@1.2.2`
 - `scopeguard 1.2.0` — MIT OR Apache-2.0 — `pkg:cargo/scopeguard@1.2.0`
 - `secrecy 0.10.3` — Apache-2.0 OR MIT — `pkg:cargo/secrecy@0.10.3`
 - `secret-service 5.1.0` — MIT OR Apache-2.0 — `pkg:cargo/secret-service@5.1.0`
@@ -402,6 +413,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `serde_core 1.0.229` — MIT OR Apache-2.0 — `pkg:cargo/serde_core@1.0.229`
 - `serde_derive 1.0.229` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive@1.0.229`
 - `serde_derive_internals 0.29.1` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive_internals@0.29.1`
+- `serde_derive_internals 0.30.0` — MIT OR Apache-2.0 — `pkg:cargo/serde_derive_internals@0.30.0`
 - `serde_json 1.0.151` — MIT OR Apache-2.0 — `pkg:cargo/serde_json@1.0.151`
 - `serde_repr 0.1.21` — MIT OR Apache-2.0 — `pkg:cargo/serde_repr@0.1.21`
 - `serde_spanned 0.6.9` — MIT OR Apache-2.0 — `pkg:cargo/serde_spanned@0.6.9`
@@ -430,6 +442,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `soup3-sys 0.5.0` — MIT — `pkg:cargo/soup3-sys@0.5.0`
 - `soup3 0.5.0` — MIT — `pkg:cargo/soup3@0.5.0`
 - `spki 0.7.3` — Apache-2.0 OR MIT — `pkg:cargo/spki@0.7.3`
+- `sse-stream 0.2.5` — MIT OR Apache-2.0 — `pkg:cargo/sse-stream@0.2.5`
 - `stable_deref_trait 1.2.1` — MIT OR Apache-2.0 — `pkg:cargo/stable_deref_trait@1.2.1`
 - `string_cache 0.9.0` — MIT OR Apache-2.0 — `pkg:cargo/string_cache@0.9.0`
 - `string_cache_codegen 0.6.1` — MIT OR Apache-2.0 — `pkg:cargo/string_cache_codegen@0.6.1`
@@ -479,6 +492,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `tinyvec 1.12.0` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/tinyvec@1.12.0`
 - `tinyvec_macros 0.1.1` — MIT OR Apache-2.0 OR Zlib — `pkg:cargo/tinyvec_macros@0.1.1`
 - `tokio-macros 2.7.2` — MIT — `pkg:cargo/tokio-macros@2.7.2`
+- `tokio-stream 0.1.19` — MIT — `pkg:cargo/tokio-stream@0.1.19`
 - `tokio-tungstenite 0.30.0` — MIT — `pkg:cargo/tokio-tungstenite@0.30.0`
 - `tokio-util 0.7.19` — MIT — `pkg:cargo/tokio-util@0.7.19`
 - `tokio 1.53.1` — MIT — `pkg:cargo/tokio@1.53.1`
@@ -647,7 +661,9 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `@vitejs/plugin-react 6.1.0` — SEE-PACKAGE — `pkg:npm/%40vitejs/plugin-react@6.1.0`
 - `@xterm/addon-fit 0.11.0` — SEE-PACKAGE — `pkg:npm/%40xterm/addon-fit@0.11.0`
 - `@xterm/xterm 6.0.0` — SEE-PACKAGE — `pkg:npm/%40xterm/xterm@6.0.0`
+- `dompurify 3.4.14` — SEE-PACKAGE — `pkg:npm/dompurify@3.4.14`
 - `jsdom 30.0.1` — SEE-PACKAGE — `pkg:npm/jsdom@30.0.1`
+- `marked 18.0.11` — SEE-PACKAGE — `pkg:npm/marked@18.0.11`
 - `react-dom 19.2.8` — SEE-PACKAGE — `pkg:npm/react-dom@19.2.8`
 - `react 19.2.8` — SEE-PACKAGE — `pkg:npm/react@19.2.8`
 - `typescript 7.0.2` — SEE-PACKAGE — `pkg:npm/typescript@7.0.2`

@@ -503,6 +503,7 @@ struct DeferredNativeStates {
 
 async fn load_deferred_native_states(
     app_data: PathBuf,
+    working_directory: PathBuf,
     startup_readiness: perf::StartupReadiness,
 ) -> Result<DeferredNativeStates, String> {
     startup_readiness.wait_for_window_paint().await;
@@ -513,7 +514,7 @@ async fn load_deferred_native_states(
             || capabilities::CapabilityState::load(&app_data),
         ),
         mcp: perf::startup_phase("mcp_load", &tracing::info_span!("startup.mcp_load"), || {
-            mcp_host::McpHostState::load(&app_data)
+            mcp_host::McpHostState::load(&app_data, &working_directory)
         }),
     })
     .await
@@ -703,6 +704,8 @@ fn main() {
             )?;
             let runtime_emergency_control = sidecar.emergency_control();
             let deferred_app_data = app_data.clone();
+            let deferred_working_directory =
+                PathBuf::from(&config.config.runtime.working_directory);
             let startup_readiness = perf::StartupReadiness::default();
             perf::startup_phase(
                 "state_install",
@@ -784,6 +787,7 @@ fn main() {
                         };
                         let deferred_startup = load_deferred_native_states(
                             deferred_app_data,
+                            deferred_working_directory,
                             deferred_startup_readiness,
                         );
                         let (health, deferred_states) =
@@ -867,7 +871,7 @@ fn main() {
                             automation_host::ensure_resident_executor(handle.clone());
                             goals_host::ensure_resident_executor(handle.clone());
                             if let Some(mcp) = handle.try_state::<mcp_host::McpHostState>() {
-                                match mcp_host::restore_enabled_servers(&mcp, &state).await {
+                                match mcp_host::restore_enabled_servers(&mcp).await {
                                     Ok(snapshot) => {
                                         if let Err(error) =
                                             handle.emit("mcp-manager://changed", snapshot)
@@ -1030,6 +1034,7 @@ mod tests {
         let startup_readiness = perf::StartupReadiness::default();
         let gdbus_before = last_event_order(&parsed_perf_report(), "gdbus_probe", "start");
         let deferred = tokio::spawn(load_deferred_native_states(
+            directory.path().to_path_buf(),
             directory.path().to_path_buf(),
             startup_readiness.clone(),
         ));
