@@ -39,6 +39,11 @@
 | PERF-11 | DONE | PTY echo uses `pty-output:{id}` events with one revision-deduplicated replay and no poll timer; playback awaits a cancellable child; resident mutation/deadline/cancellation and shutdown-join tests pass; desktop Rust 80/80 and frontend 76/76 pass at the task boundary. | `78c4197` |
 | PERF-12 | DONE | Pinned Tauri 2.11.5 compiled raw `ipc::Request` bodies; exact PCM16LE decode/limit tests and ArrayBuffer/no-per-sample-JSON Vitest pass, with desktop Rust 81/81 and frontend 77/77 green. | `acaf82c` |
 | PERF-9 | DONE | The 4.5 GiB typed registry admits CPU fallbacks for free, evicts only idle GPU models in vision → STT → TTS order, and rejects active/stale evictions; the real Python worker protocol test verifies idempotent `unload`. Audio tests pass 27/27 with one pre-existing hardware/model-assets test ignored. | `bb19691` |
+| PERF-13 | DONE | Every non-chat destination is lazy-loaded behind one Suspense boundary; the deterministic bundle gate reports 79.67 KiB gzip at the task boundary, below the 300 KiB budget, and route/build tests pass. | `330d9bd` |
+| PERF-14 | DONE | The profiler regression batches 500 deltas into five revisions, renders a stable completed row once, retains a 200-row window, and pins scrolling; desktop tests pass 90/90. | `7903dda` |
+| STT-1 | DONE | Real pinned-model replay measured a 9.7×–9.99× openWakeWord CPU reduction versus Moonshine and sub-13 ms wake-event latency; protocol, asset-pin, and frontend tests pass. | `cd65019` |
+| STT-2 | DONE | Combined real-model replay measured 9.194× wake CPU reduction and 120.279 ms Smart Turn endpoint p95/max with 5/5 decisions; Silero state/framing and missing-model fallback tests pass. | `389ccbc` |
+| STT-4 | BLOCKED-HARDWARE | AudioWorklet capture emits exact 320-sample/16 kHz frames and raw 640-byte IPC; focused tests pass 15/15 and the task-boundary desktop suite passes 87/87. Native launch built and started, but physical-microphone partials could not be exercised and the user-data wake asset was absent. | `fde73c2` |
 
 ## Wave 1 gate
 
@@ -128,3 +133,26 @@ checks and tests pass (desktop 77/77), and the production build completes at 764
 gzip. Registry, pack, performance, fuzz, security, SBOM, and release-metadata verification all
 pass. The inherited exceptions remain unchanged: the Windows MSVC standard-library target is
 unavailable, and the bundle-size verifier is introduced by PERF-13 in the next wave.
+
+## Wave 7 gate
+
+Wave 7 passes the full §14 gate except the inherited unavailable Windows target. Dependency
+installation made no changes, the pinned OpenCode 1.18.23 sidecar verified, formatting and
+workspace clippy passed with warnings denied, and every locked workspace Rust test passed
+(desktop 86/86; audio 27 passed with one pre-existing hardware/model-assets test ignored; runtime
+17 passed with one pre-existing ignored live-sidecar test). Bun checks and tests passed (desktop
+17 files / 90 tests), and the production build completed at 264.34 kB / 82.39 kB gzip. PERF-13's
+new deterministic bundle verifier reports 80.46 KiB gzip, resolving the inherited missing-verifier
+failure and remaining below the 300 KiB budget. Registry, pack, performance, fuzz (6,144
+deterministic mutations), security, SBOM, and release-metadata verification all pass.
+
+The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
+`x86_64-pc-windows-msvc` standard library and no `rustup` with which to install it.
+
+STT-4 human handoff:
+
+```sh
+# Install the pinned wake assets into the configured user-data model directory, then:
+bunx tauri dev
+# Speak through a physical microphone and confirm partial transcripts arrive during speech.
+```
