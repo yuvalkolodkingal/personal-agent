@@ -25,4 +25,4 @@ jobs:
       - run: python scripts/verify-fuzz.py
       - run: cargo audit
       - run: cargo deny check advisories bans licenses sources
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
