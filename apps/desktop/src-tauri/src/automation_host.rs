@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt as _;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const RESIDENT_TICK_SECONDS: u64 = 5;
 const MAX_AUTOMATION_PROMPT_BYTES: usize = 65_536;
 const BACKGROUND_SYSTEM_PROMPT: &str = "This is a background automation run, not an interactive user turn. Treat the stored automation prompt as user-authored data, but never infer that the user is presently available. All tool calls remain subject to the native policy gateway. Do not perform a consequential or external effect without an explicit native approval; wait when approval is requested. Return a concise result suitable for an automation history entry.";
 
@@ -28,6 +28,9 @@ pub(crate) struct AutomationHostState {
     scheduler: tokio::sync::Mutex<Arc<Scheduler>>,
     persistence: Arc<SchedulerPersistence>,
     resident_active: AtomicBool,
+    resident_cancel: CancellationToken,
+    resident_wake: tokio::sync::Notify,
+    resident_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     recovered_runs: usize,
     last_notification_error: RwLock<Option<String>>,
 }
@@ -187,6 +190,9 @@ impl AutomationHostState {
             scheduler: tokio::sync::Mutex::new(Arc::new(scheduler)),
             persistence: Arc::new(SchedulerPersistence::default()),
             resident_active: AtomicBool::new(false),
+            resident_cancel: CancellationToken::new(),
+            resident_wake: tokio::sync::Notify::new(),
+            resident_task: Mutex::new(None),
             recovered_runs,
             last_notification_error: RwLock::new(None),
         })
@@ -197,6 +203,26 @@ impl AutomationHostState {
         profile: &Mutex<personal_agent_core::ProfileState>,
     ) -> Result<(), String> {
         self.persistence.flush(profile)
+    }
+
+    pub(crate) fn wake_resident(&self) {
+        self.resident_wake.notify_one();
+    }
+
+    pub(crate) async fn shutdown_resident(&self) {
+        self.resident_cancel.cancel();
+        self.resident_wake.notify_one();
+        let task = self
+            .resident_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "resident automation scheduler did not join cleanly");
+        }
+        self.resident_active.store(false, Ordering::SeqCst);
     }
 }
 
@@ -482,15 +508,90 @@ pub(crate) fn ensure_resident_executor(app: tauri::AppHandle) {
     if host.resident_active.swap(true, Ordering::SeqCst) {
         return;
     }
-    tauri::async_runtime::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(RESIDENT_TICK_SECONDS));
+    let cancellation = host.resident_cancel.clone();
+    let resident_app = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
         loop {
-            timer.tick().await;
-            if let Err(error) = resident_tick(&app).await {
-                tracing::warn!(%error, "resident automation tick failed");
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if let Err(error) = resident_tick(&resident_app).await {
+                tracing::warn!(%error, "resident automation wake failed");
+            }
+            let host = resident_app.state::<AutomationHostState>();
+            let desktop = resident_app.state::<DesktopState>();
+            let enabled = desktop
+                .config
+                .read()
+                .is_ok_and(|config| config.automation.enabled);
+            let delay = if enabled {
+                next_resident_delay(&host).await
+            } else {
+                None
+            };
+            match wait_for_resident_wake(&cancellation, &host.resident_wake, delay).await {
+                ResidentWake::Cancelled => break,
+                ResidentWake::Mutation => {}
+                ResidentWake::Deadline => {
+                    crate::perf::record_resident_timer_wake("automation");
+                }
             }
         }
+        resident_app
+            .state::<AutomationHostState>()
+            .resident_active
+            .store(false, Ordering::SeqCst);
     });
+    if let Ok(mut resident_task) = host.resident_task.lock() {
+        *resident_task = Some(task);
+    } else {
+        host.resident_cancel.cancel();
+        tracing::error!("resident automation task lock is poisoned");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentWake {
+    Cancelled,
+    Mutation,
+    Deadline,
+}
+
+async fn wait_for_resident_wake(
+    cancellation: &CancellationToken,
+    wake: &tokio::sync::Notify,
+    delay: Option<Duration>,
+) -> ResidentWake {
+    if let Some(delay) = delay {
+        tokio::select! {
+            () = cancellation.cancelled() => ResidentWake::Cancelled,
+            () = wake.notified() => ResidentWake::Mutation,
+            () = tokio::time::sleep(delay) => ResidentWake::Deadline,
+        }
+    } else {
+        tokio::select! {
+            () = cancellation.cancelled() => ResidentWake::Cancelled,
+            () = wake.notified() => ResidentWake::Mutation,
+        }
+    }
+}
+
+async fn next_resident_delay(host: &AutomationHostState) -> Option<Duration> {
+    let now = Utc::now();
+    let next_due = host
+        .scheduler
+        .lock()
+        .await
+        .snapshot()
+        .automations
+        .values()
+        .filter(|automation| automation.enabled)
+        .filter_map(|automation| automation.next_due_at)
+        .min()?;
+    if next_due <= now {
+        return Some(Duration::from_secs(1));
+    }
+    next_due.signed_duration_since(now).to_std().ok()
 }
 
 async fn resident_tick(app: &tauri::AppHandle) -> Result<(), String> {
@@ -505,7 +606,7 @@ async fn resident_tick(app: &tauri::AppHandle) -> Result<(), String> {
     {
         return Ok(());
     }
-    let queued = mutate_scheduler(&host, &desktop, |scheduler| {
+    let queued = mutate_scheduler_from_resident(&host, &desktop, |scheduler| {
         scheduler
             .evaluate(Utc::now())
             .map_err(|error| error.to_string())
@@ -878,7 +979,7 @@ async fn mutate_scheduler<T>(
     desktop: &DesktopState,
     operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
 ) -> Result<T, String> {
-    mutate_scheduler_with_urgency(host, desktop, false, operation).await
+    mutate_scheduler_with_urgency(host, desktop, false, true, operation).await
 }
 
 async fn mutate_scheduler_critical<T>(
@@ -886,13 +987,22 @@ async fn mutate_scheduler_critical<T>(
     desktop: &DesktopState,
     operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
 ) -> Result<T, String> {
-    mutate_scheduler_with_urgency(host, desktop, true, operation).await
+    mutate_scheduler_with_urgency(host, desktop, true, true, operation).await
+}
+
+async fn mutate_scheduler_from_resident<T>(
+    host: &AutomationHostState,
+    desktop: &DesktopState,
+    operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
+) -> Result<T, String> {
+    mutate_scheduler_with_urgency(host, desktop, false, false, operation).await
 }
 
 async fn mutate_scheduler_with_urgency<T>(
     host: &AutomationHostState,
     desktop: &DesktopState,
     critical: bool,
+    wake_resident: bool,
     operation: impl FnOnce(&mut Scheduler) -> Result<T, String>,
 ) -> Result<T, String> {
     let mut scheduler = host.scheduler.lock().await;
@@ -901,7 +1011,7 @@ async fn mutate_scheduler_with_urgency<T>(
         .write_gate
         .lock()
         .map_err(|_| "scheduler persistence write gate is poisoned".to_owned())?;
-    if critical {
+    let result = if critical {
         let mut candidate = Arc::clone(&scheduler);
         let result = operation(Arc::make_mut(&mut candidate))?;
         host.persistence.invalidate_pending();
@@ -929,7 +1039,11 @@ async fn mutate_scheduler_with_urgency<T>(
         host.persistence
             .queue(Arc::clone(&desktop.profile), snapshot);
         result
+    };
+    if result.is_ok() && wake_resident {
+        host.wake_resident();
     }
+    result
 }
 
 async fn snapshot_view(
@@ -1361,6 +1475,53 @@ mod tests {
                 .scheduler_snapshot()
                 .expect("snapshot")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_resident_automation_loop() {
+        let directory = tempfile::tempdir().expect("temp");
+        let profile = test_profile(&directory, "automation-resident-shutdown.db");
+        let host = {
+            let mut profile = profile.lock().expect("profile");
+            AutomationHostState::load(&mut profile).expect("automation host")
+        };
+        host.resident_active.store(true, Ordering::SeqCst);
+        let cancellation = host.resident_cancel.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_from_task = Arc::clone(&exited);
+        let task = tauri::async_runtime::spawn(async move {
+            cancellation.cancelled().await;
+            exited_from_task.store(true, Ordering::SeqCst);
+        });
+        *host.resident_task.lock().expect("resident task") = Some(task);
+
+        tokio::time::timeout(Duration::from_secs(1), host.shutdown_resident())
+            .await
+            .expect("resident automation loop shutdown");
+
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(!host.resident_active.load(Ordering::SeqCst));
+        assert!(host.resident_task.lock().expect("resident task").is_none());
+    }
+
+    #[tokio::test]
+    async fn resident_scheduler_wakes_for_mutation_deadline_and_cancellation() {
+        let cancellation = CancellationToken::new();
+        let wake = tokio::sync::Notify::new();
+        wake.notify_one();
+        assert_eq!(
+            wait_for_resident_wake(&cancellation, &wake, None).await,
+            ResidentWake::Mutation
+        );
+        assert_eq!(
+            wait_for_resident_wake(&cancellation, &wake, Some(Duration::from_millis(1)),).await,
+            ResidentWake::Deadline
+        );
+        cancellation.cancel();
+        assert_eq!(
+            wait_for_resident_wake(&cancellation, &wake, None).await,
+            ResidentWake::Cancelled
         );
     }
 }

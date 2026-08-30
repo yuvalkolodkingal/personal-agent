@@ -1449,8 +1449,7 @@ function ChatView({
         polling = false;
       }
     };
-    void poll();
-    const interval = window.setInterval(() => void poll(), 1000);
+    const interval = window.setInterval(() => void poll(), 15_000);
     const timeout = window.setTimeout(
       () =>
         finalizeTurn({

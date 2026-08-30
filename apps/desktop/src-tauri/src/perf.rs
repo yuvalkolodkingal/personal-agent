@@ -8,12 +8,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 const MAX_TURN_SAMPLES: usize = 512;
+const MAX_RESIDENT_WAKE_SAMPLES: usize = 512;
 
 #[derive(Default)]
 struct PerfSamples {
     startup_phases_microseconds: BTreeMap<String, u64>,
     startup_span_timeline: Vec<StartupSpanEvent>,
     turn_first_delta_microseconds: VecDeque<u64>,
+    resident_timer_last_wake: BTreeMap<String, Instant>,
+    resident_timer_intervals_microseconds: VecDeque<ResidentTimerInterval>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -21,6 +24,12 @@ struct StartupSpanEvent {
     order: u64,
     span: String,
     event: &'static str,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ResidentTimerInterval {
+    source: String,
+    interval_microseconds: u64,
 }
 
 /// One-shot renderer-paint barrier for probes that may block the native setup thread.
@@ -110,6 +119,26 @@ pub(crate) fn record_startup_phase(name: &'static str, duration: Duration) {
     );
 }
 
+/// Record only deadline-driven resident scheduler wakes. Mutation notifications
+/// and the latency-sensitive audio loop are intentionally excluded so this is
+/// an honest monotonic proxy for periodic idle wakeups, not an OS CPU counter.
+pub(crate) fn record_resident_timer_wake(source: &'static str) {
+    let now = Instant::now();
+    if let Ok(mut samples) = samples().lock()
+        && let Some(previous) = samples.resident_timer_last_wake.insert(source.into(), now)
+    {
+        if samples.resident_timer_intervals_microseconds.len() == MAX_RESIDENT_WAKE_SAMPLES {
+            samples.resident_timer_intervals_microseconds.pop_front();
+        }
+        samples
+            .resident_timer_intervals_microseconds
+            .push_back(ResidentTimerInterval {
+                source: source.into(),
+                interval_microseconds: duration_microseconds(now.duration_since(previous)),
+            });
+    }
+}
+
 /// One chat turn's monotonic latency clock.
 pub(crate) struct TurnTrace {
     id: u64,
@@ -174,6 +203,16 @@ pub(crate) fn report() -> Value {
         .copied()
         .collect::<Vec<_>>();
     first_delta.sort_unstable();
+    let minimum_resident_timer_interval = samples
+        .resident_timer_intervals_microseconds
+        .iter()
+        .map(|sample| sample.interval_microseconds)
+        .min();
+    let subsecond_resident_timer_wakeups = samples
+        .resident_timer_intervals_microseconds
+        .iter()
+        .filter(|sample| sample.interval_microseconds < 1_000_000)
+        .count();
     json!({
         "measurement": "live-process-monotonic",
         "last_cold_start": {
@@ -189,6 +228,14 @@ pub(crate) fn report() -> Value {
             "p95_microseconds": percentile(&first_delta, 95),
             "maximum_microseconds": first_delta.last().copied(),
             "sample_count": first_delta.len(),
+        },
+        "cpu_idle": {
+            "measurement": "resident-loop-monotonic-wakeup-proxy",
+            "scope": "non-audio timer deadlines; mutation notifications excluded",
+            "minimum_timer_interval_microseconds": minimum_resident_timer_interval,
+            "periodic_wakeups_below_1_second": subsecond_resident_timer_wakeups,
+            "passes_no_subsecond_periodic_wakeups": subsecond_resident_timer_wakeups == 0,
+            "samples": samples.resident_timer_intervals_microseconds,
         },
     })
 }
@@ -219,6 +266,29 @@ mod tests {
             report()
                 .pointer("/last_cold_start/phases_microseconds/perf_test")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn diagnostics_exposes_honest_resident_timer_idle_sampling() {
+        let report = report();
+        assert_eq!(
+            report
+                .pointer("/cpu_idle/measurement")
+                .and_then(Value::as_str),
+            Some("resident-loop-monotonic-wakeup-proxy")
+        );
+        assert_eq!(
+            report
+                .pointer("/cpu_idle/passes_no_subsecond_periodic_wakeups")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            report
+                .pointer("/cpu_idle/scope")
+                .and_then(Value::as_str)
+                .is_some_and(|scope| scope.contains("audio"))
         );
     }
 }

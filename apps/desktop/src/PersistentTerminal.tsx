@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -201,32 +202,47 @@ export function PersistentTerminal({
   useEffect(() => {
     if (!selected || attachedId !== selected) return;
     let active = true;
-    let reading = false;
-    const read = async () => {
-      if (reading) return;
-      reading = true;
+    let unlisten: (() => void) | undefined;
+    let replaying = true;
+    const pending: PtyRead[] = [];
+    const apply = (next: PtyRead) => {
+      if (!active || selectedRef.current !== selected || next.id !== selected)
+        return;
+      setConnection(next.connection);
+      if (next.error) setError(next.error);
+      const previous = revision.current;
+      if (previous !== undefined && next.revision <= previous) return;
+      if (next.reset) terminal.current?.reset();
+      if (next.data) terminal.current?.write(next.data);
+      revision.current = next.revision;
+    };
+    const attachOutput = async () => {
       try {
-        const next = await invoke<PtyRead>("pty_read", {
+        const dispose = await listen<PtyRead>(`pty-output:${selected}`, ({ payload }) => {
+          if (replaying) pending.push(payload);
+          else apply(payload);
+        });
+        if (!active) {
+          dispose();
+          return;
+        }
+        unlisten = dispose;
+        const replay = await invoke<PtyRead>("pty_read", {
           id: selected,
           afterRevision: revision.current ?? null,
         });
-        if (!active || selectedRef.current !== selected) return;
-        if (next.reset) terminal.current?.reset();
-        if (next.data) terminal.current?.write(next.data);
-        revision.current = next.revision;
-        setConnection(next.connection);
-        if (next.error) setError(next.error);
+        apply(replay);
       } catch (caught) {
         if (active) setError(detail(caught));
       } finally {
-        reading = false;
+        replaying = false;
+        pending.splice(0).forEach(apply);
       }
     };
-    void read();
-    const timer = window.setInterval(() => void read(), 180);
+    void attachOutput();
     return () => {
       active = false;
-      window.clearInterval(timer);
+      unlisten?.();
     };
   }, [attachedId, selected]);
 

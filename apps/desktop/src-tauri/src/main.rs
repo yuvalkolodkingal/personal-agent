@@ -101,7 +101,8 @@ struct ActiveSession {
 }
 
 struct VoicePlayback {
-    child: tokio::process::Child,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    stopped: tokio::sync::oneshot::Receiver<()>,
     wav: PathBuf,
     generation: u64,
 }
@@ -457,15 +458,17 @@ fn clean_shutdown(app: &tauri::AppHandle) {
     let pty = app.state::<pty_host::PtyHostState>();
     tauri::async_runtime::block_on(pty.shutdown());
     let state = app.state::<DesktopState>();
-    if let Some(goals) = app.try_state::<goals_host::GoalsHostState>()
-        && let Err(error) = goals.flush_persistence(&state.profile)
-    {
-        tracing::warn!(%error, "goal snapshots could not be flushed during shutdown");
+    if let Some(goals) = app.try_state::<goals_host::GoalsHostState>() {
+        tauri::async_runtime::block_on(goals.shutdown_resident());
+        if let Err(error) = goals.flush_persistence(&state.profile) {
+            tracing::warn!(%error, "goal snapshots could not be flushed during shutdown");
+        }
     }
-    if let Some(automations) = app.try_state::<automation_host::AutomationHostState>()
-        && let Err(error) = automations.flush_persistence(&state.profile)
-    {
-        tracing::warn!(%error, "automation snapshot could not be flushed during shutdown");
+    if let Some(automations) = app.try_state::<automation_host::AutomationHostState>() {
+        tauri::async_runtime::block_on(automations.shutdown_resident());
+        if let Err(error) = automations.flush_persistence(&state.profile) {
+            tracing::warn!(%error, "automation snapshot could not be flushed during shutdown");
+        }
     }
     if let Some(mcp) = app.try_state::<mcp_host::McpHostState>()
         && let Err(error) = mcp.flush_persistence()
@@ -485,12 +488,7 @@ fn clean_shutdown(app: &tauri::AppHandle) {
     {
         tracing::warn!(%error, "clean lifecycle marker removal failed");
     }
-    if let Ok(mut playback) = state.voice_playback.try_lock()
-        && let Some(mut playback) = playback.take()
-    {
-        let _ = tauri::async_runtime::block_on(playback.child.kill());
-        let _ = std::fs::remove_file(playback.wav);
-    }
+    tauri::async_runtime::block_on(api::shutdown_voice_playback(&state));
     tracing::info!("desktop host stopped");
 }
 

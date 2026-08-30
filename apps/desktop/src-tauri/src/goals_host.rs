@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAXIMUM_PARALLELISM: usize = 2;
 const MAXIMUM_DELEGATION_DEPTH: usize = 3;
-const RESIDENT_TICK_SECONDS: u64 = 2;
 const MAX_GOAL_TEXT_BYTES: usize = 65_536;
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(250);
 const BACKGROUND_GOAL_SYSTEM_PROMPT: &str = "This is a durable background goal task, not an interactive user turn. Work only on the named goal and observable success criterion. Preserve user files and existing changes. All tools remain behind the native policy gateway. Pause for native approval before consequential or external effects. Return a concise result with verification evidence.";
@@ -59,6 +59,9 @@ pub(crate) struct GoalsHostState {
     goals: tokio::sync::Mutex<BTreeMap<Uuid, Arc<ManagedGoal>>>,
     persistence: Arc<GoalPersistence>,
     resident_active: AtomicBool,
+    resident_cancel: CancellationToken,
+    resident_wake: tokio::sync::Notify,
+    resident_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     recovered_tasks: usize,
     activities: tokio::sync::Mutex<Vec<GoalActivityView>>,
 }
@@ -351,6 +354,9 @@ impl GoalsHostState {
             goals: tokio::sync::Mutex::new(goals),
             persistence: Arc::new(GoalPersistence::default()),
             resident_active: AtomicBool::new(false),
+            resident_cancel: CancellationToken::new(),
+            resident_wake: tokio::sync::Notify::new(),
+            resident_task: Mutex::new(None),
             recovered_tasks,
             activities: tokio::sync::Mutex::new(activities),
         })
@@ -361,6 +367,26 @@ impl GoalsHostState {
         profile: &Mutex<personal_agent_core::ProfileState>,
     ) -> Result<(), String> {
         self.persistence.flush(profile)
+    }
+
+    pub(crate) fn wake_resident(&self) {
+        self.resident_wake.notify_one();
+    }
+
+    pub(crate) async fn shutdown_resident(&self) {
+        self.resident_cancel.cancel();
+        self.resident_wake.notify_one();
+        let task = self
+            .resident_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "resident goal supervisor did not join cleanly");
+        }
+        self.resident_active.store(false, Ordering::SeqCst);
     }
 }
 
@@ -692,6 +718,7 @@ pub(crate) async fn goals_execute(
                 json!(goal.clone()),
             )?;
             host.goals.lock().await.insert(goal.id, Arc::new(managed));
+            host.wake_resident();
             record_activity(&host, &projection, "goal.created", Some(goal.id), None).await;
             (
                 projection,
@@ -984,6 +1011,7 @@ async fn mutate_goal<T>(
         payload_task_id(&payload),
     )
     .await;
+    host.wake_resident();
     Ok((projection, result))
 }
 
@@ -1112,15 +1140,33 @@ pub(crate) fn ensure_resident_executor(app: tauri::AppHandle) {
     if host.resident_active.swap(true, Ordering::SeqCst) {
         return;
     }
-    tauri::async_runtime::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(RESIDENT_TICK_SECONDS));
+    let cancellation = host.resident_cancel.clone();
+    let resident_app = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
         loop {
-            timer.tick().await;
-            if let Err(error) = drain_ready(&app).await {
-                tracing::warn!(%error, "resident goal supervisor tick failed");
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if let Err(error) = drain_ready(&resident_app).await {
+                tracing::warn!(%error, "resident goal supervisor wake failed");
+            }
+            let host = resident_app.state::<GoalsHostState>();
+            tokio::select! {
+                () = cancellation.cancelled() => break,
+                () = host.resident_wake.notified() => {}
             }
         }
+        resident_app
+            .state::<GoalsHostState>()
+            .resident_active
+            .store(false, Ordering::SeqCst);
     });
+    if let Ok(mut resident_task) = host.resident_task.lock() {
+        *resident_task = Some(task);
+    } else {
+        host.resident_cancel.cancel();
+        tracing::error!("resident goal task lock is poisoned");
+    }
 }
 
 async fn drain_ready(app: &tauri::AppHandle) -> Result<(), String> {
@@ -1473,8 +1519,8 @@ async fn complete_task(
         .await?;
     }
     emit_snapshot(app).await?;
-    // The resident tick schedules the next dependency. Avoid recursive worker futures so every
-    // spawned task remains `Send` across platforms.
+    // The mutation wake schedules the next dependency without a periodic resident poll. Avoid
+    // recursive worker futures so every spawned task remains `Send` across platforms.
     Ok(())
 }
 
@@ -2052,5 +2098,33 @@ mod tests {
         );
         assert_eq!(host.recovered_tasks, 1);
         assert!(recovered.supervisor.snapshot().running_order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_resident_goal_loop() {
+        let temp = tempfile::tempdir().expect("temp");
+        let database = temp.path().join("goal-resident-shutdown.db");
+        let mut profile =
+            personal_agent_core::ProfileState::open(&database, "default", &TestSecrets)
+                .expect("profile");
+        let host = GoalsHostState::load(&mut profile, temp.path().to_str().expect("workspace"))
+            .expect("goal host");
+        host.resident_active.store(true, Ordering::SeqCst);
+        let cancellation = host.resident_cancel.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_from_task = Arc::clone(&exited);
+        let task = tauri::async_runtime::spawn(async move {
+            cancellation.cancelled().await;
+            exited_from_task.store(true, Ordering::SeqCst);
+        });
+        *host.resident_task.lock().expect("resident task") = Some(task);
+
+        tokio::time::timeout(Duration::from_secs(1), host.shutdown_resident())
+            .await
+            .expect("resident goal loop shutdown");
+
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(!host.resident_active.load(Ordering::SeqCst));
+        assert!(host.resident_task.lock().expect("resident task").is_none());
     }
 }

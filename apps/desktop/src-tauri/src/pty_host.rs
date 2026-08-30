@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
@@ -368,6 +368,8 @@ async fn stop_connection(session: &mut ManagedPty) {
 }
 
 fn start_reader(
+    app: tauri::AppHandle,
+    id: String,
     buffer: Arc<Mutex<TerminalBuffer>>,
     mut connection: PtySocketConnection,
 ) -> (
@@ -378,43 +380,83 @@ fn start_reader(
     let commands = connection.commands.clone();
     let socket_task = connection.task;
     let reader_task = tokio::spawn(async move {
+        let event_name = format!("pty-output:{id}");
         if let Ok(mut state) = buffer.lock() {
             state.connection = "connected".into();
             state.error = None;
         }
         while let Some(event) = connection.events.recv().await {
-            let Ok(mut state) = buffer.lock() else {
-                break;
-            };
-            match event {
-                PtySocketEvent::Output(output) => state.push(output),
-                PtySocketEvent::Cursor(cursor) => state.cursor = cursor,
-                PtySocketEvent::Closed { code, reason } => {
-                    state.connection = "detached".into();
-                    if code != 1000 {
-                        state.error = Some(if reason.is_empty() {
-                            format!("terminal connection closed with code {code}")
-                        } else {
-                            reason
-                        });
+            let payload = {
+                let Ok(mut state) = buffer.lock() else {
+                    break;
+                };
+                let data = match event {
+                    PtySocketEvent::Output(output) => {
+                        state.push(output.clone());
+                        output
                     }
+                    PtySocketEvent::Cursor(cursor) => {
+                        state.cursor = cursor;
+                        String::new()
+                    }
+                    PtySocketEvent::Closed { code, reason } => {
+                        state.connection = "detached".into();
+                        if code != 1000 {
+                            state.error = Some(if reason.is_empty() {
+                                format!("terminal connection closed with code {code}")
+                            } else {
+                                reason
+                            });
+                        }
+                        String::new()
+                    }
+                    PtySocketEvent::Error(error) => {
+                        state.connection = "degraded".into();
+                        state.error = Some(error);
+                        String::new()
+                    }
+                };
+                PtyReadResponse {
+                    id: id.clone(),
+                    data,
+                    reset: false,
+                    revision: state.revision,
+                    cursor: state.cursor,
+                    connection: state.connection.clone(),
+                    error: state.error.clone(),
                 }
-                PtySocketEvent::Error(error) => {
-                    state.connection = "degraded".into();
-                    state.error = Some(error);
-                }
+            };
+            if let Err(error) = app.emit(&event_name, payload) {
+                tracing::warn!(%error, terminal_id = %id, "PTY output event could not be emitted");
             }
         }
-        if let Ok(mut state) = buffer.lock()
+        let detached = if let Ok(mut state) = buffer.lock()
             && state.connection == "connected"
         {
             state.connection = "detached".into();
+            Some(PtyReadResponse {
+                id: id.clone(),
+                data: String::new(),
+                reset: false,
+                revision: state.revision,
+                cursor: state.cursor,
+                connection: state.connection.clone(),
+                error: state.error.clone(),
+            })
+        } else {
+            None
+        };
+        if let Some(payload) = detached
+            && let Err(error) = app.emit(&event_name, payload)
+        {
+            tracing::warn!(%error, terminal_id = %id, "PTY detach event could not be emitted");
         }
     });
     (commands, socket_task, reader_task)
 }
 
 async fn attach(
+    app: &tauri::AppHandle,
     host: &PtyHostState,
     client: &OpenCodeApiClient,
     id: &str,
@@ -459,7 +501,8 @@ async fn attach(
             return Err("terminal websocket could not be attached".into());
         }
     };
-    let (commands, socket_task, reader_task) = start_reader(buffer.clone(), connection);
+    let (commands, socket_task, reader_task) =
+        start_reader(app.clone(), id.to_owned(), buffer.clone(), connection);
     host.sessions.lock().await.insert(
         id.to_owned(),
         ManagedPty {
@@ -524,6 +567,7 @@ pub async fn pty_list(
 
 #[tauri::command]
 pub async fn pty_create(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     host: State<'_, PtyHostState>,
     request: PtyCreateRequest,
@@ -547,12 +591,13 @@ pub async fn pty_create(
         .await
         .map_err(|error| error.to_string())?;
     let info = runtime_pty(value, None, &workspace, Some(&cwd))?;
-    let buffer = attach(&host, &client, &info.id, &workspace).await?;
+    let buffer = attach(&app, &host, &client, &info.id, &workspace).await?;
     Ok(snapshot(info, Some(&buffer)))
 }
 
 #[tauri::command]
 pub async fn pty_reconnect(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     host: State<'_, PtyHostState>,
     id: String,
@@ -571,7 +616,7 @@ pub async fn pty_reconnect(
         .await
         .map_err(|error| error.to_string())?;
     let info = runtime_pty(value, Some(&id), &workspace, None)?;
-    let buffer = attach(&host, &client, &info.id, &workspace).await?;
+    let buffer = attach(&app, &host, &client, &info.id, &workspace).await?;
     Ok(snapshot(info, Some(&buffer)))
 }
 

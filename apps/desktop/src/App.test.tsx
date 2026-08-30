@@ -663,6 +663,7 @@ describe("desktop workspace", () => {
   });
 
   it("recovers a completed reply when the native completion event is missed", async () => {
+    const interval = vi.spyOn(window, "setInterval");
     invoke.mockImplementation((command: string) => {
       if (command === "chat_turn_status")
         return Promise.resolve({
@@ -677,6 +678,21 @@ describe("desktop workspace", () => {
       target: { value: "Recover this turn" },
     });
     fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() =>
+      expect(screen.getByText("Connecting to model")).toBeInTheDocument(),
+    );
+    const safetyPoll = await waitFor(() => {
+      const call = interval.mock.calls.find(([, delay]) => delay === 15_000);
+      expect(call).toBeDefined();
+      return call?.[0];
+    });
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat_turn_status"),
+    ).toBe(false);
+    expect(typeof safetyPoll).toBe("function");
+    act(() => {
+      if (typeof safetyPoll === "function") safetyPoll();
+    });
     expect(await screen.findByText("Recovered answer.")).toBeInTheDocument();
     expect(invoke).toHaveBeenCalledWith(
       "chat_turn_status",

@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
 const E5_SMALL_INT8_DIMENSIONS: usize = 384;
@@ -491,6 +492,13 @@ pub(crate) async fn save_config(
     }
     if health.healthy {
         super::automation_host::ensure_resident_executor(app.clone());
+        super::goals_host::ensure_resident_executor(app.clone());
+    }
+    if let Some(automations) = app.try_state::<super::automation_host::AutomationHostState>() {
+        automations.wake_resident();
+    }
+    if let Some(goals) = app.try_state::<super::goals_host::GoalsHostState>() {
+        goals.wake_resident();
     }
     app.emit("config-updated", &validated.config)
         .map_err(|error| error.to_string())?;
@@ -655,7 +663,7 @@ pub(crate) async fn chat_send(
         let started = Instant::now();
         let mut outcome = "completed";
         let mut failure: Option<String> = None;
-        let mut status_poll = tokio::time::interval(Duration::from_secs(5));
+        let mut status_poll = tokio::time::interval(Duration::from_secs(15));
         status_poll.tick().await;
         loop {
             let event = tokio::select! {
@@ -2068,16 +2076,19 @@ pub(crate) async fn voice_speak(
         let _ = std::fs::remove_file(&wav);
         return Ok(json!({"spoken": false, "reason": "interrupted"}));
     }
-    let child = play_wav(
+    let mut child = play_wav(
         &player,
         &wav,
         &config.voice.output_device,
         config.voice.volume_percent,
     )
     .map_err(|error| error.to_string())?;
+    let (cancel, cancelled) = oneshot::channel();
+    let (stopped, stopped_receiver) = oneshot::channel();
     *state.voice_playback.lock().await = Some(VoicePlayback {
-        child,
-        wav,
+        cancel: Some(cancel),
+        stopped: stopped_receiver,
+        wav: wav.clone(),
         generation,
     });
     let _ = app.emit(
@@ -2086,33 +2097,56 @@ pub(crate) async fn voice_speak(
     );
     let monitor_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let monitor_state = monitor_app.state::<DesktopState>();
-            let completed = {
-                let mut playback = monitor_state.voice_playback.lock().await;
-                playback.as_mut().is_some_and(|item| {
-                    item.generation == generation && item.child.try_wait().ok().flatten().is_some()
-                })
-            };
-            if !completed {
-                if monitor_state.voice_generation.load(Ordering::SeqCst) != generation {
-                    break;
-                }
-                continue;
+        let outcome = wait_for_playback(&mut child, cancelled).await;
+        let _ = std::fs::remove_file(&wav);
+        let monitor_state = monitor_app.state::<DesktopState>();
+        let was_current = {
+            let mut playback = monitor_state.voice_playback.lock().await;
+            if playback
+                .as_ref()
+                .is_some_and(|item| item.generation == generation)
+            {
+                playback.take();
+                monitor_state.voice_generation.load(Ordering::SeqCst) == generation
+            } else {
+                false
             }
-            let finished = monitor_state.voice_playback.lock().await.take();
-            if let Some(item) = finished.filter(|item| item.generation == generation) {
-                let _ = std::fs::remove_file(item.wav);
-            }
+        };
+        if outcome == PlaybackOutcome::Completed && was_current {
             let _ = monitor_app.emit(
                 "voice-state",
                 json!({"state": "idle", "generation": generation}),
             );
-            break;
         }
+        let _ = stopped.send(());
     });
     Ok(json!({"spoken": true, "engine": engine, "generation": generation}))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaybackOutcome {
+    Completed,
+    Cancelled,
+}
+
+async fn wait_for_playback(
+    child: &mut tokio::process::Child,
+    cancelled: oneshot::Receiver<()>,
+) -> PlaybackOutcome {
+    tokio::select! {
+        result = child.wait() => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "voice playback process wait failed");
+            }
+            PlaybackOutcome::Completed
+        }
+        _ = cancelled => {
+            if let Err(error) = child.kill().await {
+                tracing::warn!(%error, "voice playback process could not be interrupted");
+            }
+            PlaybackOutcome::Cancelled
+        }
+    }
 }
 
 #[tauri::command]
@@ -2231,13 +2265,36 @@ async fn voice_stop_inner(
             }
         }
     }
-    if let Some(mut playback) = state.voice_playback.lock().await.take() {
-        let _ = playback.child.kill().await;
-        let _ = playback.child.wait().await;
+    let playback = { state.voice_playback.lock().await.take() };
+    if let Some(mut playback) = playback {
+        if let Some(cancel) = playback.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if tokio::time::timeout(Duration::from_secs(5), &mut playback.stopped)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                generation = playback.generation,
+                "voice playback task did not stop within the shutdown deadline"
+            );
+        }
         let _ = std::fs::remove_file(playback.wav);
     }
     if let Some(app) = app {
         let _ = app.emit("voice-state", json!({"state": "idle", "interrupted": true}));
+    }
+}
+
+pub(crate) async fn shutdown_voice_playback(state: &DesktopState) {
+    state.voice_generation.fetch_add(1, Ordering::SeqCst);
+    let playback = { state.voice_playback.lock().await.take() };
+    if let Some(mut playback) = playback {
+        if let Some(cancel) = playback.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut playback.stopped).await;
+        let _ = std::fs::remove_file(playback.wav);
     }
 }
 
@@ -2746,5 +2803,70 @@ mod tests {
         assert!(!is_workspace_relative_path("/etc/passwd"));
         assert!(!is_workspace_relative_path("src/../../outside"));
         assert!(!is_workspace_relative_path("src/evil\0name"));
+    }
+
+    const PLAYBACK_FIXTURE_WAIT: &str = "PERSONAL_AGENT_PLAYBACK_FIXTURE_WAIT";
+
+    #[test]
+    fn playback_process_fixture() {
+        if std::env::var(PLAYBACK_FIXTURE_WAIT).as_deref() == Ok("wait-for-cancel") {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    fn playback_fixture_child(wait: bool) -> tokio::process::Child {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command.args([
+            "--exact",
+            "api::tests::playback_process_fixture",
+            "--nocapture",
+        ]);
+        command.env_remove(PLAYBACK_FIXTURE_WAIT);
+        if wait {
+            command.env(PLAYBACK_FIXTURE_WAIT, "wait-for-cancel");
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("playback fixture child")
+    }
+
+    #[tokio::test]
+    async fn playback_wait_completes_without_polling_and_cancellation_reaps_the_child() {
+        let mut completed_child = playback_fixture_child(false);
+        let (keep_alive, completed_cancel) = oneshot::channel();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_playback(&mut completed_child, completed_cancel),
+        )
+        .await
+        .expect("completion wait");
+        drop(keep_alive);
+        assert_eq!(completed, PlaybackOutcome::Completed);
+        assert!(
+            completed_child
+                .try_wait()
+                .expect("completion status")
+                .is_some()
+        );
+
+        let mut cancelled_child = playback_fixture_child(true);
+        let (cancel, cancelled) = oneshot::channel();
+        cancel.send(()).expect("signal cancellation");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_playback(&mut cancelled_child, cancelled),
+        )
+        .await
+        .expect("cancellation wait");
+        assert_eq!(outcome, PlaybackOutcome::Cancelled);
+        assert!(
+            cancelled_child
+                .try_wait()
+                .expect("cancelled status")
+                .is_some()
+        );
     }
 }

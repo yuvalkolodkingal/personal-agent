@@ -1,9 +1,22 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoke = vi.hoisted(() => vi.fn());
+const terminalWrite = vi.hoisted(() => vi.fn());
+const eventHandlers = vi.hoisted(
+  () => new Map<string, (event: { payload: unknown }) => void>(),
+);
+const listen = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen }));
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     fit() {}
@@ -15,7 +28,9 @@ vi.mock("@xterm/xterm", () => ({
     open() {}
     dispose() {}
     reset() {}
-    write() {}
+    write(value: string) {
+      terminalWrite(value);
+    }
     onData() {
       return { dispose() {} };
     }
@@ -54,6 +69,18 @@ describe("PersistentTerminal", () => {
     );
     vi.stubGlobal("confirm", vi.fn(() => true));
     invoke.mockReset();
+    terminalWrite.mockReset();
+    eventHandlers.clear();
+    listen.mockReset();
+    listen.mockImplementation(
+      (
+        eventName: string,
+        handler: (event: { payload: unknown }) => void,
+      ) => {
+        eventHandlers.set(eventName, handler);
+        return Promise.resolve(() => eventHandlers.delete(eventName));
+      },
+    );
     invoke.mockImplementation((command: string) => {
       if (command === "pty_capability") {
         return Promise.resolve({
@@ -138,5 +165,53 @@ describe("PersistentTerminal", () => {
       directory: "/workspace",
       confirmed: true,
     });
+  });
+
+  it("renders websocket output from Tauri events without a poll timer", async () => {
+    const interval = vi.spyOn(window, "setInterval");
+    invoke.mockImplementation((command: string) => {
+      if (command === "pty_capability") return Promise.resolve({ backend: "pty" });
+      if (command === "pty_list") return Promise.resolve([session]);
+      if (command === "pty_reconnect") return Promise.resolve(session);
+      if (command === "pty_read") {
+        return Promise.resolve({
+          id: session.id,
+          data: "reattached\r\n",
+          reset: true,
+          revision: 1,
+          cursor: 12,
+          connection: "connected",
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(
+      <PersistentTerminal workingDirectory="/workspace" shell="/bin/bash" />,
+    );
+    await waitFor(() =>
+      expect(listen).toHaveBeenCalledWith(
+        `pty-output:${session.id}`,
+        expect.any(Function),
+      ),
+    );
+    await waitFor(() => expect(terminalWrite).toHaveBeenCalledWith("reattached\r\n"));
+
+    act(() => {
+      eventHandlers.get(`pty-output:${session.id}`)?.({
+        payload: {
+          id: session.id,
+          data: "echo\r\n",
+          reset: false,
+          revision: 2,
+          cursor: 18,
+          connection: "connected",
+        },
+      });
+    });
+
+    expect(terminalWrite).toHaveBeenLastCalledWith("echo\r\n");
+    expect(interval.mock.calls.some(([, delay]) => delay === 180)).toBe(false);
+    expect(invoke.mock.calls.filter(([command]) => command === "pty_read")).toHaveLength(1);
   });
 });
