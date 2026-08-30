@@ -38,6 +38,7 @@
 | PERF-10 | DONE | FakeRuntime ran one delayed chat turn and 20 resource calls in 307 ms with `max_in_flight=21` (serialized minimum 700 ms); retained-handle replacement, held-lock shutdown, runtime/desktop suites, and strict clippy pass. | `00b312b` |
 | PERF-11 | DONE | PTY echo uses `pty-output:{id}` events with one revision-deduplicated replay and no poll timer; playback awaits a cancellable child; resident mutation/deadline/cancellation and shutdown-join tests pass; desktop Rust 80/80 and frontend 76/76 pass at the task boundary. | `78c4197` |
 | PERF-12 | DONE | Pinned Tauri 2.11.5 compiled raw `ipc::Request` bodies; exact PCM16LE decode/limit tests and ArrayBuffer/no-per-sample-JSON Vitest pass, with desktop Rust 81/81 and frontend 77/77 green. | `acaf82c` |
+| PERF-9 | DONE | The 4.5 GiB typed registry admits CPU fallbacks for free, evicts only idle GPU models in vision → STT → TTS order, and rejects active/stale evictions; the real Python worker protocol test verifies idempotent `unload`. Audio tests pass 27/27 with one pre-existing hardware/model-assets test ignored. | `bb19691` |
 
 ## Wave 1 gate
 
@@ -117,3 +118,13 @@ release-metadata `--check` then pass. The inherited exceptions were rerun:
 - Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
 - Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by
   PERF-13 and does not exist yet.
+
+## Wave 6 gate
+
+Wave 6 passes the full §14 gate. Formatting and workspace clippy pass with warnings denied, and
+every locked workspace Rust test passes (audio 27/27 with one pre-existing hardware/model-assets
+test ignored; desktop 81/81; runtime 17/17 with one pre-existing ignored live-sidecar test). Bun
+checks and tests pass (desktop 77/77), and the production build completes at 764.50 kB / 208.24 kB
+gzip. Registry, pack, performance, fuzz, security, SBOM, and release-metadata verification all
+pass. The inherited exceptions remain unchanged: the Windows MSVC standard-library target is
+unavailable, and the bundle-size verifier is introduced by PERF-13 in the next wave.
