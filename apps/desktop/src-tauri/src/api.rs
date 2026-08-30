@@ -19,11 +19,11 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
 const E5_SMALL_INT8_DIMENSIONS: usize = 384;
@@ -31,6 +31,176 @@ const VOICE_STREAM_SAMPLE_RATE_HZ: usize = 16_000;
 const VOICE_STREAM_MAX_SAMPLES: usize = VOICE_STREAM_SAMPLE_RATE_HZ * 2;
 const TTS_STREAM_MAX_REASSEMBLED_SAMPLES: usize = 24_000 * 180;
 const QWEN_TTS_SAMPLE_RATE_HZ: u32 = 24_000;
+const TTS_TURN_CLAUSE_MAX_CHARACTERS: usize = 220;
+const TTS_TURN_MAX_TEXT_BYTES: usize = 65_536;
+const TTS_TURN_MAX_DELTA_EVENTS: usize = 4_096;
+const TTS_TURN_FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ClauseSegmenter {
+    pending: String,
+    pending_characters: usize,
+}
+
+impl ClauseSegmenter {
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        let mut clauses = Vec::new();
+        for character in delta.chars() {
+            self.pending.push(character);
+            self.pending_characters = self.pending_characters.saturating_add(1);
+            if (matches!(character, '.' | '!' | '?' | ';' | ':')
+                || self.pending_characters >= TTS_TURN_CLAUSE_MAX_CHARACTERS)
+                && let Some(clause) = self.take_pending()
+            {
+                clauses.push(clause);
+            }
+        }
+        clauses
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        self.take_pending()
+    }
+
+    fn take_pending(&mut self) -> Option<String> {
+        self.pending_characters = 0;
+        let pending = std::mem::take(&mut self.pending);
+        let clause = pending.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!clause.is_empty()).then_some(clause)
+    }
+}
+
+enum TurnClauseInput {
+    Delta(String),
+    Finish,
+    Cancel,
+}
+
+/// Non-blocking input side of one streamed model turn.
+///
+/// A dedicated dispatcher performs segmentation and feeds a bounded TTS queue.
+/// Synthesis may own one clause while exactly one completed clause is
+/// prebuffered, without ever delaying durable runtime-event recording or the UI.
+struct TurnClausePump {
+    sender: Option<mpsc::UnboundedSender<TurnClauseInput>>,
+    accepted_text_bytes: usize,
+    accepted_delta_events: usize,
+    accepted_speech: bool,
+    cancellation_requested: bool,
+    cancellation_taken: bool,
+}
+
+impl TurnClausePump {
+    fn new(clause_sender: mpsc::Sender<String>) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(dispatch_turn_clauses(receiver, clause_sender));
+        Self {
+            sender: Some(sender),
+            accepted_text_bytes: 0,
+            accepted_delta_events: 0,
+            accepted_speech: false,
+            cancellation_requested: false,
+            cancellation_taken: false,
+        }
+    }
+
+    fn push_delta(&mut self, delta: &str) -> bool {
+        if self.accepted_delta_events >= TTS_TURN_MAX_DELTA_EVENTS {
+            self.cancel_for_overflow();
+            return false;
+        }
+        let Some(next_size) = self.accepted_text_bytes.checked_add(delta.len()) else {
+            self.cancel_for_overflow();
+            return false;
+        };
+        if next_size > TTS_TURN_MAX_TEXT_BYTES {
+            self.cancel_for_overflow();
+            return false;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return false;
+        };
+        if sender
+            .send(TurnClauseInput::Delta(delta.to_owned()))
+            .is_err()
+        {
+            self.sender.take();
+            self.cancellation_requested = true;
+            return false;
+        }
+        self.accepted_text_bytes = next_size;
+        self.accepted_delta_events = self.accepted_delta_events.saturating_add(1);
+        self.accepted_speech |= delta.chars().any(|character| !character.is_whitespace());
+        true
+    }
+
+    fn finish(&mut self) -> bool {
+        let Some(sender) = self.sender.take() else {
+            return false;
+        };
+        if sender.send(TurnClauseInput::Finish).is_err() {
+            return false;
+        }
+        self.accepted_speech
+    }
+
+    fn cancel(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(TurnClauseInput::Cancel);
+        }
+    }
+
+    fn cancel_for_overflow(&mut self) {
+        self.cancel();
+        self.cancellation_requested = true;
+    }
+
+    fn take_cancellation_request(&mut self) -> bool {
+        if !self.cancellation_requested || self.cancellation_taken {
+            return false;
+        }
+        self.cancellation_taken = true;
+        true
+    }
+
+    #[cfg(test)]
+    fn accepted_text_bytes(&self) -> usize {
+        self.accepted_text_bytes
+    }
+
+    #[cfg(test)]
+    fn accepted_delta_events(&self) -> usize {
+        self.accepted_delta_events
+    }
+}
+
+async fn dispatch_turn_clauses(
+    mut inputs: mpsc::UnboundedReceiver<TurnClauseInput>,
+    clauses: mpsc::Sender<String>,
+) {
+    let mut segmenter = ClauseSegmenter::default();
+    while let Some(input) = inputs.recv().await {
+        match input {
+            TurnClauseInput::Delta(delta) => {
+                for clause in segmenter.push(&delta) {
+                    if clauses.send(clause).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            TurnClauseInput::Finish => {
+                if let Some(clause) = segmenter.finish()
+                    && clauses.send(clause).await.is_err()
+                {
+                    return;
+                }
+                drop(clauses);
+                return;
+            }
+            TurnClauseInput::Cancel => return,
+        }
+    }
+}
 
 fn decode_pcm16le_frame(frame: &[u8]) -> Result<Vec<f32>, String> {
     if frame.is_empty() || !frame.len().is_multiple_of(2) {
@@ -491,6 +661,597 @@ where
     result.map_err(|error| error.to_string())
 }
 
+struct TurnSpeechQueue {
+    clauses: TurnClausePump,
+    first_audio: Option<oneshot::Receiver<Result<(), String>>>,
+    generation: u64,
+    queued_any: bool,
+}
+
+impl TurnSpeechQueue {
+    fn push_delta(&mut self, delta: &str, app: &tauri::AppHandle) {
+        if self.clauses.push_delta(delta) {
+            return;
+        }
+        if !self.clauses.take_cancellation_request() {
+            return;
+        }
+        let cancellation_app = app.clone();
+        let generation = self.generation;
+        if let Some(process_id) = invalidate_turn_speech_generation(&cancellation_app, generation) {
+            tauri::async_runtime::spawn(async move {
+                cleanup_cancelled_turn_speech(&cancellation_app, generation, process_id).await;
+            });
+        }
+    }
+
+    fn close(&mut self) {
+        self.queued_any = self.clauses.finish();
+    }
+
+    async fn wait_for_first_audio(mut self, app: &tauri::AppHandle) {
+        if !self.queued_any {
+            return;
+        }
+        let Some(first_audio) = self.first_audio.take() else {
+            return;
+        };
+        match tokio::time::timeout(TTS_TURN_FIRST_AUDIO_TIMEOUT, first_audio).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "streamed turn speech could not start before completion");
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("streamed turn speech ended before reporting first audio");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    generation = self.generation,
+                    "streamed turn speech exceeded the bounded first-audio wait"
+                );
+                cancel_turn_speech_generation(app, self.generation).await;
+            }
+        }
+    }
+
+    async fn cancel(mut self, app: &tauri::AppHandle) {
+        self.clauses.cancel();
+        cancel_turn_speech_generation(app, self.generation).await;
+    }
+}
+
+async fn begin_turn_speech(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    config: &PersonalAgentConfig,
+) -> Option<TurnSpeechQueue> {
+    if config.voice.quiet_mode {
+        return None;
+    }
+    let status = voice_status_for(state, config);
+    if !status.tts_ready {
+        tracing::warn!("turn requested speech, but no configured TTS fallback is ready");
+        return None;
+    }
+
+    voice_stop_inner(state, Some(app), false).await;
+    let generation = state
+        .voice_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let (clause_sender, clause_receiver) = mpsc::channel(1);
+    let (first_audio_sender, first_audio_receiver) = oneshot::channel();
+    let speech_app = app.clone();
+    let speech_config = config.clone();
+    tauri::async_runtime::spawn(async move {
+        run_turn_speech(
+            speech_app,
+            speech_config,
+            status,
+            generation,
+            clause_receiver,
+            first_audio_sender,
+        )
+        .await;
+    });
+    Some(TurnSpeechQueue {
+        clauses: TurnClausePump::new(clause_sender),
+        first_audio: Some(first_audio_receiver),
+        generation,
+        queued_any: false,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Streaming and the locked fallback ladder share one generation lifecycle.
+async fn run_turn_speech(
+    app: tauri::AppHandle,
+    config: PersonalAgentConfig,
+    status: NativeVoiceStatus,
+    generation: u64,
+    mut clauses: mpsc::Receiver<String>,
+    first_audio: oneshot::Sender<Result<(), String>>,
+) {
+    let state = app.state::<DesktopState>();
+    let Some(first_clause) = clauses.recv().await else {
+        let _ = first_audio.send(Err("the model turn produced no speech clauses".to_owned()));
+        return;
+    };
+    if state.voice_generation.load(Ordering::SeqCst) != generation {
+        let _ = first_audio.send(Err("streamed turn speech was cancelled".to_owned()));
+        return;
+    }
+
+    let mut all_clauses = vec![first_clause.clone()];
+    let mut first_audio = Some(first_audio);
+    if status.active_tts_backend == "qwen3-tts" {
+        match NativePlaybackSink::open(
+            &config.voice.output_device,
+            config.voice.volume_percent,
+            config.voice.ducking_percent,
+            state.voice_capture_active.load(Ordering::SeqCst),
+        ) {
+            Ok((sink, control, completion)) => {
+                if !register_native_playback(&state, &app, generation, control.clone(), completion)
+                    .await
+                {
+                    drop(sink);
+                    return;
+                }
+                let _ = app.emit(
+                    "voice-state",
+                    json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+                );
+                let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
+                    && !config
+                        .voice
+                        .tts_model
+                        .to_ascii_lowercase()
+                        .contains("customvoice")
+                {
+                    "base"
+                } else {
+                    "custom"
+                };
+                let mut current_clause = Some(first_clause);
+                let mut speaking_emitted = false;
+                let mut stream_error = None;
+                while let Some(clause) = current_clause {
+                    if state.voice_generation.load(Ordering::SeqCst) != generation {
+                        discard_playback_generation(&state, generation).await;
+                        return;
+                    }
+                    state.voice_synthesis_active.store(true, Ordering::SeqCst);
+                    let stream_app = app.clone();
+                    let stream_control = control.clone();
+                    let result = neural_voice_tts_stream(
+                        &state,
+                        json!({
+                            "text": clause,
+                            "voice": &config.voice.tts_voice,
+                            "model_kind": model_kind,
+                            "reference_audio": &config.voice.tts_reference_audio,
+                            "reference_text": &config.voice.tts_reference_text,
+                        }),
+                        generation,
+                        Duration::from_secs(180),
+                        |frame| {
+                            stream_control.append_pcm(frame, QWEN_TTS_SAMPLE_RATE_HZ, 1)?;
+                            if let Some(sender) = first_audio.take() {
+                                let _ = sender.send(Ok(()));
+                            }
+                            if !speaking_emitted {
+                                let _ = stream_app.emit(
+                                    "voice-state",
+                                    json!({"state": "speaking", "engine": "qwen3-tts", "generation": generation}),
+                                );
+                                speaking_emitted = true;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await;
+                    state.voice_synthesis_active.store(false, Ordering::SeqCst);
+                    match result {
+                        Ok(value)
+                            if value.get("cancelled").and_then(Value::as_bool) != Some(true)
+                                && state.voice_generation.load(Ordering::SeqCst) == generation =>
+                        {
+                            let sample_rate_hz = value
+                                .get("sample_rate_hz")
+                                .and_then(Value::as_u64)
+                                .and_then(|rate| u32::try_from(rate).ok());
+                            if sample_rate_hz != Some(QWEN_TTS_SAMPLE_RATE_HZ) {
+                                stream_error = Some(format!(
+                                    "Qwen3-TTS stream returned {sample_rate_hz:?}; expected {QWEN_TTS_SAMPLE_RATE_HZ} Hz"
+                                ));
+                                break;
+                            }
+                        }
+                        Ok(_) => {
+                            discard_playback_generation(&state, generation).await;
+                            return;
+                        }
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break;
+                        }
+                    }
+
+                    // `neural_voice_tts_stream` releases the worker mutex before
+                    // this wait, so an idle clause queue never monopolizes voice.
+                    current_clause = clauses.recv().await;
+                    if let Some(clause) = current_clause.as_ref() {
+                        all_clauses.push(clause.clone());
+                    }
+                }
+                if let Some(error) = stream_error {
+                    discard_playback_generation(&state, generation).await;
+                    drop(sink);
+                    if state.voice_generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let _ = app.emit(
+                        "voice-state",
+                        json!({"state": "recovering", "detail": error, "fallback": "piper"}),
+                    );
+                    collect_and_speak_turn_fallback(
+                        &app,
+                        &state,
+                        generation,
+                        &mut clauses,
+                        all_clauses,
+                        &config,
+                        &status,
+                        first_audio,
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = sink.finish() {
+                    if let Some(sender) = first_audio.take() {
+                        let _ = sender.send(Err(error.to_string()));
+                    }
+                    discard_playback_generation(&state, generation).await;
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cpal output unavailable for streamed turn; preserving subprocess fallback");
+            }
+        }
+    }
+
+    collect_and_speak_turn_fallback(
+        &app,
+        &state,
+        generation,
+        &mut clauses,
+        all_clauses,
+        &config,
+        &status,
+        first_audio,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)] // Compatibility speech retains the same explicit backend inputs.
+async fn collect_and_speak_turn_fallback(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    generation: u64,
+    clauses: &mut mpsc::Receiver<String>,
+    mut collected: Vec<String>,
+    config: &PersonalAgentConfig,
+    status: &NativeVoiceStatus,
+    mut first_audio: Option<oneshot::Sender<Result<(), String>>>,
+) {
+    while let Some(clause) = clauses.recv().await {
+        if state.voice_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        collected.push(clause);
+    }
+    if state.voice_generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    let text = collected.join(" ");
+    if text.is_empty() {
+        return;
+    }
+    if let Err(error) = speak_turn_fallback_for_generation(
+        &text,
+        app,
+        state,
+        config,
+        status,
+        generation,
+        &mut first_audio,
+    )
+    .await
+    {
+        if let Some(sender) = first_audio.take() {
+            let _ = sender.send(Err(error.clone()));
+        }
+        tracing::warn!(%error, "streamed turn compatibility speech failed");
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // The fixed generation is threaded through every locked fallback tier.
+async fn speak_turn_fallback_for_generation(
+    text: &str,
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    config: &PersonalAgentConfig,
+    status: &NativeVoiceStatus,
+    generation: u64,
+    first_audio: &mut Option<oneshot::Sender<Result<(), String>>>,
+) -> Result<(), String> {
+    if text.is_empty() || text.len() > TTS_TURN_MAX_TEXT_BYTES {
+        return Err("streamed turn speech exceeds the 65536-byte limit".to_owned());
+    }
+    if state.voice_generation.load(Ordering::SeqCst) != generation {
+        return Err("streamed turn speech was cancelled".to_owned());
+    }
+
+    let mut engine = "piper";
+    let wav = if status.active_tts_backend == "qwen3-tts" {
+        let _ = app.emit(
+            "voice-state",
+            json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+        );
+        let output = state
+            .app_data
+            .join("voice/runtime")
+            .join(format!("tts-turn-qwen-{}.wav", uuid::Uuid::new_v4()));
+        let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
+            && !config
+                .voice
+                .tts_model
+                .to_ascii_lowercase()
+                .contains("customvoice")
+        {
+            "base"
+        } else {
+            "custom"
+        };
+        let mut samples = Vec::new();
+        let mut sample_count = 0_usize;
+        state.voice_synthesis_active.store(true, Ordering::SeqCst);
+        let neural = neural_voice_tts_stream(
+            state,
+            json!({
+                "text": text,
+                "voice": &config.voice.tts_voice,
+                "model_kind": model_kind,
+                "reference_audio": &config.voice.tts_reference_audio,
+                "reference_text": &config.voice.tts_reference_text,
+            }),
+            generation,
+            Duration::from_secs(180),
+            |frame| {
+                sample_count = sample_count.saturating_add(frame.len());
+                if sample_count > TTS_STREAM_MAX_REASSEMBLED_SAMPLES {
+                    return Err(AudioError::Processing(
+                        "streamed speech exceeds the three-minute compatibility limit".into(),
+                    ));
+                }
+                samples.extend_from_slice(frame);
+                Ok(())
+            },
+        )
+        .await;
+        state.voice_synthesis_active.store(false, Ordering::SeqCst);
+        match neural {
+            Ok(value)
+                if value.get("cancelled").and_then(Value::as_bool) != Some(true)
+                    && state.voice_generation.load(Ordering::SeqCst) == generation =>
+            {
+                let sample_rate_hz = value
+                    .get("sample_rate_hz")
+                    .and_then(Value::as_u64)
+                    .and_then(|rate| u32::try_from(rate).ok())
+                    .ok_or_else(|| "Qwen3-TTS stream returned no sample rate".to_owned())?;
+                if sample_rate_hz != QWEN_TTS_SAMPLE_RATE_HZ {
+                    return Err(format!(
+                        "Qwen3-TTS stream returned {sample_rate_hz} Hz; expected {QWEN_TTS_SAMPLE_RATE_HZ} Hz"
+                    ));
+                }
+                let normalized = samples
+                    .into_iter()
+                    .map(|sample| f32::from(sample) / 32_768.0)
+                    .collect::<Vec<_>>();
+                write_pcm_wav(&output, &normalized, sample_rate_hz)
+                    .map_err(|error| error.to_string())?;
+                engine = "qwen3-tts";
+                output
+            }
+            Ok(_) => return Err("streamed turn speech was cancelled".to_owned()),
+            Err(error) => {
+                if state.voice_generation.load(Ordering::SeqCst) != generation {
+                    return Err("streamed turn speech was cancelled".to_owned());
+                }
+                tracing::warn!(%error, "Qwen3-TTS compatibility stream failed; using private Piper fallback");
+                let _ = app.emit(
+                    "voice-state",
+                    json!({"state": "recovering", "detail": error, "fallback": "piper"}),
+                );
+                let executable = status
+                    .piper_executable
+                    .as_ref()
+                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
+                let model = status
+                    .piper_model
+                    .as_ref()
+                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
+                synthesize_piper(
+                    executable,
+                    model,
+                    Some(&model.with_extension("onnx.json")),
+                    &state.app_data.join("voice/runtime"),
+                    text,
+                    config.voice.speech_rate_percent,
+                )
+                .await
+                .map_err(|fallback| {
+                    format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
+                })?
+            }
+        }
+    } else {
+        let executable = status
+            .piper_executable
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        let model = status
+            .piper_model
+            .as_ref()
+            .ok_or_else(|| status.details.join(" "))?;
+        synthesize_piper(
+            executable,
+            model,
+            Some(&model.with_extension("onnx.json")),
+            &state.app_data.join("voice/runtime"),
+            text,
+            config.voice.speech_rate_percent,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    };
+
+    if state.voice_generation.load(Ordering::SeqCst) != generation {
+        let _ = std::fs::remove_file(&wav);
+        return Err("streamed turn speech was cancelled".to_owned());
+    }
+    match NativePlaybackSink::open(
+        &config.voice.output_device,
+        config.voice.volume_percent,
+        config.voice.ducking_percent,
+        state.voice_capture_active.load(Ordering::SeqCst),
+    ) {
+        Ok((sink, control, completion)) => {
+            if !register_native_playback(state, app, generation, control, completion).await {
+                drop(sink);
+                let _ = std::fs::remove_file(&wav);
+                return Err("streamed turn speech was cancelled".to_owned());
+            }
+            let attached = {
+                let mut playback = state.voice_playback.lock().await;
+                if let Some(playback) = playback
+                    .as_mut()
+                    .filter(|playback| playback.generation == generation)
+                {
+                    playback.wav = Some(wav.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if !attached {
+                drop(sink);
+                let _ = std::fs::remove_file(&wav);
+                return Err("streamed turn speech was cancelled".to_owned());
+            }
+            if let Err(error) = sink.append_wav(&wav) {
+                discard_playback_generation(state, generation).await;
+                return Err(error.to_string());
+            }
+            let _ = app.emit(
+                "voice-state",
+                json!({"state": "speaking", "engine": engine, "generation": generation}),
+            );
+            if let Some(sender) = first_audio.take() {
+                let _ = sender.send(Ok(()));
+            }
+            if let Err(error) = sink.finish() {
+                discard_playback_generation(state, generation).await;
+                return Err(error.to_string());
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cpal output unavailable; using subprocess playback fallback");
+        }
+    }
+
+    let Some(player) = status.playback_command.as_ref() else {
+        let _ = std::fs::remove_file(&wav);
+        return Err(
+            "cpal output is unavailable and no pw-play compatible fallback is installed".to_owned(),
+        );
+    };
+    let child = match play_wav(
+        player,
+        &wav,
+        &config.voice.output_device,
+        config.voice.volume_percent,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&wav);
+            return Err(error.to_string());
+        }
+    };
+    if !register_subprocess_playback(state, app, generation, child, wav).await
+        || state.voice_generation.load(Ordering::SeqCst) != generation
+    {
+        return Err("streamed turn speech was cancelled".to_owned());
+    }
+    let _ = app.emit(
+        "voice-state",
+        json!({"state": "speaking", "engine": engine, "generation": generation}),
+    );
+    if let Some(sender) = first_audio.take() {
+        let _ = sender.send(Ok(()));
+    }
+    Ok(())
+}
+
+async fn cancel_turn_speech_generation(app: &tauri::AppHandle, generation: u64) {
+    if let Some(process_id) = invalidate_turn_speech_generation(app, generation) {
+        cleanup_cancelled_turn_speech(app, generation, process_id).await;
+    }
+}
+
+fn invalidate_turn_speech_generation(app: &tauri::AppHandle, generation: u64) -> Option<u32> {
+    let state = app.state::<DesktopState>();
+    state
+        .voice_generation
+        .compare_exchange(
+            generation,
+            generation.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+        .then(|| {
+            if state.voice_synthesis_active.load(Ordering::SeqCst) {
+                state.voice_runtime_pid.load(Ordering::SeqCst)
+            } else {
+                0
+            }
+        })
+}
+
+async fn cleanup_cancelled_turn_speech(app: &tauri::AppHandle, generation: u64, process_id: u32) {
+    let state = app.state::<DesktopState>();
+    discard_playback_generation(&state, generation).await;
+    if process_id != 0
+        && state.voice_generation.load(Ordering::SeqCst) == generation.saturating_add(1)
+        && state
+            .voice_runtime_pid
+            .compare_exchange(process_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &process_id.to_string()])
+                .status()
+                .await;
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<Value, String> {
     let config = config_snapshot(&state)?;
@@ -730,6 +1491,11 @@ pub(crate) async fn chat_send(
         id: session_id.clone(),
         directory: directory.clone(),
     });
+    let turn_speech = if speak_response {
+        begin_turn_speech(&app, &state, &config).await
+    } else {
+        None
+    };
 
     let prompt_message_id = submission.message_id;
     let session_for_task = session_id.clone();
@@ -737,6 +1503,7 @@ pub(crate) async fn chat_send(
     let directory_for_task = directory.display().to_string();
     let mut receiver = submission.events;
     tauri::async_runtime::spawn(async move {
+        let mut turn_speech = turn_speech;
         let mut response = String::new();
         let started = Instant::now();
         let mut outcome = "completed";
@@ -809,6 +1576,9 @@ pub(crate) async fn chat_send(
                 } else {
                     response.push_str(delta);
                 }
+                if let Some(speech) = turn_speech.as_mut() {
+                    speech.push_delta(delta, &app);
+                }
             }
             let state = app.state::<DesktopState>();
             if let Ok(mut profile) = state.profile.lock() {
@@ -851,6 +1621,15 @@ pub(crate) async fn chat_send(
                 break;
             }
         }
+        let mut completing_speech = None;
+        if let Some(mut speech) = turn_speech.take() {
+            if outcome == "completed" {
+                speech.close();
+                completing_speech = Some(speech);
+            } else {
+                speech.cancel(&app).await;
+            }
+        }
         if outcome == "completed" {
             let route = format!("/session/{session_for_task}/message");
             if let Ok(messages) = runtime_api
@@ -866,6 +1645,9 @@ pub(crate) async fn chat_send(
             {
                 response = final_text;
             }
+        }
+        if let Some(speech) = completing_speech {
+            speech.wait_for_first_audio(&app).await;
         }
         let turn_elapsed = turn_trace.elapsed();
         let elapsed_microseconds = u64::try_from(turn_elapsed.as_micros()).unwrap_or(u64::MAX);
@@ -2111,16 +2893,30 @@ async fn register_native_playback(
     generation: u64,
     control: NativePlaybackControl,
     completion: oneshot::Receiver<PlaybackEnd>,
-) {
+) -> bool {
     control.set_capturing(state.voice_capture_active.load(Ordering::SeqCst));
     let (stopped, stopped_receiver) = oneshot::channel();
-    *state.voice_playback.lock().await = Some(VoicePlayback {
+    let mut playback = state.voice_playback.lock().await;
+    let candidate = VoicePlayback {
         cancel: None,
         native: Some(control),
         stopped: stopped_receiver,
         wav: None,
         generation,
-    });
+    };
+    if let Err(mut rejected) = register_playback_if_current(
+        &state.voice_generation,
+        generation,
+        &mut playback,
+        candidate,
+    ) {
+        drop(playback);
+        if let Some(control) = rejected.native.take() {
+            let _ = control.stop();
+        }
+        return false;
+    }
+    drop(playback);
     let monitor_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = completion.await.unwrap_or(PlaybackEnd::Stopped);
@@ -2151,6 +2947,86 @@ async fn register_native_playback(
         }
         let _ = stopped.send(());
     });
+    true
+}
+
+async fn register_subprocess_playback(
+    state: &DesktopState,
+    app: &tauri::AppHandle,
+    generation: u64,
+    mut child: tokio::process::Child,
+    wav: PathBuf,
+) -> bool {
+    let (cancel, cancelled) = oneshot::channel();
+    let (stopped, stopped_receiver) = oneshot::channel();
+    let mut playback = state.voice_playback.lock().await;
+    let candidate = VoicePlayback {
+        cancel: Some(cancel),
+        native: None,
+        stopped: stopped_receiver,
+        wav: Some(wav.clone()),
+        generation,
+    };
+    if register_playback_if_current(
+        &state.voice_generation,
+        generation,
+        &mut playback,
+        candidate,
+    )
+    .is_err()
+    {
+        drop(playback);
+        let _ = reject_stale_subprocess_playback(child, &wav).await;
+        return false;
+    }
+    drop(playback);
+
+    let monitor_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = wait_for_playback(&mut child, cancelled).await;
+        let _ = std::fs::remove_file(&wav);
+        let monitor_state = monitor_app.state::<DesktopState>();
+        let was_current = {
+            let mut playback = monitor_state.voice_playback.lock().await;
+            if playback
+                .as_ref()
+                .is_some_and(|item| item.generation == generation)
+            {
+                playback.take();
+                monitor_state.voice_generation.load(Ordering::SeqCst) == generation
+            } else {
+                false
+            }
+        };
+        if outcome == PlaybackOutcome::Completed && was_current {
+            let _ = monitor_app.emit(
+                "voice-state",
+                json!({"state": "idle", "generation": generation}),
+            );
+        }
+        let _ = stopped.send(());
+    });
+    true
+}
+
+fn register_playback_if_current<T>(
+    current: &AtomicU64,
+    generation: u64,
+    playback: &mut Option<T>,
+    candidate: T,
+) -> Result<(), T> {
+    if current.load(Ordering::SeqCst) != generation {
+        return Err(candidate);
+    }
+    *playback = Some(candidate);
+    Ok(())
+}
+
+async fn reject_stale_subprocess_playback(mut child: tokio::process::Child, wav: &Path) -> bool {
+    let _ = child.start_kill();
+    let reaped = child.wait().await.is_ok();
+    let _ = std::fs::remove_file(wav);
+    reaped
 }
 
 async fn discard_playback_generation(state: &DesktopState, generation: u64) {
@@ -2211,8 +3087,12 @@ pub(crate) async fn voice_speak(
         );
         let (mut native_sink, native_control) = match native {
             Ok((sink, control, completion)) => {
-                register_native_playback(&state, &app, generation, control.clone(), completion)
-                    .await;
+                if !register_native_playback(&state, &app, generation, control.clone(), completion)
+                    .await
+                {
+                    drop(sink);
+                    return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                }
                 (Some(sink), Some(control))
             }
             Err(error) => {
@@ -2396,15 +3276,27 @@ pub(crate) async fn voice_speak(
             state.voice_capture_active.load(Ordering::SeqCst),
         ) {
             Ok((sink, control, completion)) => {
-                register_native_playback(&state, &app, generation, control, completion).await;
-                {
+                if !register_native_playback(&state, &app, generation, control, completion).await {
+                    drop(sink);
+                    let _ = std::fs::remove_file(&wav);
+                    return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                }
+                let attached = {
                     let mut playback = state.voice_playback.lock().await;
                     if let Some(playback) = playback
                         .as_mut()
                         .filter(|playback| playback.generation == generation)
                     {
                         playback.wav = Some(wav.clone());
+                        true
+                    } else {
+                        false
                     }
+                };
+                if !attached {
+                    drop(sink);
+                    let _ = std::fs::remove_file(&wav);
+                    return Ok(json!({"spoken": false, "reason": "interrupted"}));
                 }
                 if let Err(error) = sink.append_wav(&wav) {
                     discard_playback_generation(&state, generation).await;
@@ -2439,7 +3331,7 @@ pub(crate) async fn voice_speak(
             native_unavailable.unwrap_or_else(|| "cpal output is unavailable".to_owned())
         ));
     };
-    let mut child = match play_wav(
+    let child = match play_wav(
         &player,
         &wav,
         &config.voice.output_device,
@@ -2451,44 +3343,15 @@ pub(crate) async fn voice_speak(
             return Err(error.to_string());
         }
     };
-    let (cancel, cancelled) = oneshot::channel();
-    let (stopped, stopped_receiver) = oneshot::channel();
-    *state.voice_playback.lock().await = Some(VoicePlayback {
-        cancel: Some(cancel),
-        native: None,
-        stopped: stopped_receiver,
-        wav: Some(wav.clone()),
-        generation,
-    });
+    if !register_subprocess_playback(&state, &app, generation, child, wav).await
+        || state.voice_generation.load(Ordering::SeqCst) != generation
+    {
+        return Ok(json!({"spoken": false, "reason": "interrupted"}));
+    }
     let _ = app.emit(
         "voice-state",
         json!({"state": "speaking", "engine": engine, "generation": generation}),
     );
-    let monitor_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let outcome = wait_for_playback(&mut child, cancelled).await;
-        let _ = std::fs::remove_file(&wav);
-        let monitor_state = monitor_app.state::<DesktopState>();
-        let was_current = {
-            let mut playback = monitor_state.voice_playback.lock().await;
-            if playback
-                .as_ref()
-                .is_some_and(|item| item.generation == generation)
-            {
-                playback.take();
-                monitor_state.voice_generation.load(Ordering::SeqCst) == generation
-            } else {
-                false
-            }
-        };
-        if outcome == PlaybackOutcome::Completed && was_current {
-            let _ = monitor_app.emit(
-                "voice-state",
-                json!({"state": "idle", "generation": generation}),
-            );
-        }
-        let _ = stopped.send(());
-    });
     Ok(json!({"spoken": true, "engine": engine, "generation": generation, "playback": "pw-play"}))
 }
 
@@ -3247,6 +4110,169 @@ mod tests {
         assert_eq!(assistant_text_for_parent(&messages, "msg_other"), None);
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // The integration trace keeps runtime, dispatcher, fake engine, and sink ordering visible.
+    async fn fake_runtime_streams_first_clause_audio_before_turn_completion() {
+        use personal_agent_contracts::proto::EventEnvelope;
+        use personal_agent_runtime::FakeRuntime;
+        use std::sync::{Arc, Mutex};
+
+        let scripted = [
+            ("response.delta", json!({"delta": "First sentence."})),
+            ("response.delta", json!({"delta": " Second sentence."})),
+            ("response.delta", json!({"delta": " Third sentence."})),
+            ("response.completed", json!({"terminal": true})),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (event_type, payload))| {
+            EventEnvelope::new(
+                u64::try_from(index + 1).expect("small fixture sequence"),
+                "fixture",
+                "default",
+                event_type,
+                &payload,
+            )
+            .expect("fixture event")
+        })
+        .collect::<Vec<_>>();
+        let mut runtime = FakeRuntime::new(scripted);
+        runtime.start().await.expect("start fake runtime");
+        let session = runtime
+            .begin_session(SessionOptions {
+                model: None,
+                effort: None,
+                agent: None,
+                working_directory: std::env::temp_dir(),
+                environment: BTreeMap::new(),
+            })
+            .await
+            .expect("begin fake session");
+        let mut events = runtime
+            .submit(&session, "speak three sentences", None)
+            .await
+            .expect("submit fake turn");
+
+        let (clause_sender, mut clause_receiver) = mpsc::channel::<String>(1);
+        let (first_frame_sender, first_frame_receiver) = oneshot::channel();
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_trace = Arc::clone(&trace);
+        let fake_sink = tokio::spawn(async move {
+            let mut first_frame_sender = Some(first_frame_sender);
+            while let Some(clause) = clause_receiver.recv().await {
+                // The fake engine deterministically maps each completed clause to
+                // one non-empty PCM frame, then the fake sink records its receipt.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let frame = [i16::try_from(clause.len()).unwrap_or(i16::MAX); 16];
+                assert!(!frame.is_empty());
+                sink_trace
+                    .lock()
+                    .expect("trace lock")
+                    .push(format!("sink-frame:{clause}"));
+                if let Some(sender) = first_frame_sender.take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let mut clauses = TurnClausePump::new(clause_sender);
+
+        while let Some(event) = events.recv().await {
+            if event.r#type == "response.delta"
+                && let Ok(payload) = event.payload()
+                && let Some(delta) = payload
+                    .get("delta")
+                    .or_else(|| payload.get("text"))
+                    .and_then(Value::as_str)
+            {
+                assert!(clauses.push_delta(delta));
+            }
+            trace
+                .lock()
+                .expect("trace lock")
+                .push(format!("runtime-event:{}", event.r#type));
+            if event.r#type == "response.completed" {
+                assert!(clauses.finish());
+                tokio::time::timeout(Duration::from_millis(700), first_frame_receiver)
+                    .await
+                    .expect("fake first audio stayed below the 700 ms replay target")
+                    .expect("fake sink received first frame");
+                trace
+                    .lock()
+                    .expect("trace lock")
+                    .push("runtime-turn-complete".to_owned());
+                break;
+            }
+        }
+        fake_sink.await.expect("fake sink task");
+
+        let trace = trace.lock().expect("trace lock");
+        assert_eq!(
+            trace
+                .iter()
+                .filter_map(|entry| entry.strip_prefix("sink-frame:"))
+                .collect::<Vec<_>>(),
+            ["First sentence.", "Second sentence.", "Third sentence."]
+        );
+        let first_frame = trace
+            .iter()
+            .position(|entry| entry.starts_with("sink-frame:"))
+            .expect("first sink frame");
+        let turn_complete = trace
+            .iter()
+            .position(|entry| entry == "runtime-turn-complete")
+            .expect("turn completion marker");
+        assert!(first_frame < turn_complete);
+        let third_frame = trace
+            .iter()
+            .position(|entry| entry == "sink-frame:Third sentence.")
+            .expect("third sink frame");
+        assert!(
+            turn_complete < third_frame,
+            "turn completion must not wait for the full speech queue"
+        );
+        let response_complete = trace
+            .iter()
+            .position(|entry| entry == "runtime-event:response.completed")
+            .expect("runtime response completion remained observable");
+        assert!(
+            response_complete < first_frame,
+            "slow synthesis must not gate runtime-event observation"
+        );
+        assert!(clauses.accepted_text_bytes() <= TTS_TURN_MAX_TEXT_BYTES);
+        assert!(clauses.accepted_delta_events() <= TTS_TURN_MAX_DELTA_EVENTS);
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_backlog_has_a_hard_text_limit() {
+        let (clause_sender, clause_receiver) = mpsc::channel::<String>(1);
+        let mut clauses = TurnClausePump::new(clause_sender);
+        let chunk = "x".repeat(1_024);
+        for _ in 0..(TTS_TURN_MAX_TEXT_BYTES / chunk.len()) {
+            assert!(clauses.push_delta(&chunk));
+        }
+        assert_eq!(clauses.accepted_text_bytes(), TTS_TURN_MAX_TEXT_BYTES);
+        assert!(!clauses.push_delta("overflow"));
+        assert!(clauses.take_cancellation_request());
+        for _ in 0..100 {
+            assert!(!clauses.push_delta("later delta"));
+            assert!(!clauses.take_cancellation_request());
+        }
+        assert_eq!(clauses.accepted_text_bytes(), TTS_TURN_MAX_TEXT_BYTES);
+        assert!(!clauses.finish());
+        drop(clause_receiver);
+
+        let (clause_sender, clause_receiver) = mpsc::channel::<String>(1);
+        let mut events = TurnClausePump::new(clause_sender);
+        for _ in 0..TTS_TURN_MAX_DELTA_EVENTS {
+            assert!(events.push_delta(""));
+        }
+        assert_eq!(events.accepted_delta_events(), TTS_TURN_MAX_DELTA_EVENTS);
+        assert!(!events.push_delta("one event too many"));
+        assert!(events.take_cancellation_request());
+        assert!(!events.take_cancellation_request());
+        drop(clause_receiver);
+    }
+
     #[test]
     fn explicit_and_conversational_memory_requests_are_distinct() {
         assert_eq!(
@@ -3582,6 +4608,41 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("playback fixture child")
+    }
+
+    #[test]
+    fn native_and_subprocess_registration_reject_a_stale_generation() {
+        let generation = AtomicU64::new(42);
+        for candidate in ["native", "subprocess"] {
+            let mut playback = None;
+            assert_eq!(
+                register_playback_if_current(&generation, 41, &mut playback, candidate),
+                Err(candidate)
+            );
+            assert!(playback.is_none());
+        }
+        let mut current = None;
+        assert_eq!(
+            register_playback_if_current(&generation, 42, &mut current, "current"),
+            Ok(())
+        );
+        assert_eq!(current, Some("current"));
+    }
+
+    #[tokio::test]
+    async fn stale_subprocess_registration_kills_reaps_and_removes_audio() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let wav = std::env::temp_dir().join(format!(
+            "personal-agent-stale-playback-{}-{nonce}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&wav, b"stale playback fixture").expect("write stale WAV fixture");
+        let child = playback_fixture_child(true);
+        assert!(reject_stale_subprocess_playback(child, &wav).await);
+        assert!(!wav.exists());
     }
 
     #[tokio::test]

@@ -203,7 +203,7 @@ describe("streaming transcript render hygiene", () => {
     });
   });
 
-  it("flushes a queued delta before completion and speaks the accumulated text", async () => {
+  it("flushes a queued delta while Rust owns streamed turn speech", async () => {
     render(
       <ChatHarness
         initialMessages={[
@@ -236,7 +236,9 @@ describe("streaming transcript render hygiene", () => {
     expect(frames).toHaveLength(0);
     expect(screen.getByText("final tail")).toBeInTheDocument();
     expect(document.querySelector('[data-message-id="streaming"]')).toBeNull();
-    expect(invoke).toHaveBeenCalledWith("voice_speak", { text: "final tail" });
+    expect(invoke).not.toHaveBeenCalledWith("voice_speak", {
+      text: "final tail",
+    });
 
     act(() => {
       listeners.get("runtime-event")?.({

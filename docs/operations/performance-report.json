@@ -62,7 +62,7 @@
     "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
     "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
     "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set",
-    "tts_first_audio_ms": "fake-engine PCM enqueue through a bounded in-memory sink; excludes physical device startup"
+    "tts_first_audio_ms": "three-clause fake-engine turn through a one-clause prebuffer and bounded in-memory PCM sink; excludes physical device startup"
   },
   "schema_version": 1,
   "startup_native_setup": {
@@ -109,9 +109,9 @@
     "vad_stop_probability": 0.35
   },
   "tts_first_audio_ms": {
-    "maximum_microseconds": 6,
-    "p50_microseconds": 0,
-    "p95_microseconds": 0,
+    "maximum_microseconds": 255,
+    "p50_microseconds": 125,
+    "p95_microseconds": 216,
     "sample_count": 100
   },
   "wake_detection_to_listening": {

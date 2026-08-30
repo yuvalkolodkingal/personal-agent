@@ -948,12 +948,8 @@ export function ChatView({
       setTurnStage(failed ? "Needs attention" : "Ready");
       if (payload.error) setError(payload.error);
       void refreshCatalog();
-      if (payload.speak && completedText && voiceStatus.tts_ready)
-        void invoke("voice_speak", { text: completedText }).catch((caught) =>
-          setError(String(caught)),
-        );
     },
-    [flushPendingDeltas, refreshCatalog, setMessages, voiceStatus.tts_ready],
+    [flushPendingDeltas, refreshCatalog, setMessages],
   );
 
   const send = useCallback(

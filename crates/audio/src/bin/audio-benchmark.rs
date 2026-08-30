@@ -136,11 +136,35 @@ fn replay_desktop_snapshot_warm() -> Result<(), serde_json::Error> {
 
 fn replay_tts_first_audio(frame: &[i16]) -> Result<Duration, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let (producer, sink) = mpsc::sync_channel(1);
-    producer.send(frame.to_vec())?;
-    let first_frame = sink.recv()?;
-    black_box(first_frame.first().copied());
-    Ok(started.elapsed())
+    let mut first_audio = Duration::ZERO;
+    std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+        let (clause_producer, clause_consumer) = mpsc::sync_channel::<&str>(1);
+        let (pcm_producer, pcm_sink) = mpsc::sync_channel(1);
+        scope.spawn(move || {
+            while let Ok(clause) = clause_consumer.recv() {
+                let mut synthesized = frame.to_vec();
+                if let Some(sample) = synthesized.first_mut() {
+                    *sample = i16::try_from(clause.len()).unwrap_or(i16::MAX);
+                }
+                if pcm_producer.send(synthesized).is_err() {
+                    return;
+                }
+            }
+        });
+
+        clause_producer.send("First sentence.")?;
+        let first_frame = pcm_sink.recv()?;
+        first_audio = started.elapsed();
+        black_box(first_frame.first().copied());
+        clause_producer.send("Second sentence.")?;
+        clause_producer.send("Third sentence.")?;
+        drop(clause_producer);
+        for frame in pcm_sink {
+            black_box(frame.first().copied());
+        }
+        Ok(())
+    })?;
+    Ok(first_audio)
 }
 
 fn worker_cpu_ticks(process_id: u32) -> Result<u64, Box<dyn std::error::Error>> {
@@ -547,7 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
             "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
             "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
-            "tts_first_audio_ms": "fake-engine PCM enqueue through a bounded in-memory sink; excludes physical device startup",
+            "tts_first_audio_ms": "three-clause fake-engine turn through a one-clause prebuffer and bounded in-memory PCM sink; excludes physical device startup",
             "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required",
             "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set"
         },
