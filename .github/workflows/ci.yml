@@ -24,6 +24,7 @@ jobs:
       - run: bun run test
       - run: python scripts/verify-performance.py
       - run: bun run --cwd apps/desktop build
+      - run: bun scripts/verify-bundle-size.ts
 
   rust:
     strategy:

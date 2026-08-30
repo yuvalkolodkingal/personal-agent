@@ -49,6 +49,92 @@ const baseInvoke = (command: string) => {
       capabilities: [],
     });
   if (command === "autostart_status") return Promise.resolve(false);
+  if (command === "goals_snapshot")
+    return Promise.resolve({
+      goals: [],
+      activities: [],
+      resident_active: false,
+      recovered_tasks: 0,
+      maximum_parallelism: 0,
+    });
+  if (command === "artifact_snapshot")
+    return Promise.resolve({ artifacts: [], cards: [], order: [], focused: null });
+  if (command === "automation_snapshot")
+    return Promise.resolve({
+      automations: [],
+      runs: [],
+      resident_active: false,
+      global_enabled: true,
+      recovered_runs: 0,
+      supported_schedules: [],
+      unsupported_triggers: [],
+      notification: {
+        enabled: false,
+        native_delivery: false,
+        desktop_actions: false,
+        action_guidance: "Unavailable in the test fixture.",
+      },
+    });
+  if (command === "skills_agents_snapshot")
+    return Promise.resolve({
+      agents: { available: false },
+      commands: { available: false },
+      skills: { available: false },
+      managed_documents: [],
+      default_agent: "build",
+    });
+  if (command === "usage_snapshot")
+    return Promise.resolve({
+      records: [],
+      egress: [],
+      turns: {},
+      sessions: {},
+      days: {},
+      scopes: {},
+      usage_total: 0,
+      egress_total: 0,
+      limit: 50,
+      offset: 0,
+      pricing_policy: "Only provider-reported cost is totaled.",
+    });
+  if (command === "connector_list") return Promise.resolve([]);
+  if (command === "mcp_manager_snapshot")
+    return Promise.resolve({
+      servers: [],
+      audit_events: [],
+      protocol_version: "2026-07-28",
+    });
+  if (command === "runtime_resource") return Promise.resolve([]);
+  if (command === "desktop_status")
+    return Promise.resolve({
+      connected: false,
+      connection_detail: "Unavailable in the test fixture.",
+      plan: {
+        platform: "test",
+        session: "headless",
+        screen_capture_backend: "none",
+        accessibility_backend: "none",
+        input_backend: "none",
+        capabilities: [],
+      },
+      permissions: {
+        accessibility: { state: "unavailable" },
+        screen_capture: { state: "unavailable" },
+        input_control: { state: "unavailable" },
+      },
+    });
+  if (command === "portal_status")
+    return Promise.resolve({
+      interfaces: {
+        available_source_types: 0,
+        available_cursor_modes: 0,
+      },
+      phase: "idle",
+      consent: "unavailable",
+      streams: [],
+      pipewire_transport: false,
+      detail: "Unavailable in the test fixture.",
+    });
   if (command === "chat_send")
     return Promise.resolve({
       session_id: "ses_test",
@@ -113,8 +199,8 @@ describe("desktop workspace", () => {
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
-    expect(screen.getByText("desktop.active_view")).toBeInTheDocument();
-    expect(screen.getByText("AT-SPI")).toBeInTheDocument();
+    expect(await screen.findByText("desktop.active_view")).toBeInTheDocument();
+    expect(await screen.findByText("AT-SPI")).toBeInTheDocument();
   });
 
   it("shows explicit private microphone state and disables capture until native STT is ready", () => {
@@ -142,9 +228,10 @@ describe("desktop workspace", () => {
     expect(screen.getByText("＋ New session")).toBeInTheDocument();
   });
 
-  it("exposes every configuration category plus full managed OpenCode JSON", () => {
+  it("exposes every configuration category plus full managed OpenCode JSON", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByRole("heading", { level: 2, name: "Voice Lab" });
     const settingsNavigation = within(document.querySelector(".settings-nav")!);
     for (const section of [
       "Persona",
@@ -181,26 +268,43 @@ describe("desktop workspace", () => {
     ).toBeEnabled();
   });
 
-  it("keeps all desktop destinations keyboard reachable", () => {
+  it("keeps all desktop destinations keyboard reachable and renderable", async () => {
     render(<App />);
-    for (const destination of [
-      "Goals & tasks",
-      "Browser",
-      "Projects & terminal",
-      "Artifacts",
-      "History",
-      "Memory",
-      "Automations",
-      "Integrations",
-      "Skills & agents",
-      "Usage & egress",
-      "Diagnostics",
-      "Settings",
-    ]) {
+    const destinations = [
+      ["Goals & tasks", "Goals & tasks"],
+      ["Browser", "Browser automation boundaries"],
+      ["Projects & terminal", "Projects, files, VCS and terminals"],
+      ["Artifacts", "Encrypted, versioned work products"],
+      ["History", "History and audit trail"],
+      ["Memory", "Trusted, reviewable memory"],
+      ["Automations", "Schedules that survive restart"],
+      ["Integrations", "Providers, MCP servers and integrations"],
+      ["Skills & agents", "Skills & agents"],
+      ["Usage & egress", "Usage & egress"],
+      ["Diagnostics", "Diagnostics"],
+      ["Settings", "Voice Lab"],
+    ] as const;
+    for (const [destination, viewHeading] of destinations) {
       fireEvent.click(screen.getByRole("button", { name: destination }));
       expect(
         screen.getByRole("heading", { level: 1, name: destination }),
       ).toBeInTheDocument();
+      expect(
+        await screen.findByRole("heading", { level: 2, name: viewHeading }),
+      ).toBeInTheDocument();
+      if (destination === "Browser") {
+        expect(
+          await screen.findByRole("heading", {
+            level: 2,
+            name: "See and control the active view",
+          }),
+        ).toBeInTheDocument();
+      }
+      if (destination === "Integrations") {
+        expect(
+          await screen.findByRole("heading", { level: 1, name: "MCP Manager" }),
+        ).toBeInTheDocument();
+      }
     }
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(
@@ -480,8 +584,8 @@ describe("desktop workspace", () => {
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "History" }));
-    expect(screen.getByText("future.additive.event")).toBeInTheDocument();
-    expect(screen.getByText(/future-fixture/)).toBeInTheDocument();
+    expect(await screen.findByText("future.additive.event")).toBeInTheDocument();
+    expect(await screen.findByText(/future-fixture/)).toBeInTheDocument();
   });
 
   it("appends each runtime delta once when ChatView remounts under StrictMode", async () => {

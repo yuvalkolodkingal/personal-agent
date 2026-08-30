@@ -10,7 +10,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@personal-agent/ui": "workspace:*",
     "@tauri-apps/api": "=2.11.1",
     "@xterm/addon-fit": "0.11.0",
     "@xterm/xterm": "6.0.0",
