@@ -1,0 +1,220 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`assistant markdown rendering > renders code fence containing markup 1`] = `
+[
+  {
+    "code": "<img src=x onerror="alert(1)">",
+    "key": "code-0",
+    "kind": "code",
+    "language": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > renders fenced code with language 1`] = `
+[
+  {
+    "html": "<p>Here is the fix:</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+  {
+    "code": "fn main() {
+    println!("hi");
+}",
+    "key": "code-1",
+    "kind": "code",
+    "language": "rust",
+  },
+  {
+    "html": "<p>Done.</p>
+",
+    "key": "html-2",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > renders fenced code without language 1`] = `
+[
+  {
+    "code": "plain block",
+    "key": "code-0",
+    "kind": "code",
+    "language": "",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > renders headings, emphasis, lists and quotes 1`] = `
+[
+  {
+    "html": "<h1>Title</h1>
+<p>Some <strong>bold</strong>, some <em>italic</em>, some <del>struck</del> and <code>inline code</code>.</p>
+<ul>
+<li>first</li>
+<li>second<ul>
+<li>nested</li>
+</ul>
+</li>
+</ul>
+<ol>
+<li>one</li>
+<li>two</li>
+</ol>
+<blockquote>
+<p>quoted claim</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>column</th>
+<th>value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>a</td>
+<td>1</td>
+</tr>
+</tbody></table>
+<hr>
+<p><a href="https://example.com/docs?a=1&amp;b=2" title="https://example.com/docs?a=1&amp;b=2" data-external-link="true" target="_blank" rel="noopener noreferrer nofollow">safe link</a></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises base64 srcset 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises data url link 1`] = `
+[
+  {
+    "html": "<p><span class="markdown-link-blocked" title="Blocked link destination">open</span></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises form action 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises iframe 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises image error handler 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises inline event handler 1`] = `
+[
+  {
+    "html": "click me",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises javascript link 1`] = `
+[
+  {
+    "html": "<p><span class="markdown-link-blocked" title="Blocked link destination">click me</span></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises mixed case script 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises nested sanitiser escape 1`] = `
+[
+  {
+    "html": "<p>&lt;/script&gt;</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises null byte javascript link 1`] = `
+[
+  {
+    "html": "<p>[click me](javascript:alert(1))</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises object embed 1`] = `
+[
+  {
+    "html": "<p></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises remote tracking image 1`] = `
+[
+  {
+    "html": "<p><span class="markdown-image-blocked" title="Images are not fetched">[image: pixel — https://evil.example/pixel.png]</span></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises script tag 1`] = `
+[
+  {
+    "html": "<p>Hello  world</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises style import 1`] = `[]`;
+
+exports[`assistant markdown rendering > sanitises svg onload 1`] = `
+[
+  {
+    "html": "<p>&lt;svg/onload=alert(1)&gt;</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises tab split javascript link 1`] = `
+[
+  {
+    "html": "<p>[click me](java	script:alert(1))</p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;
+
+exports[`assistant markdown rendering > sanitises uppercase javascript anchor 1`] = `
+[
+  {
+    "html": "<p><a>go</a></p>
+",
+    "key": "html-0",
+    "kind": "html",
+  },
+]
+`;

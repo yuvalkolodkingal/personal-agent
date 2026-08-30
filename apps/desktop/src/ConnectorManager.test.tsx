@@ -112,4 +112,45 @@ describe("connector OAuth manager", () => {
       }),
     );
   });
+
+  it("renders empty-state snapshot when no connectors are connected", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "connector_list") return [];
+      return {};
+    });
+    const { container } = render(<ConnectorManager />);
+    const emptyState = container.querySelector(".empty-state");
+    expect(emptyState).toMatchSnapshot();
+  });
+
+  it("renders connector-wizard modal-backdrop snapshot", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "connector_list") return [];
+      return {};
+    });
+    render(<ConnectorManager />);
+    fireEvent.click(await screen.findByRole("button", { name: /Connect app/ }));
+    const backdrop = document.querySelector(".modal-backdrop");
+    expect(backdrop).toMatchSnapshot();
+  });
+
+  it("renders OAuth connector-modal-backdrop snapshot", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "connector_list") return [github];
+      if (command === "connector_oauth_authorize") {
+        return new Promise<{ message: string }>(() => {
+          // Never resolves, keeps the modal open
+        });
+      }
+      return {};
+    });
+    render(<ConnectorManager />);
+    fireEvent.click(await screen.findByRole("button", { name: "Connect OAuth" }));
+    fireEvent.change(screen.getByLabelText(/Public desktop client ID/), {
+      target: { value: "public-github-client-id" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open secure sign-in" }));
+    const backdrop = document.querySelector(".modal-backdrop");
+    expect(backdrop).toMatchSnapshot();
+  });
 });

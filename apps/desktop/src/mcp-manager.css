@@ -225,6 +225,7 @@
 .mcp-modal > header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; padding: 18px 20px; border-bottom: 1px solid var(--mcp-border); background: #08141d; }
 .mcp-modal h2 { font-size: 18px; }
 .mcp-wizard-body { min-height: 0; overflow: auto; padding: 18px 20px; }
+.mcp-wizard-pane { min-height: 0; overflow: auto; padding: 18px 20px; }
 .mcp-source-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .mcp-source-grid > button { position: relative; min-height: 200px; display: flex; flex-direction: column; align-items: flex-start; border: 1px solid var(--mcp-border); border-radius: 9px; padding: 18px; color: #8ea7b1; background: #08141d; text-align: left; }
 .mcp-source-grid > button:hover { border-color: #2d5969; background: #0a1a24; }
@@ -330,4 +331,5 @@
 @media (prefers-reduced-motion: reduce) {
   .mcp-server-card { transition: none; }
   .mcp-modal-backdrop { backdrop-filter: none; }
+  .mcp-wizard-pane { backdrop-filter: none; }
 }

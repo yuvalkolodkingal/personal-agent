@@ -71,7 +71,9 @@ type Diagnostic = {
   capabilities: Array<{
     id: string;
     backend: string;
-    status: { state: string } | string;
+    status:
+      | { state: string; reason?: string; remediation?: string }
+      | string;
   }>;
 };
 type VoiceStateReference = Record<
@@ -164,89 +166,39 @@ type FeatureAuditItem = {
   status: "implemented" | "partial" | "not_wired";
   detail: string;
 };
+
+/// Derive the implementation audit from the live native capability probe.
+///
+/// The previous hardcoded table drifted out of date the moment a backend
+/// changed, so the audit now reports whatever the platform actually reported:
+/// `supported` is implemented, `degraded` is partial, and everything else is
+/// not wired. The reason and remediation carry the detail.
+function auditFromCapabilities(
+  capabilities: Diagnostic["capabilities"],
+): FeatureAuditItem[] {
+  return capabilities.map((capability) => {
+    const status =
+      typeof capability.status === "string"
+        ? { state: capability.status }
+        : capability.status;
+    const detail = [status.reason, status.remediation]
+      .filter((part): part is string => Boolean(part && part.trim()))
+      .join(" ");
+    return {
+      area: capability.id,
+      status:
+        status.state === "supported"
+          ? "implemented"
+          : status.state === "degraded"
+            ? "partial"
+            : "not_wired",
+      detail: detail || capability.backend,
+    };
+  });
+}
 const DEFAULT_SESSION_LIMIT = 12;
 const SESSION_LIMIT_STEP = 12;
 
-const featureAudit: FeatureAuditItem[] = [
-  {
-    area: "Chat, OAuth providers and model selection",
-    status: "implemented",
-    detail:
-      "Authenticated OpenCode sidecar, one global model picker, streamed turns and timeout recovery.",
-  },
-  {
-    area: "English voice conversation",
-    status: "implemented",
-    detail:
-      "Moonshine STT, local phrase wake recognition, Smart Turn endpointing and Qwen3-TTS, with Whisper/Piper compatibility fallbacks.",
-  },
-  {
-    area: "Screen context",
-    status: "partial",
-    detail:
-      "The Browser workspace exposes live active-window context, permission truth and ephemeral pixel capture. Full semantic trees still depend on an OS-native bridge.",
-  },
-  {
-    area: "Desktop visual control",
-    status: "partial",
-    detail:
-      "Generation-bound actions, approvals and postcondition verification are wired. Windows and macOS require signed native helpers; Linux support varies by compositor and installed tools.",
-  },
-  {
-    area: "Encrypted persistent memory",
-    status: "partial",
-    detail:
-      "Encrypted facts, local feature-hash embeddings, hybrid recall, provenance, review and deletion are wired. Writing-style, project-graph and conflict workflows exist in the library but not the desktop snapshot/UI.",
-  },
-  {
-    area: "Sessions and history",
-    status: "implemented",
-    detail:
-      "Resume, rename, bulk selection, deletion, search and a bounded recent-session rail.",
-  },
-  {
-    area: "Goals and task execution",
-    status: "implemented",
-    detail:
-      "Encrypted task graphs run through a restart-safe resident supervisor with bounded concurrency, checkpoint recovery, native approvals, explicit pause/resume/cancel/retry controls and event projection.",
-  },
-  {
-    area: "Browser workspace",
-    status: "partial",
-    detail:
-      "The desktop can start an isolated WebDriver profile, navigate, inspect DOM text and use generation-bound click/type handles. Browser drivers remain an external prerequisite and the browser is not embedded.",
-  },
-  {
-    area: "Projects, terminal and local execution",
-    status: "partial",
-    detail:
-      "A responsive xterm workspace UI now drives native-owned OpenCode PTYs with structured create/input/resize/terminate/reconnect operations, bounded replay and confirmation gates. Sessions persist for the pinned runtime lifetime; Linux is live-verified while Windows/macOS remain build-supported but not yet live-verified here.",
-  },
-  {
-    area: "Artifacts",
-    status: "implemented",
-    detail:
-      "Encrypted content-addressed artifacts, immutable versions, safe previews, source provenance, restoration, export and whiteboard controls are wired.",
-  },
-  {
-    area: "Automations",
-    status: "implemented",
-    detail:
-      "Desktop schedules persist in the encrypted profile, recover without unsafe replay and execute in isolated resident agent sessions with bounded concurrency, missed-run policy, results and native approval suspension. Event-trigger watcher adapters remain explicit unsupported states.",
-  },
-  {
-    area: "App integrations and skills",
-    status: "partial",
-    detail:
-      "GitHub, Gmail and Calendar have native PKCE/state/loopback OAuth with OS-keychain-only tokens and reviewed read-only scopes. The authenticated Skills & Agents workspace discovers runtime agents, commands and skills; it safely manages confirmed user-owned agent/command Markdown while keeping skills discovery-only. Slack/Microsoft OAuth and service-specific workflows remain incomplete.",
-  },
-  {
-    area: "Usage, notifications and updates",
-    status: "partial",
-    detail:
-      "Encrypted provider token and reported-cost accounting, durable scope budgets, content-free egress records, filtered export, and native automation notifications are wired. Provider-omitted prices remain explicitly unknown; desktop toast buttons and automatic updates remain unwired.",
-  },
-];
 
 export function DomainView({
   destination,
@@ -1115,7 +1067,7 @@ export function DiagnosticsView({
         </div>
       </section>
       <h3 className="diagnostic-table-title">Capability and resource truth</h3>
-      <div className="capability-table">
+      <div className="capability-table" aria-label="Capability and resource truth">
         {diagnostic.capabilities.map((item) => (
           <div key={item.id}>
             <strong>{item.id}</strong>
@@ -1139,7 +1091,7 @@ export function DiagnosticsView({
       </div>
       <h3 className="diagnostic-table-title">Implementation audit</h3>
       <div className="feature-audit" aria-label="Implementation audit">
-        {featureAudit.map((item) => (
+        {auditFromCapabilities(diagnostic.capabilities).map((item) => (
           <article key={item.area}>
             <span
               className={`audit-status audit-${item.status}`}

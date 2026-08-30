@@ -199,8 +199,14 @@ describe("desktop workspace", () => {
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
-    expect(await screen.findByText("desktop.active_view")).toBeInTheDocument();
-    expect(await screen.findByText("AT-SPI")).toBeInTheDocument();
+    // The capability truth table and the derived implementation audit both
+    // render live capabilities, so scope to the table this assertion is about.
+    const truth = await screen.findByLabelText("Capability and resource truth");
+    expect(within(truth).getByText("desktop.active_view")).toBeInTheDocument();
+    expect(within(truth).getByText("AT-SPI")).toBeInTheDocument();
+    // The audit is derived from the same probe, never a hardcoded table.
+    const audit = screen.getByLabelText("Implementation audit");
+    expect(within(audit).getByText("desktop.active_view")).toBeInTheDocument();
   });
 
   it("shows explicit private microphone state and disables capture until native STT is ready", () => {
@@ -919,6 +925,311 @@ describe("desktop workspace", () => {
       await screen.findByRole("dialog", { name: "Complete provider sign in" }),
     ).toBeInTheDocument();
   });
+  const runtimeEvent = (
+    type: string,
+    payload: Record<string, unknown>,
+    at = "2026-08-30T12:00:00.000Z",
+    id = `evt-${type}-${at}`,
+  ) => ({
+    schema_version: 1,
+    event_id: id,
+    wall_clock_timestamp: at,
+    monotonic_sequence: 1,
+    origin: "fixture-turn",
+    profile_id: "default",
+    type,
+    payload_json: Array.from(
+      new TextEncoder().encode(JSON.stringify(payload)),
+    ),
+  });
+
+  const streamAssistantText = async (prompt: string, text: string) => {
+    render(<App />);
+    await waitFor(() => expect(listeners.has("runtime-event")).toBe(true));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), {
+      target: { value: prompt },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "chat_send",
+        expect.objectContaining({ text: prompt }),
+      ),
+    );
+    act(() =>
+      listeners.get("runtime-event")?.({
+        payload: runtimeEvent("response.delta", { delta: text }),
+      }),
+    );
+    act(() =>
+      listeners.get("runtime-turn-complete")?.({
+        payload: { text: "", speak: false, status: "completed" },
+      }),
+    );
+  };
+
+  it("renders assistant markdown, code blocks and per-block copy in the transcript", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    await streamAssistantText(
+      "Explain",
+      [
+        "## Plan",
+        "",
+        "Use **ripgrep** and see [the docs](https://example.com/rg).",
+        "",
+        "```sh",
+        "rg --files",
+        "```",
+      ].join("\n"),
+    );
+    const transcript = await screen.findByRole("heading", {
+      name: "Plan",
+      level: 2,
+    });
+    expect(transcript).toBeInTheDocument();
+    expect(document.querySelector(".chat-message.assistant strong"))
+      .toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/rg",
+    );
+    expect(
+      document.querySelector('.markdown-code[data-language="sh"] code'),
+    ).toHaveTextContent("rg --files");
+    fireEvent.click(screen.getByRole("button", { name: "Copy sh code block" }));
+    expect(writeText).toHaveBeenLastCalledWith("rg --files");
+  });
+
+  it("neutralises injected markup in a streamed assistant reply", async () => {
+    await streamAssistantText(
+      "Summarise",
+      'Careful: <img src=x onerror="alert(1)"> and <script>alert(2)</script> and [x](javascript:alert(3)).',
+    );
+    const assistant = await waitFor(() => {
+      const node = document.querySelector(".chat-message.assistant .markdown-body");
+      expect(node).not.toBeNull();
+      return node as HTMLElement;
+    });
+    expect(assistant.querySelector("img, script")).toBeNull();
+    expect(assistant.querySelector("a")).toBeNull();
+    expect(
+      assistant.querySelector(".markdown-link-blocked"),
+    ).toBeInTheDocument();
+    expect(assistant.innerHTML).not.toMatch(/<script/i);
+    expect(assistant.innerHTML).not.toMatch(/onerror/i);
+  });
+
+  it("renders a streamed fixture turn as collapsible tool cards without inventing arguments", async () => {
+    render(<App />);
+    await waitFor(() => expect(listeners.has("runtime-event")).toBe(true));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), {
+      target: { value: "Search the repo" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "chat_send",
+        expect.objectContaining({ text: "Search the repo" }),
+      ),
+    );
+    const emit = (
+      type: string,
+      payload: Record<string, unknown>,
+      at: string,
+    ) =>
+      act(() =>
+        listeners.get("runtime-event")?.({
+          payload: runtimeEvent(type, payload, at, `${type}-${at}`),
+        }),
+      );
+    emit("reasoning.available", { assistantMessageID: "m1" }, "2026-08-30T12:00:00.000Z");
+    emit(
+      "tool.started",
+      { callID: "call_1", tool: "grep", status: "running" },
+      "2026-08-30T12:00:00.000Z",
+    );
+    emit(
+      "tool.completed",
+      { callID: "call_1", tool: "grep", status: "completed" },
+      "2026-08-30T12:00:01.250Z",
+    );
+    emit(
+      "tool.started",
+      { callID: "call_2", tool: "read", status: "running" },
+      "2026-08-30T12:00:02.000Z",
+    );
+
+    const activity = await screen.findByRole("region", {
+      name: "Tool activity",
+    });
+    expect(within(activity).getByText("grep")).toBeInTheDocument();
+    expect(within(activity).getByText("read")).toBeInTheDocument();
+    expect(within(activity).getByText("completed")).toBeInTheDocument();
+    expect(within(activity).getByText("1.25 s")).toBeInTheDocument();
+    expect(within(activity).getByText("running")).toBeInTheDocument();
+    expect(within(activity).getByText("in progress")).toBeInTheDocument();
+    expect(
+      activity.querySelectorAll("details.tool-card"),
+    ).toHaveLength(2);
+    // fallbackConfig has show_tool_details on, but the sidecar boundary keeps
+    // no arguments, so the card must say so rather than fabricate them.
+    expect(
+      within(activity).getAllByText(
+        /Arguments and results are discarded at the runtime boundary/,
+      ),
+    ).toHaveLength(2);
+    expect(
+      within(activity).getByText(/Reasoning available/),
+    ).toBeInTheDocument();
+  });
+
+  it("hides tool details and the reasoning indicator when the settings are off", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "bootstrap")
+        return Promise.resolve({
+          config: {
+            ...fallbackConfig,
+            ui: {
+              ...fallbackConfig.ui,
+              show_tool_details: false,
+              show_reasoning: false,
+            },
+          },
+          projection,
+          history: [],
+          voice: {
+            stt_ready: false,
+            tts_ready: false,
+            playback_ready: false,
+            details: [],
+          },
+        });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    await waitFor(() => expect(listeners.has("runtime-event")).toBe(true));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), {
+      target: { value: "Search the repo" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "chat_send",
+        expect.objectContaining({ text: "Search the repo" }),
+      ),
+    );
+    act(() =>
+      listeners.get("runtime-event")?.({
+        payload: runtimeEvent("reasoning.available", { assistantMessageID: "m1" }),
+      }),
+    );
+    act(() =>
+      listeners.get("runtime-event")?.({
+        payload: runtimeEvent(
+          "tool.started",
+          { callID: "call_1", tool: "grep", status: "running" },
+          "2026-08-30T12:00:00.000Z",
+        ),
+      }),
+    );
+    const activity = await screen.findByRole("region", {
+      name: "Tool activity",
+    });
+    expect(within(activity).getByText("grep")).toBeInTheDocument();
+    expect(
+      within(activity).queryByText(
+        /Arguments and results are discarded at the runtime boundary/,
+      ),
+    ).toBeNull();
+    expect(within(activity).queryByText(/Reasoning available/)).toBeNull();
+  });
+
+  it("creates a session before running a slash command typed with none active", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "session_action")
+        return Promise.resolve({ session_id: "ses_created" });
+      if (command === "runtime_operation")
+        return Promise.resolve({
+          info: { id: "msg_command", role: "assistant" },
+          parts: [{ type: "text", text: "Command output." }],
+        });
+      return baseInvoke(command);
+    });
+    render(<App />);
+    const attach = screen.getByLabelText("Attach files") as HTMLInputElement;
+    fireEvent.change(attach, {
+      target: {
+        files: [new File(["hello"], "notes.txt", { type: "text/plain" })],
+      },
+    });
+    expect(
+      await screen.findByRole("button", { name: "Remove notes.txt" }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Message JARVIS" }), {
+      target: { value: "/compact keep the plan" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("session_action", {
+        action: "new",
+        sessionId: null,
+        directory: fallbackConfig.runtime.working_directory,
+        title: null,
+        confirmed: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "runtime_operation",
+        expect.objectContaining({
+          kind: "session_command",
+          sessionId: "ses_created",
+          payload: expect.objectContaining({
+            command: "compact",
+            arguments: "keep the plan",
+          }),
+        }),
+      ),
+    );
+    expect(
+      invoke.mock.calls.some(([command]) => command === "chat_send"),
+    ).toBe(false);
+    expect(await screen.findByText("Command output.")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Remove notes.txt" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("states only measured platform, profile and pipeline facts in the shell chrome", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "microphone_state") return Promise.resolve(projection);
+      return baseInvoke(command);
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("startup_window_painted"),
+    );
+    expect(await screen.findByText("TEST · TEST")).toBeInTheDocument();
+    expect(screen.getByText("ANALYTICS OFF")).toBeInTheDocument();
+    expect(screen.queryByText("PRIVATE MODE")).toBeNull();
+    expect(screen.queryByText("LINUX · X86_64")).toBeNull();
+    expect(screen.queryByText("Studio profile")).toBeNull();
+    expect(screen.queryByText("⌘K")).toBeNull();
+    expect(screen.getByText("default")).toBeInTheDocument();
+    expect(screen.getByText("Personal Agent v0.1.0")).toBeInTheDocument();
+    expect(document.querySelector(".nav-heading b")).toBeNull();
+    expect(screen.queryByText("Balanced")).toBeNull();
+    expect(screen.getByText("missing → missing")).toBeInTheDocument();
+  });
+
   describe("voice barge-in", () => {
     class MockWorkletNode {
       static instances: MockWorkletNode[] = [];

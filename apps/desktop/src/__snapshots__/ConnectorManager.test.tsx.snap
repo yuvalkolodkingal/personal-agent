@@ -1,0 +1,191 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`connector OAuth manager > renders OAuth connector-modal-backdrop snapshot 1`] = `
+<div
+  class="modal-backdrop"
+  role="presentation"
+>
+  <section
+    aria-labelledby="connector-oauth-title"
+    aria-modal="true"
+    class="connector-wizard connector-oauth-dialog"
+    role="dialog"
+  >
+    <header>
+      <div>
+        <span>
+          SECURE OAUTH
+        </span>
+        <h2
+          id="connector-oauth-title"
+        >
+          Connect 
+          Work GitHub
+        </h2>
+      </div>
+      <button
+        disabled=""
+        type="button"
+      >
+        ×
+      </button>
+    </header>
+    <p>
+      A fresh PKCE-protected browser authorization uses a private loopback callback. Access and refresh tokens go directly to your OS keychain.
+    </p>
+    <label>
+      Public desktop client ID
+      <small>
+        This identifies your OAuth app; it is not a client secret.
+      </small>
+      <input
+        autocomplete="off"
+        disabled=""
+        placeholder="GitHub OAuth App client ID"
+        value="public-github-client-id"
+      />
+    </label>
+    <aside>
+      <strong>
+        Reviewed read-only scopes
+      </strong>
+      <p>
+        read:user · user:email
+      </p>
+    </aside>
+    <p
+      role="status"
+    >
+      Waiting for the browser authorization…
+    </p>
+    <footer>
+      <button
+        type="button"
+      >
+        Cancel authorization
+      </button>
+      <button
+        class="primary"
+        disabled=""
+        type="button"
+      >
+        Waiting…
+      </button>
+    </footer>
+  </section>
+</div>
+`;
+
+exports[`connector OAuth manager > renders connector-wizard modal-backdrop snapshot 1`] = `
+<div
+  class="modal-backdrop"
+  role="presentation"
+>
+  <form
+    class="connector-wizard"
+  >
+    <header>
+      <div>
+        <span>
+          NEW CONNECTION
+        </span>
+        <h2>
+          Connect an app
+        </h2>
+      </div>
+      <button
+        type="button"
+      >
+        ×
+      </button>
+    </header>
+    <label>
+      Service
+      <select>
+        <option
+          value="github"
+        >
+          GitHub
+        </option>
+        <option
+          value="gmail"
+        >
+          Gmail
+        </option>
+        <option
+          value="google_calendar"
+        >
+          Google Calendar
+        </option>
+        <option
+          value="slack"
+        >
+          Slack
+        </option>
+        <option
+          value="microsoft_graph"
+        >
+          Microsoft 365
+        </option>
+        <option
+          value="custom_rest"
+        >
+          Custom REST API
+        </option>
+      </select>
+    </label>
+    <label>
+      Connection name
+      <input
+        required=""
+        value="My GitHub"
+      />
+    </label>
+    <label>
+      Access token 
+      <small>
+        Stored immediately in your OS keychain
+      </small>
+      <input
+        autocomplete="off"
+        placeholder="Leave blank to connect OAuth later"
+        type="password"
+        value=""
+      />
+    </label>
+    <aside>
+      <strong>
+        Safe initial access
+      </strong>
+      <p>
+        Read-only service scopes. Sending, editing, deleting, and external writes require a separate grant and confirmation.
+      </p>
+    </aside>
+    <footer>
+      <button
+        type="button"
+      >
+        Cancel
+      </button>
+      <button
+        class="primary"
+      >
+        Create connection
+      </button>
+    </footer>
+  </form>
+</div>
+`;
+
+exports[`connector OAuth manager > renders empty-state snapshot when no connectors are connected 1`] = `
+<div
+  class="empty-state"
+>
+  <strong>
+    No apps connected
+  </strong>
+  <p>
+    Choose a reviewed template to get started.
+  </p>
+</div>
+`;

@@ -1835,6 +1835,9 @@ select:focus-visible {
   animation: none !important;
   scroll-behavior: auto !important;
 }
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop { backdrop-filter: none; }
+}
 @media (max-width: 1250px) {
   .chat-layout {
     grid-template-columns: 160px minmax(390px, 1fr) 220px;
@@ -5758,6 +5761,12 @@ body {
 }
 .memory-conflict-editor { max-width: 760px; }
 .integrations-providers { grid-template-columns: minmax(0, 1fr); }
+.project-graph-list { display: grid; align-content: start; gap: 10px; }
+.modal-backdrop { position: fixed; z-index: 1000; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(1, 5, 8, 0.78); backdrop-filter: blur(8px); }
+.empty-state { display: grid; place-items: center; align-content: center; text-align: center; border: 1px dashed var(--line); border-radius: 9px; padding: 25px; min-height: 260px; }
+.empty-state strong { color: #adc3cc; font-size: 13px; margin: 12px 0 5px; }
+.empty-state p { max-width: 380px; margin: 0 0 14px; color: #5f7884; font-size: 10px; line-height: 1.55; }
+.execution-arguments { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
 @media (max-width: 760px) {
   .memory-systems-panel > header { flex-direction: column; }
   .memory-systems-panel nav,

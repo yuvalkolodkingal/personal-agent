@@ -12,6 +12,12 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { NativeDictationPanel } from "./NativeDictationPanel";
+import { MarkdownMessage } from "./Markdown";
+import {
+  reduceToolEvent,
+  ToolActivity,
+  type ToolCall,
+} from "./ToolActivity";
 import type {
   AppConfig,
   EventEnvelope,
@@ -655,7 +661,11 @@ export const MessageRow = memo(function MessageRow({
             <span className="message-failed">Stopped / failed</span>
           )}
         </header>
-        <p>{message.text || "…"}</p>
+        {message.role === "assistant" && message.text ? (
+          <MarkdownMessage text={message.text} />
+        ) : (
+          <p>{message.text || "…"}</p>
+        )}
         {message.role === "assistant" && message.text && (
           <div className="message-actions">
             <button
@@ -748,6 +758,8 @@ export function ChatView({
   const [playbackState, setPlaybackState] = useState("idle");
   const [betweenClauses, setBetweenClauses] = useState(false);
   const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(null);
+  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [reasoningAvailable, setReasoningAvailable] = useState(false);
   const [voiceInputMode, setVoiceInputMode] = useState<"agent" | "dictation">(
     "agent",
   );
@@ -971,6 +983,8 @@ export function ChatView({
       pendingDelta.current = "";
       streamedResponseText.current = "";
       setPendingTurn(null);
+      setToolCalls([]);
+      setReasoningAvailable(false);
       setBusy(true);
       setError("");
       setTurnStage("Connecting to model");
@@ -992,11 +1006,29 @@ export function ChatView({
       if (voiceInputModeRef.current === "dictation")
         void dictationClient.current.reset(dictationModeRef.current);
       try {
-        if (text.startsWith("/") && activeSession) {
+        if (text.startsWith("/")) {
+          // FIX-17: a slash command with no session must create one first,
+          // otherwise the command silently fell through to a chat turn.
+          let commandSession = activeSession;
+          if (!commandSession) {
+            const created = await invoke<Json>("session_action", {
+              action: "new",
+              sessionId: null,
+              directory: config.runtime.working_directory,
+              title: null,
+              confirmed: false,
+            });
+            commandSession = String(created.session_id ?? "");
+            if (!commandSession)
+              throw new Error(
+                "The runtime did not return a session for this command.",
+              );
+            setActiveSession(commandSession);
+          }
           const [command, ...args] = text.slice(1).split(/\s+/);
           const result = await invoke<Json>("runtime_operation", {
             kind: "session_command",
-            sessionId: activeSession,
+            sessionId: commandSession,
             directory: config.runtime.working_directory,
             payload: {
               command,
@@ -1011,6 +1043,9 @@ export function ChatView({
           setMessages((current) =>
             current.filter((item) => item.id !== "streaming").concat(extracted),
           );
+          // Commands never carry the staged attachments, so do not leave them
+          // pending as if they had been sent.
+          setAttachments([]);
           completionHandled.current = true;
           streamingActive.current = false;
           setBusy(false);
@@ -1496,7 +1531,12 @@ export function ChatView({
       if (disposed) return;
       onHistory(payload);
       if (payload.type === "response.started") setTurnStage("Thinking");
-      if (payload.type === "reasoning.available") setTurnStage("Reasoning");
+      if (payload.type === "reasoning.available") {
+        setTurnStage("Reasoning");
+        setReasoningAvailable(true);
+      }
+      if (payload.type.startsWith("tool."))
+        setToolCalls((current) => reduceToolEvent(current, payload));
       if (payload.type === "tool.started")
         setTurnStage(`Using ${String(eventPayload(payload).tool ?? "a tool")}`);
       if (payload.type === "tool.completed")
@@ -2195,6 +2235,12 @@ export function ChatView({
               onProfileRender={onMessageProfile}
             />
           ))}
+          <ToolActivity
+            calls={toolCalls}
+            showDetails={config.ui.show_tool_details}
+            reasoningAvailable={reasoningAvailable}
+            showReasoning={config.ui.show_reasoning}
+          />
         </div>
         {voice.partialTranscript && capturing && (
           <div className="live-transcript-dock" role="status">
@@ -2431,7 +2477,10 @@ export function ChatView({
               </div>
               <div>
                 <dt>Pipeline</dt>
-                <dd>Balanced</dd>
+                <dd>
+                  {activeStt} → {activeTts}
+                  {voiceStatus.degraded ? " · fallback active" : ""}
+                </dd>
               </div>
               <div>
                 <dt>Barge-in</dt>
@@ -2976,7 +3025,6 @@ export function App() {
             <span>{selectedModel || "Choose model"}</span>
             <i>⌄</i>
           </button>
-          <kbd>⌘K</kbd>
           <button
             aria-label="Open settings"
             onClick={() => setActive("Settings")}
@@ -2986,9 +3034,9 @@ export function App() {
         </div>
       </header>
       <aside className="sidebar">
+        {/* No chevron here: there is no workspace switcher to open yet. */}
         <div className="nav-heading">
           <span>WORKSPACE</span>
-          <b>⌄</b>
         </div>
         <nav>
           {navigation.map((item) => (
@@ -3008,10 +3056,14 @@ export function App() {
           ))}
         </nav>
         <div className="profile">
-          <span>YK</span>
+          <span>
+            {(projection.active_profile || "??").slice(0, 2).toUpperCase()}
+          </span>
           <div>
-            <strong>Studio profile</strong>
-            <small>● local · offline-capable</small>
+            <strong>{projection.active_profile || "No active profile"}</strong>
+            <small>
+              {diagnostic.product} v{diagnostic.version}
+            </small>
           </div>
         </div>
       </aside>
@@ -3063,9 +3115,12 @@ export function App() {
           <span>
             MICROPHONE {projection.microphone_active ? "LIVE" : "PRIVATE"}
           </span>
-          <span>PRIVATE MODE</span>
+          <span>
+            ANALYTICS {config.privacy.analytics ? "ON" : "OFF"}
+          </span>
           <span className="footer-right">
-            LINUX · X86_64 <b>v{diagnostic.version}</b>
+            {diagnostic.platform.toUpperCase()} ·{" "}
+            {diagnostic.arch.toUpperCase()} <b>v{diagnostic.version}</b>
           </span>
         </footer>
       </main>
