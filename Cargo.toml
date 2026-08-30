@@ -78,3 +78,10 @@ missing_docs = "allow"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# Development builds emit line tables only. The rebuild-test loop is dominated
+# by linking full debug info for the desktop binary, and panics and backtraces
+# still resolve to file and line. Optimization settings are untouched, so the
+# deterministic replay benchmarks measure identical codegen.
+[profile.dev]
+debug = "line-tables-only"

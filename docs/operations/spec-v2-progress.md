@@ -51,6 +51,7 @@
 | STT-3 | DONE | Pinned wheel/model hashes are exact (`faster_whisper_wheel_dependencies_and_complete_model_are_exactly_pinned`), the status probe is metadata-bounded and fail-closed, a tampered pinned model is rejected before CUDA load, `voice_self_test_reports_the_selected_accurate_engine` passes, and the accurate stream never leaks its arbiter lease across restart. Workspace suite green. | `6db6bfd` |
 | TTS-4 | DONE | `cargo test -p personal-agent-desktop kokoro` -> 3 passed, 0 failed: `voice_self_test_synthesizes_via_kokoro_when_kokoro_is_the_selected_backend`, `qwen_failure_falls_to_kokoro_and_emits_the_recovering_event`, `kokoro_failure_falls_to_piper_and_announces_every_remaining_tier`. The ladder tests assert the exact `recovering` event sequence, that Piper never runs once Kokoro recovers, that a missing pinned manifest fails closed to Piper, and that prior-tier errors chain forward. | `8180118` |
 | TTS-5 | DONE | Frontend 17 files / 96 tests and desktop Rust 101/101 pass. `App.test.tsx > voice barge-in` renders the real app, asserts the wake track is not stopped during playback, that `applyConstraints({echoCancellation:true})` ran, and that 400 ms at `speech_prob 0.95` triggers `voice_stop` + Listening. Replay `internal_speaker_stop` p95 = 1 us (max 15 us) against the 100 ms barge-in bar. The `between-clauses` emission that made the half-duplex guard dead code was implemented in `api.rs` with a Rust state-machine test, and the neural wake path now reports `speech_prob`, verified against the real pinned openWakeWord + Silero models. | `c3584c3` |
+| TTS-6 | DONE | `cargo test -p personal-agent-audio` -> 44 passed, 1 pre-existing ignored, including `second_request_for_the_same_phrase_hits_the_disk_cache`, key invalidation on engine/voice/rate, LRU eviction within the 64 MiB budget, and fail-soft truncation/corruption. `python scripts/verify-performance.py` measures `tts_ack_first_audio_ms` p95 = 4,039 us (max 4,210 us) against the 250 ms budget. | `7fdcbd3` |
 
 ## Wave 1 gate
 
@@ -180,11 +181,10 @@ The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
 
 ## Wave 9 gate
 
-Wave 9 is STT-3, STT-5, TTS-4, TTS-5, TTS-6. The gate below was run at the TTS-5 boundary and
-covers STT-3, STT-5, TTS-4, and TTS-5; **TTS-6 is still in flight and this gate will be re-run
-before the wave is closed.** This wave was interrupted by a host crash that killed two in-flight
-subagents; their work was recovered from disk, independently re-verified rather than trusted, and
-finished.
+Wave 9 (STT-3, STT-5, TTS-4, TTS-5, TTS-6) passes the full §14 gate except the inherited
+unavailable Windows target. The wave was interrupted by a host crash that killed two in-flight
+subagents, and a third died later the same way; in every case the work was recovered from disk,
+independently re-verified rather than trusted, and finished by the orchestrator.
 
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`
 both exit 0, and `cargo test --workspace --locked` is fully green with the two pre-existing ignores
@@ -203,6 +203,15 @@ Three defects were found by verification rather than by the implementing agents,
   "400 ms above 0.9" barge-in trigger could not fire on the default openWakeWord path. The neural
   branch now reports it, requested by Rust only while playback is active so STT-1's ambient
   wake-CPU reduction is preserved, and fail-soft when Silero is unavailable.
+- TTS-6 defined `TTS_ACK_PHRASE`, `TTS_WARMUP_TIMEOUT`, and `warmup_ack_phrases` but never called
+  them: warmup pre-synthesis, an explicit part of the task, was unwired. `warmup_tts_phrase_cache`
+  now runs off the deferred startup path and yields the model as soon as a real turn bumps the
+  generation. The three dead-code errors were what exposed the missing requirement.
+
+Build note: `[profile.dev] debug = "line-tables-only"` was added to the workspace `Cargo.toml` to
+cut link time on the rebuild-test loop. Optimization settings are untouched, so replay benchmarks
+measure identical codegen. Measured afterwards: cold `cargo test --workspace --locked` 3m57s;
+incremental desktop rebuild plus 101 tests 1m18s. This was not A/B'd against the previous setting.
 
 The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
 `x86_64-pc-windows-msvc` standard library and `rustup` is not installed.
