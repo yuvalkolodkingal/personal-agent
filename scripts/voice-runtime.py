@@ -9,17 +9,20 @@ output is redirected to stderr so it can never corrupt an IPC response.
 from __future__ import annotations
 
 import argparse
+from array import array
 import contextlib
 import gc
 import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import socket
 import stat
 import struct
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -41,9 +44,99 @@ SILERO_VAD_REVISION = "6478567951ae5c9979ad7b234185b5515f4be7a1"
 SILERO_VAD_SHA256 = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
 SILERO_VAD_WINDOW_SAMPLES = 512
 SILERO_VAD_CONTEXT_SAMPLES = 64
+FASTER_WHISPER_PACKAGE_VERSION = "1.2.1"
+FASTER_WHISPER_WHEEL_SHA256 = "79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7"
+FASTER_WHISPER_MODEL_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+FASTER_WHISPER_MODEL_REVISION = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+FASTER_WHISPER_COMPUTE_TYPE = "int8_float16"
+FASTER_WHISPER_RUNTIME_DEPENDENCIES = [
+    "av==16.0.1",
+    "certifi==2026.7.22",
+    "charset-normalizer==3.5.1",
+    "ctranslate2==4.7.1",
+    "filelock==3.32.4",
+    "flatbuffers==25.12.19",
+    "fsspec==2026.7.0",
+    "hf-xet==1.6.0",
+    "huggingface-hub==0.36.2",
+    "idna==3.19",
+    "numpy==2.5.2",
+    "nvidia-cublas-cu12==12.9.1.4",
+    "nvidia-cudnn-cu12==9.16.0.29",
+    "onnxruntime==1.28.0",
+    "packaging==26.3",
+    "protobuf==7.36.0",
+    "PyYAML==6.0.3",
+    "requests==2.34.2",
+    "setuptools==84.0.0",
+    "tokenizers==0.22.2",
+    "tqdm==4.70.0",
+    "typing-extensions==4.16.0",
+    "urllib3==2.7.0",
+]
+FASTER_WHISPER_MODEL_SHA256 = {
+    "config.json": "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+    "model.bin": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+    "preprocessor_config.json": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+    "tokenizer.json": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+    "vocabulary.json": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+}
+FASTER_WHISPER_WINDOW_SAMPLES = 16_000 * 3
+FASTER_WHISPER_FIRST_PARTIAL_SAMPLES = FASTER_WHISPER_WINDOW_SAMPLES
+FASTER_WHISPER_OVERLAP_SAMPLES = 16_000 // 2
+FASTER_WHISPER_HOP_SAMPLES = (
+    FASTER_WHISPER_WINDOW_SAMPLES - FASTER_WHISPER_OVERLAP_SAMPLES
+)
+FASTER_WHISPER_PARTIAL_ENCODER_FRAMES = 600
+FASTER_WHISPER_PARTIAL_MAX_TOKENS = 48
+MOONSHINE_STREAM_QUEUE_MAX_SAMPLES = 16_000 * 5
+STT_MAX_SAMPLES = 16_000 * 60 * 10
 TTS_CLAUSE_MAX_CHARACTERS = 220
 TTS_STREAM_MAX_FRAME_BYTES = 8 * 1024 * 1024
 TTS_STREAM_DELIMITERS = frozenset(".!?;:")
+
+
+def highest_frequency_cpu_tier(
+    allowed: set[int], frequencies: dict[int, int]
+) -> list[int]:
+    """Select one complete, non-uniform highest-frequency logical CPU tier."""
+    if not allowed or set(frequencies) != allowed:
+        return []
+    peak = max(frequencies.values())
+    tier = sorted(cpu for cpu, frequency in frequencies.items() if frequency == peak)
+    if not tier or len(tier) == len(allowed):
+        return []
+    return tier
+
+
+def prefer_highest_frequency_cpu_tier() -> list[int]:
+    """Let native model threads inherit the fastest CPU tier when detectable.
+
+    Linux hybrid CPUs expose each logical CPU's hardware maximum in sysfs. If
+    that complete topology is unavailable, uniform, or cannot be applied, the
+    worker leaves scheduler policy untouched. Other platforms fail open.
+    """
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    set_affinity = getattr(os, "sched_setaffinity", None)
+    if get_affinity is None or set_affinity is None:
+        return []
+    try:
+        allowed = set(get_affinity(0))
+        frequencies = {
+            cpu: int(
+                Path(
+                    f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
+                ).read_text(encoding="ascii")
+            )
+            for cpu in allowed
+        }
+        tier = highest_frequency_cpu_tier(allowed, frequencies)
+        if not tier:
+            return []
+        set_affinity(0, tier)
+        return tier
+    except (OSError, ValueError):
+        return []
 
 
 def normalized_phrase(value: Any) -> str:
@@ -91,12 +184,30 @@ def tts_clauses(value: Any) -> list[str]:
 
 class VoiceRuntime:
     def __init__(self, root: Path) -> None:
+        # Run before constructing any ONNX/CTranslate2/Torch model so its
+        # native threads inherit the detected performance-core affinity.
+        self.performance_cpu_tier = prefer_highest_frequency_cpu_tier()
         self.root = root
         self.models = root / "models"
         self.moonshine = None
         self.moonshine_thread_mode = ""
+        self.moonshine_partial_lines: dict[int, str] = {}
+        self.moonshine_state_lock = threading.Lock()
+        self.moonshine_jobs: queue.Queue[tuple[str, Any]] | None = None
+        self.moonshine_done: queue.Queue[tuple[bool, Any]] | None = None
+        self.moonshine_thread: threading.Thread | None = None
+        self.moonshine_cancel: threading.Event | None = None
+        self.moonshine_queued_samples = 0
+        self.moonshine_processed_samples = 0
+        self.moonshine_decode_boundary_samples = 0
         self.stream = None
+        self.stt_engine = ""
+        self.stt_language = "en"
+        self.stt_vocabulary: list[str] = []
+        self.stt_audio = array("f")
+        self.next_partial_samples = FASTER_WHISPER_FIRST_PARTIAL_SAMPLES
         self.partial_text = ""
+        self.partial_audio_samples = 0
         self.qwen = None
         self.qwen_kind = ""
         self.smart_turn = None
@@ -118,6 +229,389 @@ class VoiceRuntime:
         # unload protocol stable before those optional GPU engines are installed.
         self.faster_whisper = None
         self.vision_grounding = None
+
+    def _faster_whisper_marker(self) -> dict[str, Any]:
+        marker = self.root / "faster-whisper.json"
+        if not marker.is_file():
+            raise RuntimeError(
+                "faster-whisper large-v3-turbo is not installed; install the Accurate voice profile"
+            )
+        manifest = json.loads(marker.read_text(encoding="utf-8"))
+        expected = {
+            "package": f"faster-whisper=={FASTER_WHISPER_PACKAGE_VERSION}",
+            "wheel_sha256": FASTER_WHISPER_WHEEL_SHA256,
+            "model_id": FASTER_WHISPER_MODEL_ID,
+            "revision": FASTER_WHISPER_MODEL_REVISION,
+            "compute_type": FASTER_WHISPER_COMPUTE_TYPE,
+            "dependencies": FASTER_WHISPER_RUNTIME_DEPENDENCIES,
+        }
+        for key, value in expected.items():
+            if manifest.get(key) != value:
+                raise RuntimeError(
+                    f"faster-whisper install manifest has an unexpected {key}"
+                )
+        model_path = Path(str(manifest.get("model_path", "")))
+        if not model_path.is_dir() or not model_path.is_relative_to(self.root):
+            raise RuntimeError("faster-whisper model files are missing or outside the voice root")
+        required = manifest.get("files")
+        if required != FASTER_WHISPER_MODEL_SHA256:
+            raise RuntimeError("faster-whisper install manifest is incomplete")
+        for name, expected_digest in required.items():
+            asset = model_path / name
+            if not asset.is_file():
+                raise RuntimeError(f"faster-whisper model file is missing: {name}")
+            actual_digest = sha256_file(asset)
+            if actual_digest != expected_digest:
+                raise RuntimeError(
+                    f"faster-whisper model digest mismatch for {name}: "
+                    f"expected {expected_digest}, found {actual_digest}"
+                )
+        manifest["model_path"] = str(model_path)
+        return manifest
+
+    def _load_faster_whisper(self) -> None:
+        if self.faster_whisper is not None:
+            return
+        manifest = self._faster_whisper_marker()
+        from importlib.metadata import PackageNotFoundError, version
+
+        for specification in [
+            f"faster-whisper=={FASTER_WHISPER_PACKAGE_VERSION}",
+            *FASTER_WHISPER_RUNTIME_DEPENDENCIES,
+        ]:
+            package, expected_version = specification.split("==", maxsplit=1)
+            try:
+                installed_version = version(package)
+            except PackageNotFoundError as error:
+                raise RuntimeError(
+                    f"Accurate STT runtime dependency is missing: {package}"
+                ) from error
+            if installed_version != expected_version:
+                raise RuntimeError(
+                    f"Accurate STT runtime dependency mismatch for {package}: "
+                    f"expected {expected_version}, found {installed_version}"
+                )
+        import ctranslate2
+        from faster_whisper import WhisperModel
+
+        if ctranslate2.get_cuda_device_count() < 1:
+            raise RuntimeError("faster-whisper Accurate profile requires a CUDA GPU")
+        self.faster_whisper = WhisperModel(
+            manifest["model_path"],
+            device="cuda",
+            device_index=0,
+            compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+            local_files_only=True,
+        )
+        # CTranslate2 initializes several CUDA kernels lazily. Paying that
+        # one-time cost on the first live three-second window turns an
+        # otherwise warm ~150 ms partial into a near-one-second cold outlier.
+        # Warm the exact low-level partial path once while model loading is
+        # already allowed to block; the zero samples are never exposed as a
+        # transcript or added to a user session.
+        import numpy as np
+
+        try:
+            self._faster_whisper_partial_decode(
+                np.zeros(FASTER_WHISPER_WINDOW_SAMPLES, dtype=np.float32), None
+            )
+        except BaseException:
+            # A partially initialized CUDA model must not make a retry look
+            # loaded after the start request correctly reports failure.
+            self.faster_whisper = None
+            gc.collect()
+            raise
+
+    def _reset_stt_session(self) -> None:
+        self.stt_engine = ""
+        self.stt_language = "en"
+        self.stt_vocabulary = []
+        self.stt_audio = array("f")
+        self.next_partial_samples = FASTER_WHISPER_FIRST_PARTIAL_SAMPLES
+        with self.moonshine_state_lock:
+            self.partial_text = ""
+            self.partial_audio_samples = 0
+            self.moonshine_partial_lines = {}
+            self.moonshine_queued_samples = 0
+            self.moonshine_processed_samples = 0
+            self.moonshine_decode_boundary_samples = 0
+
+    def _capture_moonshine_event(self, event: Any) -> None:
+        """Keep the latest lines emitted by Moonshine's adaptive update gate."""
+        line = getattr(event, "line", None)
+        line_id = getattr(line, "line_id", None)
+        if line is None or not isinstance(line_id, int):
+            return
+        text = str(getattr(line, "text", "")).strip()
+        with self.moonshine_state_lock:
+            if text:
+                self.moonshine_partial_lines[line_id] = text
+            else:
+                self.moonshine_partial_lines.pop(line_id, None)
+            self.partial_text = " ".join(
+                self.moonshine_partial_lines[key]
+                for key in sorted(self.moonshine_partial_lines)
+            ).strip()
+            # This is the amount of source audio the background stream had
+            # accepted when it produced this text, not the newer amount the
+            # protocol thread may already have queued.
+            self.partial_audio_samples = self.moonshine_decode_boundary_samples
+
+    def _run_moonshine_stream(
+        self,
+        stream: Any,
+        jobs: queue.Queue[tuple[str, Any]],
+        done: queue.Queue[tuple[bool, Any]],
+        cancelled: threading.Event,
+    ) -> None:
+        """Own all calls into one Moonshine stream on a single worker thread."""
+        try:
+            while True:
+                action, payload = jobs.get()
+                if action == "audio":
+                    samples, sample_rate_hz = payload
+                    try:
+                        if not cancelled.is_set():
+                            with self.moonshine_state_lock:
+                                boundary = self.moonshine_processed_samples + len(samples)
+                                self.moonshine_decode_boundary_samples = boundary
+                            stream.add_audio(samples, sample_rate_hz)
+                            with self.moonshine_state_lock:
+                                self.moonshine_processed_samples = boundary
+                    finally:
+                        with self.moonshine_state_lock:
+                            self.moonshine_queued_samples = max(
+                                0, self.moonshine_queued_samples - len(samples)
+                            )
+                    continue
+                if action == "stop":
+                    with self.moonshine_state_lock:
+                        self.moonshine_decode_boundary_samples = (
+                            self.moonshine_processed_samples
+                        )
+                    done.put((True, stream.stop()))
+                    return
+                if action == "cancel":
+                    done.put((True, None))
+                    return
+                raise RuntimeError(f"unknown Moonshine stream job: {action}")
+        except BaseException as error:
+            done.put((False, error))
+        finally:
+            stream.close()
+
+    def _start_moonshine_stream(self) -> None:
+        if self.moonshine is None:
+            raise RuntimeError("Moonshine Medium Streaming is not loaded")
+        stream = self.moonshine.create_stream(update_interval=0.45)
+        stream.add_listener(self._capture_moonshine_event)
+        stream.start()
+        jobs: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
+        done: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        cancelled = threading.Event()
+        worker = threading.Thread(
+            target=self._run_moonshine_stream,
+            args=(stream, jobs, done, cancelled),
+            name="moonshine-stream",
+            daemon=True,
+        )
+        self.stream = stream
+        self.moonshine_jobs = jobs
+        self.moonshine_done = done
+        self.moonshine_cancel = cancelled
+        self.moonshine_thread = worker
+        try:
+            worker.start()
+        except BaseException:
+            self.stream = None
+            self.moonshine_jobs = None
+            self.moonshine_done = None
+            self.moonshine_cancel = None
+            self.moonshine_thread = None
+            stream.close()
+            raise
+
+    def _enqueue_moonshine_audio(
+        self, samples: list[Any], sample_rate_hz: int
+    ) -> tuple[str, int]:
+        jobs = self.moonshine_jobs
+        worker = self.moonshine_thread
+        if jobs is None or worker is None or self.stream is None:
+            raise RuntimeError("no Moonshine stream is active")
+        if not worker.is_alive():
+            raise RuntimeError("Moonshine stream worker exited unexpectedly")
+        with self.moonshine_state_lock:
+            queued = self.moonshine_queued_samples + len(samples)
+            if queued > MOONSHINE_STREAM_QUEUE_MAX_SAMPLES:
+                raise RuntimeError("Moonshine stream queue exceeds five seconds of audio")
+            self.moonshine_queued_samples = queued
+        try:
+            jobs.put_nowait(("audio", (samples, sample_rate_hz)))
+        except queue.Full as error:
+            with self.moonshine_state_lock:
+                self.moonshine_queued_samples = max(
+                    0, self.moonshine_queued_samples - len(samples)
+                )
+            raise RuntimeError("Moonshine stream queue is full") from error
+        with self.moonshine_state_lock:
+            return self.partial_text, self.partial_audio_samples
+
+    def _finish_moonshine_stream(self, *, cancel: bool) -> Any:
+        jobs = self.moonshine_jobs
+        done = self.moonshine_done
+        worker = self.moonshine_thread
+        cancelled = self.moonshine_cancel
+        if (
+            jobs is None
+            or done is None
+            or worker is None
+            or cancelled is None
+            or self.stream is None
+        ):
+            return None
+        try:
+            if cancel:
+                cancelled.set()
+                while True:
+                    try:
+                        action, payload = jobs.get_nowait()
+                    except queue.Empty:
+                        break
+                    if action == "audio":
+                        samples, _sample_rate_hz = payload
+                        with self.moonshine_state_lock:
+                            self.moonshine_queued_samples = max(
+                                0, self.moonshine_queued_samples - len(samples)
+                            )
+                jobs.put(("cancel", None), timeout=5)
+            else:
+                # FIFO placement means every accepted audio frame is processed
+                # before the one final endpoint decode.
+                jobs.put(("stop", None), timeout=5)
+            try:
+                succeeded, value = done.get(timeout=120 if not cancel else 15)
+            except queue.Empty as error:
+                raise RuntimeError("Moonshine stream worker did not stop") from error
+            worker.join(timeout=1)
+            if worker.is_alive():
+                raise RuntimeError("Moonshine stream worker did not exit")
+            if not succeeded:
+                raise RuntimeError(f"Moonshine stream failed: {value}") from value
+            return value
+        finally:
+            self.stream = None
+            self.moonshine_jobs = None
+            self.moonshine_done = None
+            self.moonshine_cancel = None
+            self.moonshine_thread = None
+            with self.moonshine_state_lock:
+                self.moonshine_queued_samples = 0
+
+    def _faster_whisper_decode(self, audio: Any, *, final: bool) -> str:
+        if self.faster_whisper is None:
+            raise RuntimeError("faster-whisper is not loaded")
+        import numpy as np
+
+        if isinstance(audio, (str, Path)):
+            source: Any = str(audio)
+        else:
+            samples = np.asarray(audio, dtype=np.float32)
+            if samples.size == 0:
+                return ""
+            source = samples
+        initial_prompt = ", ".join(self.stt_vocabulary[:128]).strip() or None
+        if not final:
+            return self._faster_whisper_partial_decode(source, initial_prompt)
+        segments, _info = self.faster_whisper.transcribe(
+            source,
+            language=self.stt_language,
+            beam_size=5,
+            best_of=5,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            condition_on_previous_text=True,
+            vad_filter=False,
+            word_timestamps=False,
+            initial_prompt=initial_prompt,
+        )
+        return " ".join(
+            str(segment.text).strip()
+            for segment in segments
+            if str(getattr(segment, "text", "")).strip()
+        ).strip()
+
+    def _faster_whisper_partial_decode(
+        self, samples: Any, initial_prompt: str | None
+    ) -> str:
+        """Run one bounded greedy decode over a real three-second window.
+
+        faster-whisper's public streaming path pads every short input to the
+        Whisper 30-second encoder width. The pinned CTranslate2 model accepts a
+        shorter feature sequence, so partials use the same model/tokenizer with
+        six seconds of encoder features (three seconds of captured audio plus
+        zero padding). This is not a wider audio window. The endpoint still
+        uses the public full-width, beam-search transcription path above.
+        """
+        import numpy as np
+        from faster_whisper.audio import pad_or_trim
+        from faster_whisper.tokenizer import Tokenizer
+
+        model = self.faster_whisper
+        if model is None:
+            raise RuntimeError("faster-whisper is not loaded")
+        unused_segments, info = model.transcribe(
+            samples,
+            language=self.stt_language,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            word_timestamps=False,
+            without_timestamps=True,
+            max_new_tokens=FASTER_WHISPER_PARTIAL_MAX_TOKENS,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.1,
+            initial_prompt=initial_prompt,
+        )
+        del unused_segments
+        tokenizer = Tokenizer(
+            model.hf_tokenizer,
+            model.model.is_multilingual,
+            task="transcribe",
+            language=self.stt_language,
+        )
+        features = model.feature_extractor(
+            np.asarray(samples, dtype=np.float32)
+        )[..., :-1]
+        features = pad_or_trim(
+            features, length=FASTER_WHISPER_PARTIAL_ENCODER_FRAMES
+        )
+        encoder_output = model.encode(features)
+        previous_tokens = (
+            tokenizer.encode(" " + initial_prompt.strip()) if initial_prompt else []
+        )
+        prompt = model.get_prompt(
+            tokenizer,
+            previous_tokens,
+            without_timestamps=True,
+        )
+        result, average_log_probability, _temperature, _compression_ratio = (
+            model.generate_with_fallback(
+                encoder_output,
+                prompt,
+                tokenizer,
+                info.transcription_options,
+            )
+        )
+        options = info.transcription_options
+        if (
+            options.no_speech_threshold is not None
+            and result.no_speech_prob > options.no_speech_threshold
+            and options.log_prob_threshold is not None
+            and average_log_probability < options.log_prob_threshold
+        ):
+            return ""
+        return tokenizer.decode(result.sequences_ids[0]).strip()
 
     def _moonshine_marker(self) -> dict[str, Any]:
         marker = self.root / "moonshine.json"
@@ -157,6 +651,12 @@ class VoiceRuntime:
                 model_path,
                 model_arch=wanted_arch,
                 update_interval=0.45,
+                options={
+                    # Partial text is a product requirement. The native
+                    # speculative path is intentionally absent: repeated
+                    # pinned-corpus measurements increased its p95 tail.
+                    "decode_incomplete_lines": "true",
+                },
             )
             self.moonshine_thread_mode = wanted_thread_mode
         if vocabulary and hasattr(self.moonshine, "set_keyterms"):
@@ -484,6 +984,7 @@ class VoiceRuntime:
 
     def status(self) -> dict[str, Any]:
         moonshine_marker = self.root / "moonshine.json"
+        faster_whisper_marker = self.root / "faster-whisper.json"
         qwen_custom = self.models / "qwen3-tts-0.6b-customvoice"
         qwen_base = self.models / "qwen3-tts-0.6b-base"
         smart_turn = self.models / "smart-turn-v3.2-cpu.onnx"
@@ -500,6 +1001,7 @@ class VoiceRuntime:
         )
         return {
             "moonshine_ready": moonshine_marker.is_file(),
+            "faster_whisper_ready": faster_whisper_marker.is_file(),
             "qwen_ready": custom_complete or base_complete,
             "qwen_custom_voice_ready": custom_complete,
             "qwen_clone_ready": base_complete,
@@ -507,8 +1009,10 @@ class VoiceRuntime:
             "embed_ready": embed_model.is_file() and embed_tokenizer.is_file(),
             "moonshine_loaded": self.moonshine is not None,
             "moonshine_thread_mode": self.moonshine_thread_mode or "unloaded",
+            "performance_cpu_tier": self.performance_cpu_tier,
             "qwen_loaded": self.qwen is not None,
             "faster_whisper_loaded": self.faster_whisper is not None,
+            "active_stt_engine": self.stt_engine or "idle",
             "vision_grounding_loaded": self.vision_grounding is not None,
             "embed_loaded": self.embed_session is not None,
             "wake_ready": all(path.is_file() for path in self._wake_paths()),
@@ -548,25 +1052,52 @@ class VoiceRuntime:
 
     def stt_start(self, request: dict[str, Any]) -> dict[str, Any]:
         self._load_smart_turn()
-        self._load_moonshine(
-            [str(item) for item in request.get("vocabulary", [])], streaming=True
-        )
-        self._load_silero_vad()
+        engine = str(request.get("stt_engine", "moonshine")).strip()
+        if engine not in {"moonshine", "faster-whisper"}:
+            raise RuntimeError(f"unsupported neural STT engine: {engine}")
+        vocabulary = [str(item) for item in request.get("vocabulary", [])]
+        language = str(request.get("language", "en")).strip() or "en"
+        if len(vocabulary) > 128 or any(len(item) > 256 for item in vocabulary):
+            raise RuntimeError("STT vocabulary exceeds the worker limits")
+        if len(language) > 16:
+            raise RuntimeError("STT language identifier is too long")
         if self.stream is not None:
-            try:
-                self.stream.stop()
-            except Exception:
-                pass
-        self.partial_text = ""
+            self._finish_moonshine_stream(cancel=True)
+        if engine == "moonshine":
+            self._load_moonshine(vocabulary, streaming=True)
+        else:
+            self._load_faster_whisper()
+        self._load_silero_vad()
+        self._reset_stt_session()
+        self.stt_engine = engine
+        self.stt_language = language
+        self.stt_vocabulary = vocabulary
         self.turn_audio = []
         self._reset_silero_vad()
-        self.stream = self.moonshine.create_stream(update_interval=0.45)
-        self.stream.start()
-        return {
+        if engine == "moonshine":
+            # `Stream.add_audio` runs inference on a load-adaptive cadence (at
+            # least 450 ms of audio, widened by the previous pass cost). A
+            # bounded single-owner queue keeps its synchronous decode off the
+            # 20 ms protocol-ingest path without reordering or dropping audio.
+            self._start_moonshine_stream()
+        result = {
             "state": "listening",
             "text": "",
-            "moonshine_thread_mode": self.moonshine_thread_mode,
+            "engine": engine,
         }
+        if engine == "moonshine":
+            result["model"] = "medium-streaming"
+            result["moonshine_thread_mode"] = self.moonshine_thread_mode
+        else:
+            result.update(
+                {
+                    "model": "large-v3-turbo",
+                    "compute_type": FASTER_WHISPER_COMPUTE_TYPE,
+                    "window_seconds": 3.0,
+                    "overlap_seconds": 0.5,
+                }
+            )
+        return result
 
     def wake_start(self, request: dict[str, Any]) -> dict[str, Any]:
         phrases = request.get("phrases")
@@ -659,59 +1190,97 @@ class VoiceRuntime:
         return {"state": "idle", "stopped": was_active}
 
     def stt_chunk(self, request: dict[str, Any]) -> dict[str, Any]:
-        if self.stream is None:
+        if self.stt_engine not in {"moonshine", "faster-whisper"}:
+            raise RuntimeError("no neural STT stream is active")
+        if self.stt_engine == "moonshine" and self.stream is None:
             raise RuntimeError("no Moonshine stream is active")
         samples = request.get("samples", [])
         if not isinstance(samples, list) or not samples or len(samples) > 32_000:
             raise RuntimeError("invalid speech chunk")
         sample_rate_hz = int(request.get("sample_rate_hz", 16_000))
+        if sample_rate_hz != 16_000:
+            raise RuntimeError("neural STT chunks must be 16 kHz mono audio")
         speech_prob, vad_frames = self._speech_probability(samples, sample_rate_hz)
-        self.stream.add_audio(samples, sample_rate_hz)
         self.turn_audio.extend(float(sample) for sample in samples)
         if len(self.turn_audio) > 16_000 * 8:
             self.turn_audio = self.turn_audio[-16_000 * 8 :]
-        result = self.stream.update_transcription()
-        text = transcript_text(result)
-        if text:
-            self.partial_text = text
-        return {
+        if self.stt_engine == "moonshine":
+            partial_text, partial_audio_samples = self._enqueue_moonshine_audio(
+                samples, sample_rate_hz
+            )
+        else:
+            if len(self.stt_audio) + len(samples) > STT_MAX_SAMPLES:
+                raise RuntimeError("accurate STT capture exceeds the ten-minute limit")
+            self.stt_audio.extend(float(sample) for sample in samples)
+            if len(self.stt_audio) >= self.next_partial_samples:
+                start = max(0, len(self.stt_audio) - FASTER_WHISPER_WINDOW_SAMPLES)
+                text = self._faster_whisper_decode(self.stt_audio[start:], final=False)
+                if text:
+                    self.partial_text = text
+                    self.partial_audio_samples = len(self.stt_audio)
+                self.next_partial_samples += FASTER_WHISPER_HOP_SAMPLES
+            partial_text = self.partial_text
+            partial_audio_samples = self.partial_audio_samples
+        result = {
             "state": "listening",
-            "text": self.partial_text,
+            "text": partial_text,
             "final_result": False,
+            "engine": self.stt_engine,
+            "partial_audio_samples": partial_audio_samples,
             "speech_prob": speech_prob,
             "vad_frames": vad_frames,
             "vad_model": f"silero-vad-{SILERO_VAD_VERSION}",
         }
+        if self.stt_engine == "faster-whisper":
+            result.update(
+                {
+                    "model": "large-v3-turbo",
+                    "compute_type": FASTER_WHISPER_COMPUTE_TYPE,
+                    "window_seconds": 3.0,
+                    "overlap_seconds": 0.5,
+                }
+            )
+        return result
 
     def stt_stop(self, _request: dict[str, Any]) -> dict[str, Any]:
-        if self.stream is None:
-            raise RuntimeError("no Moonshine stream is active")
-        stream = self.stream
-        self.stream = None
-        result = stream.stop()
-        text = transcript_text(result) or self.partial_text
-        self.partial_text = ""
+        engine = self.stt_engine
+        language = self.stt_language
+        if engine == "moonshine" and self.stream is not None:
+            result = self._finish_moonshine_stream(cancel=False)
+            with self.moonshine_state_lock:
+                partial_text = self.partial_text
+            text = transcript_text(result) or partial_text
+        elif engine == "faster-whisper" and self.faster_whisper is not None:
+            text = self._faster_whisper_decode(self.stt_audio, final=True)
+        else:
+            raise RuntimeError("no neural STT stream is active")
+        self._reset_stt_session()
         self.turn_audio = []
         self._reset_silero_vad()
         if not text:
             raise RuntimeError("no speech was detected")
-        return {
+        response = {
             "state": "idle",
             "text": text,
             "final_result": True,
-            "language": "en",
+            "language": language,
+            "engine": engine,
+            "model": "large-v3-turbo" if engine == "faster-whisper" else "medium-streaming",
         }
+        if engine == "faster-whisper":
+            response["compute_type"] = FASTER_WHISPER_COMPUTE_TYPE
+        else:
+            response["moonshine_thread_mode"] = self.moonshine_thread_mode
+        return response
 
     def stt_cancel(self, _request: dict[str, Any]) -> dict[str, Any]:
         if self.stream is not None:
-            try:
-                self.stream.stop()
-            finally:
-                self.stream = None
-        self.partial_text = ""
+            self._finish_moonshine_stream(cancel=True)
+        engine = self.stt_engine
+        self._reset_stt_session()
         self.turn_audio = []
         self._reset_silero_vad()
-        return {"state": "idle", "cancelled": True}
+        return {"state": "idle", "cancelled": True, "engine": engine or "none"}
 
     def turn_complete(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self._load_smart_turn():
@@ -724,25 +1293,46 @@ class VoiceRuntime:
         return result
 
     def stt_transcribe(self, request: dict[str, Any]) -> dict[str, Any]:
-        from moonshine_voice import load_wav_file
-
-        self._load_moonshine(
-            [str(item) for item in request.get("vocabulary", [])], streaming=False
-        )
+        engine = str(request.get("stt_engine", "moonshine")).strip()
+        if engine not in {"moonshine", "faster-whisper"}:
+            raise RuntimeError(f"unsupported neural STT engine: {engine}")
+        vocabulary = [str(item) for item in request.get("vocabulary", [])]
+        language = str(request.get("language", "en")).strip() or "en"
         wav = Path(str(request.get("wav", "")))
         if not wav.is_file() or not wav.is_relative_to(self.root.parent):
             raise RuntimeError("transcription input is outside the private voice directory")
-        audio, sample_rate = load_wav_file(wav)
-        result = self.moonshine.transcribe_without_streaming(audio, sample_rate)
-        text = transcript_text(result)
+        if engine == "moonshine":
+            from moonshine_voice import load_wav_file
+
+            self._load_moonshine(vocabulary, streaming=False)
+            audio, sample_rate = load_wav_file(wav)
+            result = self.moonshine.transcribe_without_streaming(audio, sample_rate)
+            text = transcript_text(result)
+        else:
+            self._load_faster_whisper()
+            previous_language = self.stt_language
+            previous_vocabulary = self.stt_vocabulary
+            self.stt_language = language
+            self.stt_vocabulary = vocabulary
+            try:
+                text = self._faster_whisper_decode(str(wav), final=True)
+            finally:
+                self.stt_language = previous_language
+                self.stt_vocabulary = previous_vocabulary
         if not text:
             raise RuntimeError("no speech was detected")
-        return {
+        response = {
             "text": text,
             "final_result": True,
-            "language": "en",
-            "moonshine_thread_mode": self.moonshine_thread_mode,
+            "language": language,
+            "engine": engine,
+            "model": "large-v3-turbo" if engine == "faster-whisper" else "medium-streaming",
         }
+        if engine == "moonshine":
+            response["moonshine_thread_mode"] = self.moonshine_thread_mode
+        else:
+            response["compute_type"] = FASTER_WHISPER_COMPUTE_TYPE
+        return response
 
     def tts_synthesize(self, request: dict[str, Any]) -> dict[str, Any]:
         import soundfile as sf

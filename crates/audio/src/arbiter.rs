@@ -340,6 +340,21 @@ impl ModelArbiter {
         state.active_leases = 0;
     }
 
+    /// Reconcile registry state after the shared neural worker exits.
+    ///
+    /// Process termination releases the worker's CUDA context and invalidates
+    /// every GPU-model lease. CPU fallbacks are logical entries and remain
+    /// unaffected.
+    pub fn reset_worker_gpu_models(&mut self) {
+        for model in [
+            LocalModel::Qwen3Tts,
+            LocalModel::FasterWhisperLargeV3TurboInt8,
+            LocalModel::VisionGrounding,
+        ] {
+            self.mark_unloaded(model);
+        }
+    }
+
     fn state(&self, model: LocalModel) -> ModelState {
         self.states.get(&model).copied().unwrap_or_default()
     }
@@ -450,5 +465,30 @@ mod tests {
         assert!(arbiter.commit_admission(&plan).is_err());
         assert!(arbiter.is_loaded(LocalModel::VisionGrounding));
         assert!(!arbiter.is_loaded(LocalModel::Qwen3Tts));
+    }
+
+    #[test]
+    fn worker_exit_clears_gpu_residency_and_active_leases() {
+        let mut arbiter = ModelArbiter::new();
+        for model in [
+            LocalModel::Qwen3Tts,
+            LocalModel::FasterWhisperLargeV3TurboInt8,
+            LocalModel::VisionGrounding,
+        ] {
+            admit(&mut arbiter, model);
+            arbiter.activate(model).expect("activate model");
+        }
+
+        arbiter.reset_worker_gpu_models();
+
+        for model in [
+            LocalModel::Qwen3Tts,
+            LocalModel::FasterWhisperLargeV3TurboInt8,
+            LocalModel::VisionGrounding,
+        ] {
+            assert!(!arbiter.is_loaded(model));
+            assert!(!arbiter.is_active(model));
+        }
+        assert_eq!(arbiter.resident_vram_mib(), 0);
     }
 }

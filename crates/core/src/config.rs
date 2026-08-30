@@ -377,8 +377,13 @@ pub struct VoiceConfig {
     #[serde(default = "voice_language")]
     pub response_language: String,
     #[serde(default = "default_stt_backend")]
+    /// Local STT family. `moonshine` selects the persistent neural worker;
+    /// `whisper.cpp` keeps the compatibility subprocess path.
     pub stt_backend: String,
     #[serde(default = "whisper_model")]
+    /// Neural STT profile. `large-v3-turbo` with the `moonshine` backend is the
+    /// opt-in Accurate profile: faster-whisper on CUDA with int8-float16 weights.
+    /// Every other neural model value keeps Moonshine Medium Streaming on CPU.
     pub stt_model: String,
     #[serde(default)]
     pub stt_executable: String,
@@ -539,6 +544,17 @@ impl Default for VoiceConfig {
             hosted_stt_credential_alias: String::new(),
             hosted_tts_credential_alias: String::new(),
         }
+    }
+}
+
+impl VoiceConfig {
+    /// Whether this configuration selects the opt-in CUDA Accurate STT profile.
+    ///
+    /// The backend remains `moonshine` for compatibility with existing config
+    /// and frontend capture routing; `stt_model` chooses the worker engine.
+    #[must_use]
+    pub fn uses_faster_whisper(&self) -> bool {
+        self.stt_backend == "moonshine" && self.stt_model == "large-v3-turbo"
     }
 }
 
@@ -1066,6 +1082,20 @@ mod tests {
             "https://json-schema.org/draft/2020-12/schema"
         );
         assert!(schema["properties"]["risk_acknowledgements"].is_object());
+    }
+
+    #[test]
+    fn accurate_stt_requires_the_neural_backend_and_large_v3_turbo_model() {
+        let mut voice = VoiceConfig {
+            stt_model: "large-v3-turbo".to_owned(),
+            ..VoiceConfig::default()
+        };
+        assert!(voice.uses_faster_whisper());
+        voice.stt_backend = "whisper.cpp".to_owned();
+        assert!(!voice.uses_faster_whisper());
+        voice.stt_backend = "moonshine".to_owned();
+        voice.stt_model = "medium-streaming".to_owned();
+        assert!(!voice.uses_faster_whisper());
     }
 
     #[test]

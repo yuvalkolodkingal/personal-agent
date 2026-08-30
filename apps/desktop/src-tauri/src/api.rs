@@ -1,9 +1,9 @@
 use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime, perf};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
-    AudioError, NativePlaybackControl, NativePlaybackSink, NativeVoiceStatus, NeuralVoiceRuntime,
-    PlaybackEnd, discover_native_voice, play_wav, synthesize_piper, transcribe_pcm, transcribe_wav,
-    write_pcm_wav,
+    AudioError, LocalModel, NativePlaybackControl, NativePlaybackSink, NativeVoiceStatus,
+    NeuralVoiceRuntime, PlaybackEnd, discover_native_voice, play_wav, synthesize_piper,
+    transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 use personal_agent_core::{
     FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust, PersonalAgentConfig,
@@ -556,8 +556,63 @@ fn canonical_directory(
     Ok(directory)
 }
 
+fn faster_whisper_asset_size(name: &str) -> Option<u64> {
+    match name {
+        "config.json" => Some(2_263),
+        "model.bin" => Some(1_617_884_929),
+        "preprocessor_config.json" => Some(340),
+        "tokenizer.json" => Some(2_710_337),
+        "vocabulary.json" => Some(1_068_114),
+        _ => None,
+    }
+}
+
+/// Bounded readiness probe: exact manifest values, paths, and file sizes only.
+///
+/// The installer verifies every download digest and the isolated worker hashes
+/// every model file before its first CUDA load. Reading 1.6 GiB synchronously
+/// here would put model verification back on the desktop bootstrap path.
+fn faster_whisper_install_ready(root: &Path) -> bool {
+    let marker_path = root.join("faster-whisper.json");
+    let model_path = root.join("models/faster-whisper-large-v3-turbo");
+    let manifest = std::fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    manifest.is_some_and(|manifest| {
+        manifest.get("package").and_then(Value::as_str) == Some("faster-whisper==1.2.1")
+            && manifest.get("wheel_sha256").and_then(Value::as_str)
+                == Some(FASTER_WHISPER_WHEEL.sha256)
+            && manifest.get("model_id").and_then(Value::as_str) == Some(FASTER_WHISPER_MODEL_ID)
+            && manifest.get("revision").and_then(Value::as_str)
+                == Some(FASTER_WHISPER_MODEL_REVISION)
+            && manifest.get("compute_type").and_then(Value::as_str)
+                == Some(FASTER_WHISPER_COMPUTE_TYPE)
+            && manifest
+                .get("dependencies")
+                .and_then(Value::as_array)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        == &FASTER_WHISPER_RUNTIME_DEPENDENCIES
+                            .iter()
+                            .map(|dependency| json!(dependency))
+                            .collect::<Vec<_>>()
+                })
+            && manifest.get("model_path").and_then(Value::as_str) == model_path.to_str()
+            && manifest.get("files").is_some_and(|files| {
+                faster_whisper_model_assets().iter().all(|asset| {
+                    files.get(asset.name).and_then(Value::as_str) == Some(asset.sha256)
+                        && faster_whisper_asset_size(asset.name).is_some_and(|expected| {
+                            std::fs::metadata(model_path.join(asset.name)).is_ok_and(|metadata| {
+                                metadata.is_file() && metadata.len() == expected
+                            })
+                        })
+                }) && files.as_object().is_some_and(|files| files.len() == 5)
+            })
+    })
+}
+
 fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> NativeVoiceStatus {
-    discover_native_voice(
+    let mut status = discover_native_voice(
         &state.app_data.join("voice"),
         &config.voice.stt_backend,
         &config.voice.tts_backend,
@@ -566,7 +621,75 @@ fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> Nativ
         &config.voice.tts_executable,
         &config.voice.tts_model_path,
         &config.voice.output_device,
-    )
+    );
+    if config.voice.uses_faster_whisper() {
+        let ready = status.neural_python.is_some()
+            && faster_whisper_install_ready(&state.app_data.join("voice/neural"));
+        status.stt_ready =
+            ready || status.whisper_executable.is_some() && status.whisper_model.is_some();
+        status.active_stt_backend = if ready {
+            "faster-whisper".to_owned()
+        } else if status.whisper_executable.is_some() && status.whisper_model.is_some() {
+            "whisper.cpp".to_owned()
+        } else {
+            "faster-whisper".to_owned()
+        };
+        status.degraded = !ready || status.active_tts_backend != config.voice.tts_backend;
+        if ready {
+            status.details.push(
+                "Accurate STT is ready: faster-whisper large-v3-turbo int8_float16 on CUDA."
+                    .to_owned(),
+            );
+        } else {
+            status.details.push(
+                "Accurate STT is not installed; install the pinned faster-whisper profile."
+                    .to_owned(),
+            );
+        }
+    }
+    status
+}
+
+async fn ensure_neural_voice_runtime(
+    state: &DesktopState,
+    runtime: &mut Option<NeuralVoiceRuntime>,
+    python: &Path,
+) -> Result<(), String> {
+    if runtime.is_none() {
+        let worker = NeuralVoiceRuntime::start(
+            python,
+            &state.voice_runtime_script,
+            &state.app_data.join("voice/neural"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        state
+            .voice_runtime_pid
+            .store(worker.process_id().unwrap_or(0), Ordering::SeqCst);
+        *runtime = Some(worker);
+    }
+    Ok(())
+}
+
+async fn reset_neural_worker_registry(state: &DesktopState) {
+    state
+        .voice_model_arbiter
+        .lock()
+        .await
+        .reset_worker_gpu_models();
+    *state.voice_stt_model.lock().await = None;
+}
+
+async fn terminate_failed_neural_worker(
+    state: &DesktopState,
+    runtime: &mut Option<NeuralVoiceRuntime>,
+) {
+    if let Some(worker) = runtime.as_mut() {
+        worker.terminate();
+    }
+    *runtime = None;
+    state.voice_runtime_pid.store(0, Ordering::SeqCst);
+    reset_neural_worker_registry(state).await;
 }
 
 async fn neural_voice_request(
@@ -581,32 +704,84 @@ async fn neural_voice_request(
         .neural_python
         .ok_or_else(|| "The neural voice runtime is not installed. Open Voice settings and install Balanced voice.".to_owned())?;
     let mut runtime = state.voice_runtime.lock().await;
-    if runtime.is_none() {
-        let worker = NeuralVoiceRuntime::start(
-            &python,
-            &state.voice_runtime_script,
-            &state.app_data.join("voice/neural"),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        state
-            .voice_runtime_pid
-            .store(worker.process_id().unwrap_or(0), Ordering::SeqCst);
-        *runtime = Some(worker);
-    }
+    ensure_neural_voice_runtime(state, &mut runtime, &python).await?;
     let result = runtime
         .as_mut()
         .expect("voice runtime was initialized")
         .request(command, payload, timeout)
         .await;
     if result.is_err() {
-        if let Some(worker) = runtime.as_mut() {
-            worker.terminate();
-        }
-        *runtime = None;
-        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+        terminate_failed_neural_worker(state, &mut runtime).await;
     }
     result.map_err(|error| error.to_string())
+}
+
+async fn neural_voice_model_request(
+    state: &DesktopState,
+    model: LocalModel,
+    retain_lease: bool,
+    command: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let config = config_snapshot(state)?;
+    let status = voice_status_for(state, &config);
+    let python = status
+        .neural_python
+        .ok_or_else(|| "The neural voice runtime is not installed. Open Voice settings and install the selected neural profile.".to_owned())?;
+    let mut runtime = state.voice_runtime.lock().await;
+    ensure_neural_voice_runtime(state, &mut runtime, &python).await?;
+    let retained = *state.voice_stt_model.lock().await;
+    let needs_activation = if retain_lease {
+        retained_model_needs_activation(retained, model)?
+    } else {
+        true
+    };
+    if needs_activation {
+        let worker = runtime.as_mut().expect("voice runtime was initialized");
+        let mut arbiter = state.voice_model_arbiter.lock().await;
+        worker
+            .prepare_model_load(&mut arbiter, model, Duration::from_secs(30))
+            .await
+            .map_err(|error| error.to_string())?;
+        arbiter.activate(model).map_err(|error| error.to_string())?;
+    }
+
+    let result = runtime
+        .as_mut()
+        .expect("voice runtime was initialized")
+        .request(command, payload, timeout)
+        .await;
+    if result.is_err() {
+        terminate_failed_neural_worker(state, &mut runtime).await;
+    } else if retain_lease {
+        *state.voice_stt_model.lock().await = Some(model);
+    } else {
+        state.voice_model_arbiter.lock().await.release(model);
+    }
+    result.map_err(|error| error.to_string())
+}
+
+fn retained_model_needs_activation(
+    retained: Option<LocalModel>,
+    requested: LocalModel,
+) -> Result<bool, String> {
+    match retained {
+        None => Ok(true),
+        Some(current) if current == requested => Ok(false),
+        Some(current) => Err(format!(
+            "cannot replace active neural STT model {} with {} before stopping its stream",
+            current.worker_id(),
+            requested.worker_id()
+        )),
+    }
+}
+
+async fn release_neural_stt_lease(state: &DesktopState) {
+    let model = { state.voice_stt_model.lock().await.take() };
+    if let Some(model) = model {
+        state.voice_model_arbiter.lock().await.release(model);
+    }
 }
 
 async fn neural_voice_tts_stream<F>(
@@ -625,18 +800,17 @@ where
         .neural_python
         .ok_or_else(|| "The neural voice runtime is not installed. Open Voice settings and install Balanced voice.".to_owned())?;
     let mut runtime = state.voice_runtime.lock().await;
-    if runtime.is_none() {
-        let worker = NeuralVoiceRuntime::start(
-            &python,
-            &state.voice_runtime_script,
-            &state.app_data.join("voice/neural"),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        state
-            .voice_runtime_pid
-            .store(worker.process_id().unwrap_or(0), Ordering::SeqCst);
-        *runtime = Some(worker);
+    ensure_neural_voice_runtime(state, &mut runtime, &python).await?;
+    {
+        let worker = runtime.as_mut().expect("voice runtime was initialized");
+        let mut arbiter = state.voice_model_arbiter.lock().await;
+        worker
+            .prepare_model_load(&mut arbiter, LocalModel::Qwen3Tts, Duration::from_secs(30))
+            .await
+            .map_err(|error| error.to_string())?;
+        arbiter
+            .activate(LocalModel::Qwen3Tts)
+            .map_err(|error| error.to_string())?;
     }
 
     let result = runtime
@@ -651,12 +825,13 @@ where
             |frame| on_frame(frame),
         )
         .await;
+    state
+        .voice_model_arbiter
+        .lock()
+        .await
+        .release(LocalModel::Qwen3Tts);
     if result.is_err() {
-        if let Some(worker) = runtime.as_mut() {
-            worker.terminate();
-        }
-        *runtime = None;
-        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+        terminate_failed_neural_worker(state, &mut runtime).await;
     }
     result.map_err(|error| error.to_string())
 }
@@ -2705,18 +2880,15 @@ pub(crate) async fn voice_transcribe(
     }
     let config = config_snapshot(&state)?;
     let status = voice_status_for(&state, &config);
-    if status.active_stt_backend == "moonshine" {
+    if matches!(
+        status.active_stt_backend.as_str(),
+        "moonshine" | "faster-whisper"
+    ) {
         let working = state.app_data.join("voice/runtime");
         std::fs::create_dir_all(&working).map_err(|error| error.to_string())?;
         let wav = working.join(format!("stt-neural-{}.wav", uuid::Uuid::new_v4()));
         write_pcm_wav(&wav, &samples, sample_rate_hz).map_err(|error| error.to_string())?;
-        let result = neural_voice_request(
-            &state,
-            "stt_transcribe",
-            json!({"wav": &wav, "vocabulary": &config.voice.vocabulary}),
-            Duration::from_secs(90),
-        )
-        .await;
+        let result = neural_stt_transcribe_wav(&state, &config, &status, &wav).await;
         let _ = std::fs::remove_file(&wav);
         if let Ok(value) = result {
             return Ok(value);
@@ -2743,23 +2915,69 @@ pub(crate) async fn voice_transcribe(
     Ok(json!(transcript))
 }
 
+async fn neural_stt_transcribe_wav(
+    state: &DesktopState,
+    config: &PersonalAgentConfig,
+    status: &NativeVoiceStatus,
+    wav: &Path,
+) -> Result<Value, String> {
+    let payload = json!({
+        "wav": wav,
+        "vocabulary": &config.voice.vocabulary,
+        "language": &config.voice.language,
+        "stt_engine": &status.active_stt_backend,
+    });
+    if status.active_stt_backend == "faster-whisper" {
+        neural_voice_model_request(
+            state,
+            LocalModel::FasterWhisperLargeV3TurboInt8,
+            false,
+            "stt_transcribe",
+            payload,
+            Duration::from_secs(180),
+        )
+        .await
+    } else {
+        neural_voice_request(state, "stt_transcribe", payload, Duration::from_secs(90)).await
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn voice_stream_start(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
     let config = config_snapshot(&state)?;
     let status = voice_status_for(&state, &config);
-    if status.active_stt_backend != "moonshine" {
+    if !matches!(
+        status.active_stt_backend.as_str(),
+        "moonshine" | "faster-whisper"
+    ) {
         return Ok(json!({"streaming": false, "backend": status.active_stt_backend}));
     }
-    let result = neural_voice_request(
-        &state,
-        "stt_start",
-        json!({"language": "en", "vocabulary": &config.voice.vocabulary}),
-        Duration::from_secs(120),
-    )
-    .await?;
-    Ok(json!({"streaming": true, "backend": "moonshine", "result": result}))
+    let payload = json!({
+        "language": &config.voice.language,
+        "vocabulary": &config.voice.vocabulary,
+        "stt_engine": &status.active_stt_backend,
+    });
+    let result = if status.active_stt_backend == "faster-whisper" {
+        neural_voice_model_request(
+            &state,
+            LocalModel::FasterWhisperLargeV3TurboInt8,
+            true,
+            "stt_start",
+            payload,
+            Duration::from_secs(180),
+        )
+        .await?
+    } else {
+        let result =
+            neural_voice_request(&state, "stt_start", payload, Duration::from_secs(120)).await?;
+        // The worker transition is serialized by `voice_runtime`; only after it
+        // has replaced the old session may an Accurate-model lease be released.
+        release_neural_stt_lease(&state).await;
+        result
+    };
+    Ok(json!({"streaming": true, "backend": status.active_stt_backend, "result": result}))
 }
 
 #[tauri::command]
@@ -2786,14 +3004,20 @@ pub(crate) async fn voice_stream_chunk(
 pub(crate) async fn voice_stream_stop(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
-    neural_voice_request(&state, "stt_stop", json!({}), Duration::from_secs(45)).await
+    let result =
+        neural_voice_request(&state, "stt_stop", json!({}), Duration::from_secs(180)).await;
+    release_neural_stt_lease(&state).await;
+    result
 }
 
 #[tauri::command]
 pub(crate) async fn voice_stream_cancel(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
-    neural_voice_request(&state, "stt_cancel", json!({}), Duration::from_secs(10)).await
+    let result =
+        neural_voice_request(&state, "stt_cancel", json!({}), Duration::from_secs(10)).await;
+    release_neural_stt_lease(&state).await;
+    result
 }
 
 #[tauri::command]
@@ -2845,9 +3069,7 @@ pub(crate) async fn voice_wake_stop(
         .request("wake_stop", json!({}), Duration::from_secs(5))
         .await;
     if result.is_err() {
-        worker.terminate();
-        *runtime = None;
-        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+        terminate_failed_neural_worker(&state, &mut runtime).await;
     }
     result.map_err(|error| error.to_string())
 }
@@ -2884,7 +3106,8 @@ fn silence_fallback_decision() -> Value {
 }
 
 fn endpoint_fallback_decision(active_stt_backend: &str, smart_turn_ready: bool) -> Option<Value> {
-    (active_stt_backend != "moonshine" || !smart_turn_ready).then(silence_fallback_decision)
+    (!matches!(active_stt_backend, "moonshine" | "faster-whisper") || !smart_turn_ready)
+        .then(silence_fallback_decision)
 }
 
 async fn register_native_playback(
@@ -3381,6 +3604,24 @@ async fn wait_for_playback(
     }
 }
 
+fn voice_self_test_report(
+    transcript: &str,
+    synthesis_ms: u64,
+    recognition_ms: u64,
+    stt_engine: &str,
+    tts_backend: &str,
+) -> Value {
+    json!({
+        "ok": true,
+        "transcript": transcript,
+        "synthesis_ms": synthesis_ms,
+        "recognition_ms": recognition_ms,
+        "stt_backend": stt_engine,
+        "stt_engine": stt_engine,
+        "tts_backend": tts_backend,
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn voice_self_test(
     state: tauri::State<'_, DesktopState>,
@@ -3392,8 +3633,10 @@ pub(crate) async fn voice_self_test(
     let started = Instant::now();
     let wav = if status.active_tts_backend == "qwen3-tts" {
         let output = working.join(format!("self-test-qwen-{}.wav", uuid::Uuid::new_v4()));
-        let value = neural_voice_request(
+        let value = neural_voice_model_request(
             &state,
+            LocalModel::Qwen3Tts,
+            false,
             "tts_synthesize",
             json!({
                 "text": "Personal Agent voice test",
@@ -3432,21 +3675,19 @@ pub(crate) async fn voice_self_test(
     };
     let synthesis_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let recognition_started = Instant::now();
-    let result = if status.active_stt_backend == "moonshine" {
-        neural_voice_request(
-            &state,
-            "stt_transcribe",
-            json!({"wav": &wav, "vocabulary": &config.voice.vocabulary}),
-            Duration::from_secs(90),
-        )
-        .await
-        .and_then(|value| {
-            value
-                .get("text")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| "Moonshine returned no test transcript".to_owned())
-        })
+    let result = if matches!(
+        status.active_stt_backend.as_str(),
+        "moonshine" | "faster-whisper"
+    ) {
+        neural_stt_transcribe_wav(&state, &config, &status, &wav)
+            .await
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "the neural STT engine returned no test transcript".to_owned())
+            })
     } else {
         let whisper = status
             .whisper_executable
@@ -3469,14 +3710,13 @@ pub(crate) async fn voice_self_test(
     };
     let _ = std::fs::remove_file(&wav);
     let transcript = result?;
-    Ok(json!({
-        "ok": true,
-        "transcript": transcript,
-        "synthesis_ms": synthesis_ms,
-        "recognition_ms": u64::try_from(recognition_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "stt_backend": status.active_stt_backend,
-        "tts_backend": status.active_tts_backend,
-    }))
+    Ok(voice_self_test_report(
+        &transcript,
+        synthesis_ms,
+        u64::try_from(recognition_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        &status.active_stt_backend,
+        &status.active_tts_backend,
+    ))
 }
 
 async fn voice_stop_inner(
@@ -3630,6 +3870,91 @@ const SMART_TURN_V3_2: VoiceAsset = VoiceAsset {
     url: "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx",
     sha256: "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f",
 };
+const FASTER_WHISPER_WHEEL: VoiceAsset = VoiceAsset {
+    name: "faster_whisper-1.2.1-py3-none-any.whl",
+    url: "https://files.pythonhosted.org/packages/05/99/49ee85903dee060d9f08297b4a342e5e0bcfca2f027a07b4ee0a38ab13f9/faster_whisper-1.2.1-py3-none-any.whl",
+    sha256: "79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7",
+};
+const FASTER_WHISPER_MODEL_ID: &str = "mobiuslabsgmbh/faster-whisper-large-v3-turbo";
+const FASTER_WHISPER_MODEL_REVISION: &str = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf";
+const FASTER_WHISPER_COMPUTE_TYPE: &str = "int8_float16";
+const FASTER_WHISPER_RUNTIME_DEPENDENCIES: [&str; 23] = [
+    "av==16.0.1",
+    "certifi==2026.7.22",
+    "charset-normalizer==3.5.1",
+    "ctranslate2==4.7.1",
+    "filelock==3.32.4",
+    "flatbuffers==25.12.19",
+    "fsspec==2026.7.0",
+    "hf-xet==1.6.0",
+    "huggingface-hub==0.36.2",
+    "idna==3.19",
+    "numpy==2.5.2",
+    "nvidia-cublas-cu12==12.9.1.4",
+    "nvidia-cudnn-cu12==9.16.0.29",
+    "onnxruntime==1.28.0",
+    "packaging==26.3",
+    "protobuf==7.36.0",
+    "PyYAML==6.0.3",
+    "requests==2.34.2",
+    "setuptools==84.0.0",
+    "tokenizers==0.22.2",
+    "tqdm==4.70.0",
+    "typing-extensions==4.16.0",
+    "urllib3==2.7.0",
+];
+const FASTER_WHISPER_CONFIG: VoiceAsset = VoiceAsset {
+    name: "config.json",
+    url: "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/config.json",
+    sha256: "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+};
+const FASTER_WHISPER_MODEL: VoiceAsset = VoiceAsset {
+    name: "model.bin",
+    url: "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/model.bin",
+    sha256: "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+};
+const FASTER_WHISPER_PREPROCESSOR: VoiceAsset = VoiceAsset {
+    name: "preprocessor_config.json",
+    url: "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/preprocessor_config.json",
+    sha256: "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+};
+const FASTER_WHISPER_TOKENIZER: VoiceAsset = VoiceAsset {
+    name: "tokenizer.json",
+    url: "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/tokenizer.json",
+    sha256: "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+};
+const FASTER_WHISPER_VOCABULARY: VoiceAsset = VoiceAsset {
+    name: "vocabulary.json",
+    url: "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/vocabulary.json",
+    sha256: "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+};
+
+fn faster_whisper_model_assets() -> [&'static VoiceAsset; 5] {
+    [
+        &FASTER_WHISPER_CONFIG,
+        &FASTER_WHISPER_MODEL,
+        &FASTER_WHISPER_PREPROCESSOR,
+        &FASTER_WHISPER_TOKENIZER,
+        &FASTER_WHISPER_VOCABULARY,
+    ]
+}
+
+fn faster_whisper_install_manifest(model_path: &Path) -> Value {
+    let files = faster_whisper_model_assets()
+        .into_iter()
+        .map(|asset| (asset.name, asset.sha256))
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "package": "faster-whisper==1.2.1",
+        "wheel_sha256": FASTER_WHISPER_WHEEL.sha256,
+        "model_id": FASTER_WHISPER_MODEL_ID,
+        "revision": FASTER_WHISPER_MODEL_REVISION,
+        "compute_type": FASTER_WHISPER_COMPUTE_TYPE,
+        "dependencies": FASTER_WHISPER_RUNTIME_DEPENDENCIES,
+        "model_path": model_path,
+        "files": files,
+    })
+}
 
 async fn download_voice_asset(
     asset: &VoiceAsset,
@@ -3695,6 +4020,14 @@ fn promote_directory(staged: &Path, destination: &Path) -> Result<(), String> {
             let _ = std::fs::rename(&previous, destination);
         }
         return Err(error.to_string());
+    }
+    if previous.exists() {
+        std::fs::remove_dir_all(&previous).map_err(|error| {
+            format!(
+                "installed replacement but could not remove previous directory {}: {error}",
+                previous.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -3824,6 +4157,113 @@ async fn ensure_neural_python(root: &Path, app: &tauri::AppHandle) -> Result<Pat
         return Err("uv completed without creating the neural Python runtime".to_owned());
     }
     Ok(python)
+}
+
+fn atomic_write_private_json(path: &Path, value: &Value) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "voice manifest path has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".voice-manifest-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let rendered = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&rendered)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+async fn install_accurate_stt(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
+    if (std::env::consts::OS, std::env::consts::ARCH) != ("linux", "x86_64") {
+        return Err(
+            "automatic Accurate STT installation currently supports Linux x86_64 with CUDA"
+                .to_owned(),
+        );
+    }
+    let python = ensure_neural_python(root, app).await?;
+    let wheel = root.join("downloads").join(FASTER_WHISPER_WHEEL.name);
+    download_voice_asset(&FASTER_WHISPER_WHEEL, &wheel, app).await?;
+    let mut dependencies = Command::new("uv");
+    dependencies
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .arg("--no-deps")
+        .args(FASTER_WHISPER_RUNTIME_DEPENDENCIES);
+    run_voice_installer(
+        app,
+        "Installing exact faster-whisper runtime dependencies",
+        dependencies,
+        Duration::from_mins(10),
+    )
+    .await?;
+    let mut install = Command::new("uv");
+    install
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .arg("--no-deps")
+        .arg(&wheel);
+    let install_result = run_voice_installer(
+        app,
+        "Installing pinned faster-whisper 1.2.1 CUDA runtime",
+        install,
+        Duration::from_mins(10),
+    )
+    .await;
+    let _ = std::fs::remove_file(&wheel);
+    install_result?;
+
+    let neural = root.join("neural");
+    let destination = neural.join("models/faster-whisper-large-v3-turbo");
+    let staging = neural.join(format!(
+        "models/.faster-whisper-staging-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let result = async {
+        for asset in faster_whisper_model_assets() {
+            download_voice_asset(asset, &staging.join(asset.name), app).await?;
+        }
+        promote_directory(&staging, &destination)?;
+        download_voice_asset(
+            &SILERO_VAD_V5,
+            &neural.join("models").join(SILERO_VAD_V5.name),
+            app,
+        )
+        .await?;
+        download_voice_asset(
+            &SMART_TURN_V3_2,
+            &neural.join("models").join(SMART_TURN_V3_2.name),
+            app,
+        )
+        .await?;
+        // Publish readiness only after every asset used by the Accurate
+        // streaming path is present. A failed ancillary download leaves the
+        // already-verified model reusable by a retry but never claims ready.
+        atomic_write_private_json(
+            &neural.join("faster-whisper.json"),
+            &faster_whisper_install_manifest(&destination),
+        )
+    }
+    .await;
+    if result.is_err() && staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 async fn install_memory_embedder(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
@@ -3968,10 +4408,16 @@ pub(crate) async fn voice_install(
 ) -> Result<NativeVoiceStatus, String> {
     let root = state.app_data.join("voice");
     match component.as_str() {
-        "balanced" | "neural" => {
+        "balanced" => {
             install_neural_voice(&root, &app).await?;
             install_memory_embedder(&root, &app).await?;
         }
+        "neural" => {
+            install_neural_voice(&root, &app).await?;
+            install_accurate_stt(&root, &app).await?;
+            install_memory_embedder(&root, &app).await?;
+        }
+        "accurate" | "faster-whisper" => install_accurate_stt(&root, &app).await?,
         "memory-embedder" => install_memory_embedder(&root, &app).await?,
         "whisper" => install_whisper_engine(&root, &app).await?,
         "whisper-model" => {
@@ -3995,6 +4441,7 @@ pub(crate) async fn voice_install(
             install_piper_engine(&root, &app).await?;
             install_piper_voice(&root, &app).await?;
             install_neural_voice(&root, &app).await?;
+            install_accurate_stt(&root, &app).await?;
             install_memory_embedder(&root, &app).await?;
         }
         _ => return Err("unknown voice component".to_owned()),
@@ -4012,6 +4459,38 @@ mod tests {
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn directory_promotion_removes_the_replaced_installation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "personal-agent-voice-promotion-{}-{nonce}",
+            std::process::id()
+        ));
+        let staged = root.join("staged");
+        let destination = root.join("model");
+        std::fs::create_dir_all(&staged).expect("create staged installation");
+        std::fs::create_dir_all(&destination).expect("create existing installation");
+        std::fs::write(staged.join("version"), b"new").expect("write staged version");
+        std::fs::write(destination.join("version"), b"old").expect("write old version");
+
+        promote_directory(&staged, &destination).expect("promote replacement");
+
+        assert_eq!(
+            std::fs::read(destination.join("version")).expect("read promoted version"),
+            b"new"
+        );
+        assert!(!staged.exists());
+        let leftovers = std::fs::read_dir(&root)
+            .expect("list promotion root")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(leftovers, [std::ffi::OsString::from("model")]);
+        std::fs::remove_dir_all(root).expect("remove promotion fixture");
+    }
 
     fn worker_test_python() -> PathBuf {
         for variable in ["PYTHON", "PYTHON3"] {
@@ -4364,6 +4843,309 @@ mod tests {
     }
 
     #[test]
+    fn faster_whisper_wheel_dependencies_and_complete_model_are_exactly_pinned() {
+        assert_eq!(
+            FASTER_WHISPER_WHEEL.name,
+            "faster_whisper-1.2.1-py3-none-any.whl"
+        );
+        assert_eq!(FASTER_WHISPER_WHEEL.sha256.len(), 64);
+        assert!(
+            FASTER_WHISPER_WHEEL
+                .url
+                .starts_with("https://files.pythonhosted.org/")
+        );
+        assert_eq!(
+            FASTER_WHISPER_RUNTIME_DEPENDENCIES,
+            [
+                "av==16.0.1",
+                "certifi==2026.7.22",
+                "charset-normalizer==3.5.1",
+                "ctranslate2==4.7.1",
+                "filelock==3.32.4",
+                "flatbuffers==25.12.19",
+                "fsspec==2026.7.0",
+                "hf-xet==1.6.0",
+                "huggingface-hub==0.36.2",
+                "idna==3.19",
+                "numpy==2.5.2",
+                "nvidia-cublas-cu12==12.9.1.4",
+                "nvidia-cudnn-cu12==9.16.0.29",
+                "onnxruntime==1.28.0",
+                "packaging==26.3",
+                "protobuf==7.36.0",
+                "PyYAML==6.0.3",
+                "requests==2.34.2",
+                "setuptools==84.0.0",
+                "tokenizers==0.22.2",
+                "tqdm==4.70.0",
+                "typing-extensions==4.16.0",
+                "urllib3==2.7.0",
+            ]
+        );
+        let assets = faster_whisper_model_assets();
+        assert_eq!(
+            assets.map(|asset| asset.name),
+            [
+                "config.json",
+                "model.bin",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "vocabulary.json",
+            ]
+        );
+        for asset in assets {
+            assert!(asset.url.contains(FASTER_WHISPER_MODEL_REVISION));
+            assert!(!asset.url.contains("/main/"));
+            assert_eq!(asset.sha256.len(), 64);
+            assert!(faster_whisper_asset_size(asset.name).is_some());
+        }
+    }
+
+    #[test]
+    fn faster_whisper_status_probe_is_metadata_bounded_and_fail_closed() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "personal-agent-stt3-status-{}-{nonce}",
+            std::process::id()
+        ));
+        let model = root.join("models/faster-whisper-large-v3-turbo");
+        std::fs::create_dir_all(&model).expect("create sparse model fixture");
+        for asset in faster_whisper_model_assets() {
+            let file = std::fs::File::create(model.join(asset.name)).expect("create sparse asset");
+            file.set_len(faster_whisper_asset_size(asset.name).expect("known asset size"))
+                .expect("size sparse asset");
+        }
+        std::fs::write(
+            root.join("faster-whisper.json"),
+            serde_json::to_vec(&faster_whisper_install_manifest(&model)).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+
+        let started = Instant::now();
+        assert!(faster_whisper_install_ready(&root));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "status must not read the sparse 1.6 GiB model"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(model.join("model.bin"))
+            .expect("open model fixture")
+            .set_len(faster_whisper_asset_size("model.bin").expect("model size") - 1)
+            .expect("truncate model fixture");
+        assert!(!faster_whisper_install_ready(&root));
+        std::fs::remove_dir_all(root).expect("remove status fixture");
+    }
+
+    #[tokio::test]
+    async fn faster_whisper_worker_rejects_a_tampered_pinned_model_before_cuda_load() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "personal-agent-stt3-worker-{}-{nonce}",
+            std::process::id()
+        ));
+        let model = root.join("models/faster-whisper-large-v3-turbo");
+        std::fs::create_dir_all(&model).expect("create tampered model fixture");
+        for asset in faster_whisper_model_assets() {
+            std::fs::write(model.join(asset.name), b"tampered").expect("write tampered asset");
+        }
+        std::fs::write(
+            root.join("faster-whisper.json"),
+            serde_json::to_vec(&faster_whisper_install_manifest(&model)).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/voice-runtime.py")
+            .canonicalize()
+            .expect("voice worker script");
+        let mut child = Command::new(worker_test_python())
+            .arg("-u")
+            .arg(script)
+            .arg("--root")
+            .arg(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start voice worker");
+        let mut stdin = child.stdin.take().expect("worker stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("worker stdout"));
+        let mut greeting = String::new();
+        stdout
+            .read_line(&mut greeting)
+            .await
+            .expect("worker greeting");
+        let response = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({
+                "id": 1,
+                "command": "stt_start",
+                "stt_engine": "faster-whisper",
+                "language": "en",
+                "vocabulary": [],
+            }),
+        )
+        .await;
+        assert_eq!(response.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("model digest mismatch"))
+        );
+        drop(stdin);
+        child.start_kill().expect("stop voice worker");
+        child.wait().await.expect("reap voice worker");
+        std::fs::remove_dir_all(root).expect("remove worker fixture");
+    }
+
+    #[test]
+    fn moonshine_queue_decouples_slow_decode_and_preserves_terminal_order() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/voice-runtime.py")
+            .canonicalize()
+            .expect("voice worker script");
+        let probe = r#"
+import pathlib
+import runpy
+import sys
+import time
+import types
+
+runtime_module = runpy.run_path(sys.argv[1], run_name="voice_runtime_queue_test")
+VoiceRuntime = runtime_module["VoiceRuntime"]
+highest_frequency_cpu_tier = runtime_module["highest_frequency_cpu_tier"]
+assert highest_frequency_cpu_tier(
+    {0, 1, 2, 3}, {0: 4800000, 1: 4800000, 2: 3500000, 3: 3500000}
+) == [0, 1]
+assert highest_frequency_cpu_tier({0, 1}, {0: 4800000}) == []
+assert highest_frequency_cpu_tier({0, 1}, {0: 4800000, 1: 4800000}) == []
+
+class FakeStream:
+    def __init__(self, events):
+        self.events = events
+        self.listener = None
+
+    def add_listener(self, listener):
+        self.listener = listener
+
+    def start(self):
+        self.events.append("start")
+
+    def add_audio(self, samples, sample_rate_hz):
+        assert sample_rate_hz == 16000
+        time.sleep(0.1)
+        value = int(samples[0])
+        self.events.append(value)
+        self.listener(types.SimpleNamespace(line=types.SimpleNamespace(
+            line_id=0,
+            text=f"partial-{value}",
+        )))
+
+    def stop(self):
+        self.events.append("stop")
+        return types.SimpleNamespace(lines=[types.SimpleNamespace(text="final")])
+
+    def close(self):
+        self.events.append("close")
+
+class FakeMoonshine:
+    def __init__(self, events):
+        self.events = events
+
+    def create_stream(self, update_interval):
+        assert update_interval == 0.45
+        return FakeStream(self.events)
+
+runtime = VoiceRuntime(pathlib.Path(sys.argv[2]))
+events = []
+runtime.moonshine = FakeMoonshine(events)
+runtime._reset_stt_session()
+runtime._start_moonshine_stream()
+enqueue_latencies = []
+for value in range(6):
+    started = time.monotonic()
+    runtime._enqueue_moonshine_audio([float(value)] * 320, 16000)
+    enqueue_latencies.append(time.monotonic() - started)
+result = runtime._finish_moonshine_stream(cancel=False)
+assert max(enqueue_latencies) < 0.05, enqueue_latencies
+assert events == ["start", 0, 1, 2, 3, 4, 5, "stop", "close"], events
+assert result.lines[0].text == "final"
+assert runtime.partial_audio_samples == 6 * 320, runtime.partial_audio_samples
+
+cancel_events = []
+runtime.moonshine = FakeMoonshine(cancel_events)
+runtime._reset_stt_session()
+runtime._start_moonshine_stream()
+for value in range(20):
+    runtime._enqueue_moonshine_audio([float(value)] * 320, 16000)
+cancel_started = time.monotonic()
+runtime._finish_moonshine_stream(cancel=True)
+assert time.monotonic() - cancel_started < 0.5, cancel_events
+assert "stop" not in cancel_events, cancel_events
+assert cancel_events[-1] == "close", cancel_events
+assert runtime.stream is None
+runtime_module["PROTOCOL_STDOUT"].write("moonshine queue order/provenance/cancel: ok\n")
+runtime_module["PROTOCOL_STDOUT"].flush()
+"#;
+        let output = std::process::Command::new(worker_test_python())
+            .args(["-B", "-c", probe])
+            .arg(script)
+            .arg(std::env::temp_dir())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run queue probe");
+        assert!(
+            output.status.success(),
+            "queue probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "moonshine queue order/provenance/cancel: ok"
+        );
+    }
+
+    #[test]
+    fn retained_accurate_stream_never_releases_its_lease_during_restart() {
+        let model = LocalModel::FasterWhisperLargeV3TurboInt8;
+        let mut arbiter = personal_agent_audio::ModelArbiter::with_ceiling_mib(model.vram_mib());
+        let plan = arbiter.plan_admission(model).expect("admit Accurate STT");
+        arbiter
+            .commit_admission(&plan)
+            .expect("commit Accurate STT");
+        arbiter.activate(model).expect("activate Accurate STT");
+
+        assert!(!retained_model_needs_activation(Some(model), model).expect("same model"));
+        assert!(
+            arbiter.plan_admission(LocalModel::Qwen3Tts).is_err(),
+            "the retained lease must prevent eviction until the worker transition finishes"
+        );
+    }
+
+    #[test]
+    fn voice_self_test_reports_the_selected_accurate_engine() {
+        let report =
+            voice_self_test_report("fixture transcript", 11, 22, "faster-whisper", "piper");
+        assert_eq!(
+            report.get("stt_engine").and_then(Value::as_str),
+            Some("faster-whisper")
+        );
+        assert_eq!(
+            report.get("stt_backend").and_then(Value::as_str),
+            Some("faster-whisper")
+        );
+    }
+
+    #[test]
     fn missing_smart_turn_returns_a_successful_silence_fallback_decision() {
         assert_eq!(
             endpoint_fallback_decision("moonshine", false),
@@ -4374,6 +5156,7 @@ mod tests {
             Some(json!({"complete": true, "decision": "silence-fallback"}))
         );
         assert_eq!(endpoint_fallback_decision("moonshine", true), None);
+        assert_eq!(endpoint_fallback_decision("faster-whisper", true), None);
     }
 
     #[tokio::test]

@@ -51,6 +51,32 @@ fn checked_tts_frame_bytes(prefix: [u8; 4]) -> Result<usize, AudioError> {
     Ok(frame_bytes)
 }
 
+#[cfg(unix)]
+fn neural_cuda_library_dirs(python: &Path) -> Vec<PathBuf> {
+    let Some(venv) = python.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let nvidia = venv.join("lib/python3.12/site-packages/nvidia");
+    [nvidia.join("cublas/lib"), nvidia.join("cudnn/lib")]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+#[cfg(unix)]
+fn configure_neural_cuda_libraries(command: &mut Command, python: &Path) {
+    let mut paths = neural_cuda_library_dirs(python);
+    if paths.is_empty() {
+        return;
+    }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("LD_LIBRARY_PATH", joined);
+    }
+}
+
 /// One private Python worker with lazily loaded Moonshine and Qwen models.
 pub struct NeuralVoiceRuntime {
     child: Child,
@@ -155,7 +181,8 @@ impl NeuralVoiceRuntime {
                 "the neural voice runtime is not installed".into(),
             ));
         }
-        let mut child = Command::new(python)
+        let mut command = Command::new(python);
+        command
             .arg("-u")
             .arg(script)
             .arg("--root")
@@ -163,7 +190,10 @@ impl NeuralVoiceRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        configure_neural_cuda_libraries(&mut command, python);
+        let mut child = command
             .spawn()
             .map_err(|error| AudioError::Processing(error.to_string()))?;
         let stdin = child
@@ -543,6 +573,21 @@ mod tests {
             }
         }
         panic!("python3 is required for the real voice-worker protocol test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_cuda_library_path_uses_exact_venv_runtime_directories() {
+        let root = unique_test_root();
+        let python = root.join("venv/bin/python");
+        let cublas = root.join("venv/lib/python3.12/site-packages/nvidia/cublas/lib");
+        let cudnn = root.join("venv/lib/python3.12/site-packages/nvidia/cudnn/lib");
+        std::fs::create_dir_all(python.parent().expect("python parent")).expect("venv bin");
+        std::fs::create_dir_all(&cublas).expect("cuBLAS fixture");
+        std::fs::create_dir_all(&cudnn).expect("cuDNN fixture");
+
+        assert_eq!(neural_cuda_library_dirs(&python), [cublas, cudnn]);
+        std::fs::remove_dir_all(root).expect("remove CUDA path fixture");
     }
 
     fn unique_test_root() -> PathBuf {
