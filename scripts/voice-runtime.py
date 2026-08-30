@@ -16,6 +16,9 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import stat
+import struct
 import sys
 import time
 import traceback
@@ -38,6 +41,9 @@ SILERO_VAD_REVISION = "6478567951ae5c9979ad7b234185b5515f4be7a1"
 SILERO_VAD_SHA256 = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
 SILERO_VAD_WINDOW_SAMPLES = 512
 SILERO_VAD_CONTEXT_SAMPLES = 64
+TTS_CLAUSE_MAX_CHARACTERS = 220
+TTS_STREAM_MAX_FRAME_BYTES = 8 * 1024 * 1024
+TTS_STREAM_DELIMITERS = frozenset(".!?;:")
 
 
 def normalized_phrase(value: Any) -> str:
@@ -60,6 +66,27 @@ def transcript_text(transcript: Any) -> str:
         for line in getattr(transcript, "lines", [])
         if str(getattr(line, "text", "")).strip()
     ).strip()
+
+
+def tts_clauses(value: Any) -> list[str]:
+    """Split text at spoken clause boundaries without slicing encoded UTF-8."""
+    text = " ".join(str(value).split())
+    clauses: list[str] = []
+    pending: list[str] = []
+    for character in text:
+        pending.append(character)
+        if (
+            character in TTS_STREAM_DELIMITERS
+            or len(pending) >= TTS_CLAUSE_MAX_CHARACTERS
+        ):
+            clause = "".join(pending).strip()
+            if clause:
+                clauses.append(clause)
+            pending = []
+    clause = "".join(pending).strip()
+    if clause:
+        clauses.append(clause)
+    return clauses
 
 
 class VoiceRuntime:
@@ -757,6 +784,108 @@ class VoiceRuntime:
             "model_kind": kind,
         }
 
+    def _private_tts_socket(self, request: dict[str, Any]) -> Path:
+        raw_path = str(request.get("socket_path", ""))
+        socket_path = Path(raw_path)
+        if not raw_path or not socket_path.is_absolute() or not socket_path.name:
+            raise RuntimeError("tts_stream requires an absolute private socket path")
+        private_root = self.root.parent.resolve(strict=True)
+        socket_parent = socket_path.parent.resolve(strict=True)
+        if not socket_parent.is_relative_to(private_root):
+            raise RuntimeError("tts_stream socket is outside the private voice directory")
+        try:
+            mode = socket_path.lstat().st_mode
+        except FileNotFoundError as error:
+            raise RuntimeError("tts_stream socket is not ready") from error
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError("tts_stream path is not a Unix domain socket")
+        return socket_path
+
+    @staticmethod
+    def _pcm16le(waveform: Any) -> bytes:
+        import numpy as np
+
+        audio = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            raise RuntimeError("Qwen3-TTS returned an empty clause")
+        audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
+        pcm = (np.clip(audio, -1.0, 1.0) * 32_767.0).round().astype("<i2")
+        encoded = pcm.tobytes()
+        if len(encoded) > TTS_STREAM_MAX_FRAME_BYTES:
+            raise RuntimeError("Qwen3-TTS clause exceeds the stream frame limit")
+        return encoded
+
+    def tts_stream(self, request: dict[str, Any]) -> dict[str, Any]:
+        text = str(request.get("text", "")).strip()
+        if not text or len(text) > 65_536:
+            raise RuntimeError("invalid speech text")
+        generation = request.get("generation")
+        if not isinstance(generation, int) or not 0 <= generation <= (2**64 - 1):
+            raise RuntimeError("tts_stream requires a valid generation")
+        clauses = tts_clauses(text)
+        if not clauses:
+            raise RuntimeError("tts_stream found no speakable clauses")
+
+        socket_path = self._private_tts_socket(request)
+        requested = str(request.get("model_kind", "custom"))
+        voice = str(request.get("voice", "Ryan")) or "Ryan"
+        started = time.monotonic()
+        sample_rate_hz: int | None = None
+        frames = 0
+        samples = 0
+        cancelled = False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.connect(str(socket_path))
+            # Connect before loading so model/config failures close the audio
+            # channel and let Rust consume the JSON error without waiting for
+            # the socket-accept deadline.
+            kind = self._load_qwen(requested)
+            for clause in clauses:
+                if kind == "base":
+                    reference = Path(str(request.get("reference_audio", "")))
+                    reference_text = str(request.get("reference_text", "")).strip()
+                    if not reference.is_file():
+                        raise RuntimeError(
+                            "Qwen voice cloning requires a local reference recording"
+                        )
+                    wavs, clause_sample_rate = self.qwen.generate_voice_clone(
+                        text=clause,
+                        language="English",
+                        ref_audio=str(reference),
+                        ref_text=reference_text or None,
+                        x_vector_only_mode=not bool(reference_text),
+                    )
+                else:
+                    wavs, clause_sample_rate = self.qwen.generate_custom_voice(
+                        text=clause,
+                        language="English",
+                        speaker=voice,
+                    )
+                clause_sample_rate = int(clause_sample_rate)
+                if sample_rate_hz is None:
+                    sample_rate_hz = clause_sample_rate
+                elif sample_rate_hz != clause_sample_rate:
+                    raise RuntimeError("Qwen3-TTS changed sample rate between clauses")
+                encoded = self._pcm16le(wavs[0])
+                try:
+                    stream.sendall(struct.pack("<I", len(encoded)) + encoded)
+                except (BrokenPipeError, ConnectionResetError):
+                    cancelled = True
+                    break
+                frames += 1
+                samples += len(encoded) // 2
+        return {
+            "generation": generation,
+            "sample_rate_hz": sample_rate_hz or 24_000,
+            "clause_count": len(clauses),
+            "frames": frames,
+            "samples": samples,
+            "cancelled": cancelled,
+            "synthesis_ms": int((time.monotonic() - started) * 1000),
+            "engine": "qwen3-tts-0.6b",
+            "model_kind": kind,
+        }
+
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         command = str(request.get("command", ""))
         handlers = {
@@ -772,6 +901,7 @@ class VoiceRuntime:
             "turn_complete": lambda: self.turn_complete(request),
             "stt_transcribe": lambda: self.stt_transcribe(request),
             "tts_synthesize": lambda: self.tts_synthesize(request),
+            "tts_stream": lambda: self.tts_stream(request),
             "embed": lambda: self.embed(request),
         }
         handler = handlers.get(command)

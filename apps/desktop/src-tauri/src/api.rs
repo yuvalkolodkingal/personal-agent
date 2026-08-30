@@ -1,8 +1,8 @@
 use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime, perf};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
-    NativeVoiceStatus, NeuralVoiceRuntime, discover_native_voice, play_wav, synthesize_piper,
-    transcribe_pcm, transcribe_wav, write_pcm_wav,
+    AudioError, NativeVoiceStatus, NeuralVoiceRuntime, discover_native_voice, play_wav,
+    synthesize_piper, transcribe_pcm, transcribe_wav, write_pcm_wav,
 };
 use personal_agent_core::{
     FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust, PersonalAgentConfig,
@@ -28,6 +28,7 @@ const E5_SMALL_INT8_MODEL_ID: &str = "e5-small-int8";
 const E5_SMALL_INT8_DIMENSIONS: usize = 384;
 const VOICE_STREAM_SAMPLE_RATE_HZ: usize = 16_000;
 const VOICE_STREAM_MAX_SAMPLES: usize = VOICE_STREAM_SAMPLE_RATE_HZ * 2;
+const TTS_STREAM_MAX_REASSEMBLED_SAMPLES: usize = 24_000 * 180;
 
 fn decode_pcm16le_frame(frame: &[u8]) -> Result<Vec<f32>, String> {
     if frame.is_empty() || !frame.len().is_multiple_of(2) {
@@ -433,6 +434,65 @@ async fn neural_voice_request(
         state.voice_runtime_pid.store(0, Ordering::SeqCst);
     }
     result.map_err(|error| error.to_string())
+}
+
+async fn neural_voice_tts_stream(
+    state: &DesktopState,
+    payload: Value,
+    generation: u64,
+    timeout: Duration,
+) -> Result<(Value, Vec<i16>), String> {
+    let config = config_snapshot(state)?;
+    let status = voice_status_for(state, &config);
+    let python = status
+        .neural_python
+        .ok_or_else(|| "The neural voice runtime is not installed. Open Voice settings and install Balanced voice.".to_owned())?;
+    let mut runtime = state.voice_runtime.lock().await;
+    if runtime.is_none() {
+        let worker = NeuralVoiceRuntime::start(
+            &python,
+            &state.voice_runtime_script,
+            &state.app_data.join("voice/neural"),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        state
+            .voice_runtime_pid
+            .store(worker.process_id().unwrap_or(0), Ordering::SeqCst);
+        *runtime = Some(worker);
+    }
+
+    let mut samples = Vec::new();
+    let result = runtime
+        .as_mut()
+        .expect("voice runtime was initialized")
+        .tts_stream(
+            &state.app_data.join("voice/runtime"),
+            payload,
+            generation,
+            timeout,
+            || state.voice_generation.load(Ordering::SeqCst) == generation,
+            |frame| {
+                if samples.len().saturating_add(frame.len()) > TTS_STREAM_MAX_REASSEMBLED_SAMPLES {
+                    return Err(AudioError::Processing(
+                        "streamed speech exceeds the three-minute compatibility limit".into(),
+                    ));
+                }
+                samples.extend_from_slice(frame);
+                Ok(())
+            },
+        )
+        .await;
+    if result.is_err() {
+        if let Some(worker) = runtime.as_mut() {
+            worker.terminate();
+        }
+        *runtime = None;
+        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+    }
+    result
+        .map(|result| (result, samples))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2089,30 +2149,40 @@ pub(crate) async fn voice_speak(
                 "custom"
             };
             state.voice_synthesis_active.store(true, Ordering::SeqCst);
-            let neural = neural_voice_request(
+            let neural = neural_voice_tts_stream(
                 &state,
-                "tts_synthesize",
                 json!({
                     "text": &text,
-                    "output": &output,
                     "voice": &config.voice.tts_voice,
                     "model_kind": model_kind,
                     "reference_audio": &config.voice.tts_reference_audio,
                     "reference_text": &config.voice.tts_reference_text,
                 }),
+                generation,
                 Duration::from_secs(180),
             )
             .await;
             state.voice_synthesis_active.store(false, Ordering::SeqCst);
             match neural {
-                Ok(value) => {
+                Ok((value, samples)) => {
+                    if value.get("cancelled").and_then(Value::as_bool) == Some(true)
+                        || state.voice_generation.load(Ordering::SeqCst) != generation
+                    {
+                        return Ok(json!({"spoken": false, "reason": "interrupted"}));
+                    }
+                    let sample_rate_hz = value
+                        .get("sample_rate_hz")
+                        .and_then(Value::as_u64)
+                        .and_then(|rate| u32::try_from(rate).ok())
+                        .ok_or_else(|| "Qwen3-TTS stream returned no sample rate".to_owned())?;
+                    let normalized = samples
+                        .into_iter()
+                        .map(|sample| f32::from(sample) / f32::from(i16::MAX))
+                        .collect::<Vec<_>>();
+                    write_pcm_wav(&output, &normalized, sample_rate_hz)
+                        .map_err(|error| error.to_string())?;
                     engine = "qwen3-tts";
-                    PathBuf::from(
-                        value
-                            .get("wav")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| "Qwen3-TTS returned no audio file".to_owned())?,
-                    )
+                    output
                 }
                 Err(error) => {
                     if state.voice_generation.load(Ordering::SeqCst) != generation {
