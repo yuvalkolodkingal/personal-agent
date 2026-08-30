@@ -44,6 +44,9 @@
 | STT-1 | DONE | Real pinned-model replay measured a 9.7×–9.99× openWakeWord CPU reduction versus Moonshine and sub-13 ms wake-event latency; protocol, asset-pin, and frontend tests pass. | `cd65019` |
 | STT-2 | DONE | Combined real-model replay measured 9.194× wake CPU reduction and 120.279 ms Smart Turn endpoint p95/max with 5/5 decisions; Silero state/framing and missing-model fallback tests pass. | `389ccbc` |
 | STT-4 | BLOCKED-HARDWARE | AudioWorklet capture emits exact 320-sample/16 kHz frames and raw 640-byte IPC; focused tests pass 15/15 and the task-boundary desktop suite passes 87/87. Native launch built and started, but physical-microphone partials could not be exercised and the user-data wake asset was absent. | `fde73c2` |
+| TTS-1 | DONE | The fake worker streams three ordered clauses over a private length-prefixed PCM socket; one monotonic deadline covers connect/read/ack, and generation cancellation stops within one frame. Audio protocol, deadline, bounds, format, and strict-clippy gates pass. | `34ec158` |
+| TTS-2 | DONE | Native rodio/cpal playback owns one streaming sink, stops immediately without polling, applies capture ducking, and falls back to `pw-play` only when device discovery/open fails. Audio tests pass 32/32 with one pre-existing asset test ignored; replay stop and first-audio gates pass. | `8163733` |
+| TTS-3 | DONE | A bounded nonblocking Rust clause pump consumes FakeRuntime deltas, keeps exactly one completed-clause prebuffer, rejects stale playback generations, and starts sink audio before `runtime-turn-complete`; replay first-audio p95 is 216 µs against the 700 ms limit. | `765a034` |
 
 ## Wave 1 gate
 
@@ -156,3 +159,17 @@ STT-4 human handoff:
 bunx tauri dev
 # Speak through a physical microphone and confirm partial transcripts arrive during speech.
 ```
+
+## Wave 8 gate
+
+Wave 8 passes the full §14 gate except the inherited unavailable Windows target. The frozen Bun
+install made no changes and the pinned OpenCode 1.18.23 sidecar verified. Formatting and workspace
+clippy pass with warnings denied; every locked workspace Rust test passes (desktop 90/90, audio
+32 passed with one pre-existing hardware/model-assets test ignored, runtime 17 passed with one
+pre-existing ignored live-sidecar test). Bun checks and tests pass (desktop 17 files / 90 tests),
+the production build completes, and the deterministic initial-JavaScript gate reports 80.44 KiB
+gzip against the 300 KiB limit. Registry, pack, deterministic performance, 6,144-case fuzz,
+security, SBOM, notices, and release-metadata checks all pass.
+
+The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
+`x86_64-pc-windows-msvc` standard library and no `rustup` with which to install it.
