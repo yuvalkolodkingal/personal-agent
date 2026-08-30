@@ -4,7 +4,11 @@ const invoke = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
-import { matchWakePhrase, sendVoiceStreamChunk } from "./useVoiceCapture";
+import {
+  matchWakePhrase,
+  sendVoiceStreamChunk,
+  sendWakeStreamChunk,
+} from "./useVoiceCapture";
 
 describe("binary voice streaming", () => {
   beforeEach(() => invoke.mockReset());
@@ -25,6 +29,20 @@ describe("binary voice streaming", () => {
         view.getInt16(index * 2, true),
       ),
     ).toEqual([-32_768, -16_384, 0, 16_384, 32_767]);
+  });
+
+  it("routes ambient wake frames through the raw wake command", async () => {
+    invoke.mockResolvedValue({ wake: false, score: 0.02 });
+
+    await sendWakeStreamChunk(new Float32Array([-1, 0, 1]));
+
+    expect(invoke).toHaveBeenCalledOnce();
+    const [command, body] = invoke.mock.calls[0] ?? [];
+    expect(command).toBe("voice_wake_chunk");
+    expect(body).toBeInstanceOf(ArrayBuffer);
+    expect(Array.from(new Int16Array(body as ArrayBuffer))).toEqual([
+      -32_768, 0, 32_767,
+    ]);
   });
 });
 

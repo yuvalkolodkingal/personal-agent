@@ -1953,6 +1953,62 @@ pub(crate) async fn voice_stream_cancel(
 }
 
 #[tauri::command]
+pub(crate) async fn voice_wake_start(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let config = config_snapshot(&state)?;
+    neural_voice_request(
+        &state,
+        "wake_start",
+        json!({
+            "phrases": &config.voice.wake_phrases,
+            "threshold_milli": config.voice.wake_threshold_milli,
+        }),
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn voice_wake_chunk(
+    request: tauri::ipc::Request<'_>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let samples = match request.body() {
+        tauri::ipc::InvokeBody::Raw(frame) => decode_pcm16le_frame(frame)?,
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("wake stream chunks require a raw PCM16LE invoke body".to_owned());
+        }
+    };
+    neural_voice_request(
+        &state,
+        "wake_chunk",
+        json!({"samples": samples, "sample_rate_hz": VOICE_STREAM_SAMPLE_RATE_HZ}),
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn voice_wake_stop(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Value, String> {
+    let mut runtime = state.voice_runtime.lock().await;
+    let Some(worker) = runtime.as_mut() else {
+        return Ok(json!({"state": "idle", "stopped": false}));
+    };
+    let result = worker
+        .request("wake_stop", json!({}), Duration::from_secs(5))
+        .await;
+    if result.is_err() {
+        worker.terminate();
+        *runtime = None;
+        state.voice_runtime_pid.store(0, Ordering::SeqCst);
+    }
+    result.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) async fn voice_turn_complete(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Value, String> {
@@ -2375,6 +2431,21 @@ const E5_SMALL_INT8_TOKENIZER: VoiceAsset = VoiceAsset {
     url: "https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3/onnx/tokenizer.json",
     sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
 };
+const OPENWAKEWORD_HEY_JARVIS: VoiceAsset = VoiceAsset {
+    name: "hey_jarvis_v0.1.onnx",
+    url: "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx",
+    sha256: "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb",
+};
+const OPENWAKEWORD_MELSPECTROGRAM: VoiceAsset = VoiceAsset {
+    name: "melspectrogram.onnx",
+    url: "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx",
+    sha256: "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f",
+};
+const OPENWAKEWORD_EMBEDDING: VoiceAsset = VoiceAsset {
+    name: "embedding_model.onnx",
+    url: "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx",
+    sha256: "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f",
+};
 
 async fn download_voice_asset(
     asset: &VoiceAsset,
@@ -2619,16 +2690,46 @@ async fn install_neural_voice(root: &Path, app: &tauri::AppHandle) -> Result<(),
         .arg(&python)
         .args([
             "moonshine-voice==0.1.5",
+            "numpy==2.5.2",
+            "onnxruntime==1.28.0",
+            "requests==2.34.2",
+            "scikit-learn==1.9.0",
+            "scipy==1.18.1",
             "soundfile==0.14.0",
+            "tqdm==4.70.0",
             "qwen-tts==0.1.1",
         ]);
     run_voice_installer(
         app,
-        "Installing Moonshine and Qwen runtimes",
+        "Installing Moonshine, Qwen, and pinned ONNX runtime dependencies",
         install,
         Duration::from_mins(20),
     )
     .await?;
+    // openWakeWord's Linux metadata unconditionally depends on tflite-runtime,
+    // which has no CPython 3.12 wheel. This profile uses only its ONNX path, so
+    // install the pinned package without that unused backend after installing
+    // every imported ONNX dependency explicitly above.
+    let mut openwakeword = Command::new("uv");
+    openwakeword
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .args(["--no-deps", "openwakeword==0.6.0"]);
+    run_voice_installer(
+        app,
+        "Installing pinned openWakeWord ONNX package",
+        openwakeword,
+        Duration::from_mins(5),
+    )
+    .await?;
+    let wake_root = neural.join("models/openwakeword");
+    for asset in [
+        &OPENWAKEWORD_HEY_JARVIS,
+        &OPENWAKEWORD_MELSPECTROGRAM,
+        &OPENWAKEWORD_EMBEDDING,
+    ] {
+        download_voice_asset(asset, &wake_root.join(asset.name), app).await?;
+    }
     let moonshine_root = neural.join("models/moonshine");
     let marker = neural.join("moonshine.json");
     let moonshine_code = r"import json, pathlib, sys
@@ -2726,6 +2827,53 @@ pub(crate) async fn voice_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn worker_test_python() -> PathBuf {
+        for variable in ["PYTHON", "PYTHON3"] {
+            if let Some(path) = std::env::var_os(variable).map(PathBuf::from)
+                && path.is_file()
+            {
+                return path;
+            }
+        }
+        let executable = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        };
+        if let Some(paths) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&paths) {
+                let candidate = directory.join(executable);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        panic!("python3 is required for the voice-worker protocol test");
+    }
+
+    async fn worker_test_request(
+        stdin: &mut tokio::process::ChildStdin,
+        stdout: &mut BufReader<tokio::process::ChildStdout>,
+        request: &Value,
+    ) -> Value {
+        let mut encoded = serde_json::to_vec(request).expect("encode worker request");
+        encoded.push(b'\n');
+        stdin
+            .write_all(&encoded)
+            .await
+            .expect("write worker request");
+        stdin.flush().await.expect("flush worker request");
+        let mut response = String::new();
+        stdout
+            .read_line(&mut response)
+            .await
+            .expect("read worker response");
+        serde_json::from_str(&response).expect("valid worker response")
+    }
 
     #[test]
     fn decodes_little_endian_pcm16_voice_frame() {
@@ -2838,6 +2986,210 @@ mod tests {
             assert!(!asset.url.contains("/main/"));
             assert_eq!(asset.sha256.len(), 64);
         }
+    }
+
+    #[test]
+    fn openwakeword_assets_are_release_and_digest_pinned() {
+        for asset in [
+            &OPENWAKEWORD_HEY_JARVIS,
+            &OPENWAKEWORD_MELSPECTROGRAM,
+            &OPENWAKEWORD_EMBEDDING,
+        ] {
+            assert!(asset.url.contains("/releases/download/v0.5.1/"));
+            assert!(!asset.url.contains("/latest/"));
+            assert_eq!(asset.sha256.len(), 64);
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_worker_protocol_covers_start_chunk_and_stop() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "personal-agent-stt1-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create worker test root");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/voice-runtime.py")
+            .canonicalize()
+            .expect("voice worker script");
+        let mut child = Command::new(worker_test_python())
+            .arg("-u")
+            .arg(script)
+            .arg("--root")
+            .arg(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start voice worker");
+        let mut stdin = child.stdin.take().expect("worker stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("worker stdout"));
+        let mut greeting = String::new();
+        stdout
+            .read_line(&mut greeting)
+            .await
+            .expect("worker greeting");
+        assert_eq!(
+            serde_json::from_str::<Value>(&greeting)
+                .expect("valid greeting")
+                .get("ready")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let built_in = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({"id": 1, "command": "wake_start", "phrases": ["hey jarvis"]}),
+        )
+        .await;
+        assert_eq!(built_in.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            built_in
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("not installed"))
+        );
+
+        let start = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({"id": 2, "command": "wake_start", "phrases": ["computer"]}),
+        )
+        .await;
+        assert_eq!(start.pointer("/result/fallback"), Some(&json!("stt-match")));
+        let chunk = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({
+                "id": 3,
+                "command": "wake_chunk",
+                "samples": vec![0.0_f32; 1_280],
+                "sample_rate_hz": 16_000,
+            }),
+        )
+        .await;
+        assert_eq!(chunk.pointer("/result/wake"), Some(&json!(false)));
+        assert_eq!(chunk.pointer("/result/fallback"), Some(&json!("stt-match")));
+        let stop = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({"id": 4, "command": "wake_stop"}),
+        )
+        .await;
+        assert_eq!(stop.pointer("/result/stopped"), Some(&json!(true)));
+
+        drop(stdin);
+        child.start_kill().expect("stop voice worker");
+        child.wait().await.expect("reap voice worker");
+        std::fs::remove_dir_all(root).expect("remove worker test root");
+    }
+
+    #[tokio::test]
+    async fn live_openwakeword_protocol_detects_bundled_hey_jarvis_when_enabled() {
+        if std::env::var("PERSONAL_AGENT_OPENWAKEWORD_LIVE_TEST").as_deref() != Ok("1") {
+            eprintln!(
+                "set PERSONAL_AGENT_OPENWAKEWORD_LIVE_TEST=1 with ROOT and PCM to run the pinned-model replay"
+            );
+            return;
+        }
+        let root = PathBuf::from(
+            std::env::var_os("PERSONAL_AGENT_OPENWAKEWORD_ROOT")
+                .expect("PERSONAL_AGENT_OPENWAKEWORD_ROOT is required"),
+        );
+        let pcm_path = PathBuf::from(
+            std::env::var_os("PERSONAL_AGENT_OPENWAKEWORD_PCM")
+                .expect("PERSONAL_AGENT_OPENWAKEWORD_PCM is required"),
+        );
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/voice-runtime.py")
+            .canonicalize()
+            .expect("voice worker script");
+        let mut child = Command::new(worker_test_python())
+            .arg("-u")
+            .arg(script)
+            .arg("--root")
+            .arg(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start live voice worker");
+        let mut stdin = child.stdin.take().expect("worker stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("worker stdout"));
+        let mut greeting = String::new();
+        stdout
+            .read_line(&mut greeting)
+            .await
+            .expect("worker greeting");
+        let start = worker_test_request(
+            &mut stdin,
+            &mut stdout,
+            &json!({
+                "id": 1,
+                "command": "wake_start",
+                "phrases": ["hey jarvis"],
+                "threshold_milli": 930,
+            }),
+        )
+        .await;
+        assert_eq!(start.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            start.pointer("/result/engine"),
+            Some(&json!("openwakeword-onnx"))
+        );
+
+        let bytes = std::fs::read(pcm_path).expect("read signed PCM16LE replay");
+        assert!(bytes.len().is_multiple_of(2));
+        let samples = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| f32::from(i16::from_le_bytes(*sample)) / 32_768.0)
+            .collect::<Vec<_>>();
+        let mut detected = false;
+        let mut maximum_score = 0.0_f64;
+        for (index, chunk) in samples.chunks(1_280).enumerate() {
+            let request_started = Instant::now();
+            let response = worker_test_request(
+                &mut stdin,
+                &mut stdout,
+                &json!({
+                    "id": index + 2,
+                    "command": "wake_chunk",
+                    "samples": chunk,
+                    "sample_rate_hz": 16_000,
+                }),
+            )
+            .await;
+            assert_eq!(response.get("ok").and_then(Value::as_bool), Some(true));
+            let score = response
+                .pointer("/result/score")
+                .and_then(Value::as_f64)
+                .expect("wake score");
+            maximum_score = maximum_score.max(score);
+            if response.pointer("/result/wake") == Some(&json!(true)) {
+                assert!(
+                    request_started.elapsed() < Duration::from_millis(250),
+                    "wake-to-listen protocol replay exceeded 250 ms"
+                );
+                detected = true;
+                break;
+            }
+        }
+        assert!(
+            detected,
+            "pinned hey-jarvis model did not detect replay; maximum score {maximum_score}"
+        );
+        drop(stdin);
+        child.start_kill().expect("stop live voice worker");
+        child.wait().await.expect("reap live voice worker");
     }
 
     #[test]

@@ -126,6 +126,20 @@ export function sendVoiceStreamChunk(samples: ArrayLike<number>) {
   );
 }
 
+export type WakeChunkResult = {
+  wake: boolean;
+  score: number;
+  fallback?: "stt-match";
+};
+
+/** Send ambient audio to the dedicated wake-word worker without JSON samples. */
+export function sendWakeStreamChunk(samples: ArrayLike<number>) {
+  return invoke<WakeChunkResult>(
+    "voice_wake_chunk",
+    encodePcm16Le(samples),
+  );
+}
+
 export function useVoiceCapture(
   config: AppConfig,
   onTranscript: (text: string, meta: VoiceTranscriptMeta) => void,
@@ -169,7 +183,9 @@ export function useVoiceCapture(
   const wakeSpeechStarted = useRef(false);
   const wakeNoiseFloor = useRef(0.005);
   const wakeSilenceStartedAt = useRef(0);
-  const wakeProcessing = useRef(false);
+  const wakeFallback = useRef(false);
+  const wakeQueue = useRef<Promise<void>>(Promise.resolve());
+  const wakeSessionActive = useRef(false);
   const wakeGeneration = useRef(0);
   const lastWakeDetectedAt = useRef(0);
 
@@ -194,7 +210,7 @@ export function useVoiceCapture(
   );
 
   const stopWakeCapture = useCallback(
-    (publishPrivacy = true) => {
+    async (publishPrivacy = true) => {
       wakeGeneration.current += 1;
       wakeProcessor.current?.disconnect();
       wakeSource.current?.disconnect();
@@ -209,7 +225,12 @@ export function useVoiceCapture(
       wakeCandidateSamples.current = 0;
       wakeSpeechStarted.current = false;
       wakeSilenceStartedAt.current = 0;
-      wakeProcessing.current = false;
+      wakeFallback.current = false;
+      let workerStopped: Promise<unknown> = Promise.resolve();
+      if (wakeSessionActive.current) {
+        wakeSessionActive.current = false;
+        workerStopped = invoke("voice_wake_stop").catch(() => undefined);
+      }
       setLevel(0);
       if (publishPrivacy)
         void invoke<Projection>("microphone_state", {
@@ -220,8 +241,34 @@ export function useVoiceCapture(
           .catch(() => undefined);
       if (["arming", "armed", "wake_detected"].includes(stateRef.current))
         transition("idle");
+      await workerStopped;
     },
     [onProjection, transition],
+  );
+
+  const activateWake = useCallback(
+    async (phrase: string, remainder = "") => {
+      const detectedAt = performance.now();
+      if (
+        detectedAt - lastWakeDetectedAt.current <
+        config.voice.refractory_ms
+      )
+        return;
+      lastWakeDetectedAt.current = detectedAt;
+      publishPartial(phrase, { final: false, source: "wake" }, false);
+      await stopWakeCapture();
+      transition("wake_detected");
+      if (remainder) {
+        onTranscriptRef.current(remainder, {
+          final: true,
+          source: "wake",
+        });
+        transition("idle");
+      } else {
+        await startRef.current();
+      }
+    },
+    [config.voice.refractory_ms, publishPartial, stopWakeCapture, transition],
   );
 
   const armWake = useCallback(async () => {
@@ -244,6 +291,16 @@ export function useVoiceCapture(
     const generation = wakeGeneration.current + 1;
     wakeGeneration.current = generation;
     try {
+      const wakeStart = await invoke<{
+        fallback?: "stt-match";
+      }>("voice_wake_start");
+      if (wakeGeneration.current !== generation || wakeSuspended) {
+        await invoke("voice_wake_stop").catch(() => undefined);
+        return;
+      }
+      wakeSessionActive.current = true;
+      wakeFallback.current = wakeStart.fallback === "stt-match";
+      wakeQueue.current = Promise.resolve();
       const media = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: config.voice.input_device || undefined,
@@ -269,7 +326,6 @@ export function useVoiceCapture(
       wakeSpeechStarted.current = false;
       wakeNoiseFloor.current = 0.005;
       wakeSilenceStartedAt.current = 0;
-      wakeProcessing.current = false;
       node.onaudioprocess = (event) => {
         if (wakeGeneration.current !== generation) return;
         const data = new Float32Array(event.inputBuffer.getChannelData(0));
@@ -282,9 +338,33 @@ export function useVoiceCapture(
         }
         const rms = Math.sqrt(sum / data.length);
         setLevel(Math.min(1, rms * 8));
-        // Keep the microphone open, but do not build a second candidate while the local
-        // recognizer owns the first one. This bounds inference and preserves phrase edges.
-        if (wakeProcessing.current) return;
+        if (!wakeFallback.current) {
+          const requestGeneration = wakeGeneration.current;
+          const samples = downsample(data, audioContext.sampleRate);
+          wakeQueue.current = wakeQueue.current
+            .then(async () => {
+              if (wakeGeneration.current !== requestGeneration) return;
+              const result = await sendWakeStreamChunk(samples);
+              if (
+                wakeGeneration.current === requestGeneration &&
+                result.wake
+              ) {
+                const phrase = config.voice.wake_phrases.find((candidate) =>
+                  ["hey jarvis", "jarvis"].includes(
+                    normalizedWords(candidate).join(" "),
+                  ),
+                );
+                await activateWake(phrase ?? "hey jarvis");
+              }
+            })
+            .catch((caught) => {
+              if (wakeGeneration.current !== requestGeneration) return;
+              setError(`Wake recognition failed: ${String(caught)}`);
+              void stopWakeCapture();
+              transition("error");
+            });
+          return;
+        }
         const startThreshold = Math.max(
           0.012,
           wakeNoiseFloor.current * 3,
@@ -318,10 +398,8 @@ export function useVoiceCapture(
           }
           return;
         }
-        if (!wakeProcessing.current) {
-          wakeCandidate.current.push(data);
-          wakeCandidateSamples.current += data.length;
-        }
+        wakeCandidate.current.push(data);
+        wakeCandidateSamples.current += data.length;
         const now = performance.now();
         if (rms <= stopThreshold) {
           if (!wakeSilenceStartedAt.current) wakeSilenceStartedAt.current = now;
@@ -335,7 +413,7 @@ export function useVoiceCapture(
         const ended =
           wakeSilenceStartedAt.current > 0 &&
           now - wakeSilenceStartedAt.current >= silenceMs;
-        if ((!ended && !timedOut) || wakeProcessing.current) return;
+        if (!ended && !timedOut) return;
         const candidate = mergeChunks(wakeCandidate.current);
         wakeCandidate.current = [];
         wakeCandidateSamples.current = 0;
@@ -343,52 +421,26 @@ export function useVoiceCapture(
         wakeSpeechStarted.current = false;
         wakeSilenceStartedAt.current = 0;
         if (candidate.length < audioContext.sampleRate / 4) return;
-        wakeProcessing.current = true;
         const requestGeneration = wakeGeneration.current;
-        void invoke<{ text: string }>("voice_transcribe", {
-          samples: downsample(candidate, audioContext.sampleRate),
-          sampleRateHz: 16_000,
-        })
-          .then(async (result) => {
+        wakeQueue.current = wakeQueue.current
+          .then(async () => {
+            const result = await invoke<{ text: string }>("voice_transcribe", {
+              samples: downsample(candidate, audioContext.sampleRate),
+              sampleRateHz: 16_000,
+            });
             if (wakeGeneration.current !== requestGeneration) return;
             const match = matchWakePhrase(
               result.text,
               config.voice.wake_phrases,
             );
             if (!match) return;
-            const detectedAt = performance.now();
-            if (
-              detectedAt - lastWakeDetectedAt.current <
-              config.voice.refractory_ms
-            )
-              return;
-            lastWakeDetectedAt.current = detectedAt;
-            publishPartial(
-              match.phrase,
-              { final: false, source: "wake" },
-              false,
-            );
-            stopWakeCapture();
-            transition("wake_detected");
-            if (match.remainder) {
-              onTranscriptRef.current(match.remainder, {
-                final: true,
-                source: "wake",
-              });
-              transition("idle");
-            } else {
-              await startRef.current();
-            }
+            await activateWake(match.phrase, match.remainder);
           })
           .catch((caught) => {
             if (wakeGeneration.current !== requestGeneration) return;
             setError(`Wake recognition failed: ${String(caught)}`);
-            stopWakeCapture();
+            void stopWakeCapture();
             transition("error");
-          })
-          .finally(() => {
-            if (wakeGeneration.current === requestGeneration)
-              wakeProcessing.current = false;
           });
       };
       input.connect(node);
@@ -406,11 +458,12 @@ export function useVoiceCapture(
       transition("armed");
     } catch (caught) {
       if (wakeGeneration.current !== generation) return;
-      stopWakeCapture();
+      await stopWakeCapture();
       setError(`Could not arm wake recognition: ${String(caught)}`);
       transition("error");
     }
   }, [
+    activateWake,
     config.voice,
     onProjection,
     publishPartial,
@@ -592,7 +645,7 @@ export function useVoiceCapture(
       ].includes(stateRef.current)
     )
       return;
-    stopWakeCapture();
+    await stopWakeCapture();
     stopRequested.current = false;
     stopInFlight.current = false;
     streamFailure.current = "";
@@ -756,7 +809,7 @@ export function useVoiceCapture(
 
   const cancel = useCallback(() => {
     stopRequested.current = true;
-    stopWakeCapture();
+    void stopWakeCapture();
     processor.current?.disconnect();
     source.current?.disconnect();
     stream.current?.getTracks().forEach((track) => track.stop());
@@ -786,7 +839,7 @@ export function useVoiceCapture(
   useEffect(() => {
     // Increment the generation even while getUserMedia is pending so a newly suspended
     // turn cannot finish arming a stale wake listener behind model/TTS activity.
-    if (!wakeShouldRun) stopWakeCapture();
+    if (!wakeShouldRun) void stopWakeCapture();
   }, [stopWakeCapture, wakeShouldRun]);
 
   useEffect(() => {

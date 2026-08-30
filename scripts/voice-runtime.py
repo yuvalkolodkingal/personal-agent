@@ -14,6 +14,7 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import time
 import traceback
@@ -27,6 +28,14 @@ E5_MODEL_ID = "e5-small-int8"
 E5_MODEL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
 E5_MODEL_SHA256 = "dd476dd0c2514e9b9be83aeb3853fac0763e0bdf4a71645407587d77c48a2d88"
 E5_TOKENIZER_SHA256 = "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"
+OPENWAKEWORD_MODEL_SHA256 = "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb"
+OPENWAKEWORD_MELSPEC_SHA256 = "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f"
+OPENWAKEWORD_EMBEDDING_SHA256 = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f"
+BUILTIN_WAKE_PHRASES = frozenset({"hey jarvis", "jarvis"})
+
+
+def normalized_phrase(value: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9']+", str(value).lower()))
 
 
 def sha256_file(path: Path) -> str:
@@ -60,6 +69,12 @@ class VoiceRuntime:
         self.turn_audio: list[float] = []
         self.embed_session = None
         self.embed_tokenizer = None
+        self.wake_model = None
+        self.wake_active = False
+        self.wake_fallback = False
+        self.wake_phrases: list[str] = []
+        self.wake_threshold = 0.5
+        self.wake_pending_samples: list[float] = []
         # STT-3 and DESK-5 populate these slots. Defining them now keeps the
         # unload protocol stable before those optional GPU engines are installed.
         self.faster_whisper = None
@@ -127,6 +142,45 @@ class VoiceRuntime:
     def _embed_paths(self) -> tuple[Path, Path]:
         root = self.models / "multilingual-e5-small-int8"
         return root / "model.onnx", root / "tokenizer.json"
+
+    def _wake_paths(self) -> tuple[Path, Path, Path]:
+        root = self.models / "openwakeword"
+        return (
+            root / "hey_jarvis_v0.1.onnx",
+            root / "melspectrogram.onnx",
+            root / "embedding_model.onnx",
+        )
+
+    def _load_wake_model(self) -> None:
+        if self.wake_model is not None:
+            self.wake_model.reset()
+            return
+        model, melspec, embedding = self._wake_paths()
+        expected = (
+            (model, OPENWAKEWORD_MODEL_SHA256),
+            (melspec, OPENWAKEWORD_MELSPEC_SHA256),
+            (embedding, OPENWAKEWORD_EMBEDDING_SHA256),
+        )
+        for path, wanted in expected:
+            if not path.is_file():
+                raise RuntimeError(
+                    "the pinned hey-jarvis openWakeWord model is not installed"
+                )
+            found = sha256_file(path)
+            if found != wanted:
+                raise RuntimeError(
+                    f"wake asset digest mismatch for {path.name}: "
+                    f"expected {wanted}, found {found}"
+                )
+
+        from openwakeword.model import Model
+
+        self.wake_model = Model(
+            wakeword_models=[str(model)],
+            inference_framework="onnx",
+            melspec_model_path=str(melspec),
+            embedding_model_path=str(embedding),
+        )
 
     def _load_embedder(self) -> None:
         if self.embed_session is not None and self.embed_tokenizer is not None:
@@ -280,6 +334,9 @@ class VoiceRuntime:
             "faster_whisper_loaded": self.faster_whisper is not None,
             "vision_grounding_loaded": self.vision_grounding is not None,
             "embed_loaded": self.embed_session is not None,
+            "wake_ready": all(path.is_file() for path in self._wake_paths()),
+            "wake_loaded": self.wake_model is not None,
+            "wake_active": self.wake_active,
         }
 
     def unload(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -320,6 +377,82 @@ class VoiceRuntime:
         self.stream = self.moonshine.create_stream(update_interval=0.45)
         self.stream.start()
         return {"state": "listening", "text": ""}
+
+    def wake_start(self, request: dict[str, Any]) -> dict[str, Any]:
+        phrases = request.get("phrases")
+        if not isinstance(phrases, list) or not phrases or len(phrases) > 16:
+            raise RuntimeError("wake_start expects between one and 16 phrases")
+        normalized = [normalized_phrase(item) for item in phrases]
+        if any(not phrase or len(phrase) > 128 for phrase in normalized):
+            raise RuntimeError("wake phrases must be non-empty and at most 128 characters")
+        threshold_milli = request.get("threshold_milli", 500)
+        if not isinstance(threshold_milli, int) or not 0 <= threshold_milli <= 1_000:
+            raise RuntimeError("wake threshold must be between 0 and 1000")
+
+        self.wake_phrases = normalized
+        self.wake_threshold = threshold_milli / 1_000
+        self.wake_pending_samples = []
+        self.wake_fallback = any(
+            phrase not in BUILTIN_WAKE_PHRASES for phrase in normalized
+        )
+        self.wake_active = True
+        if self.wake_fallback:
+            return {
+                "state": "listening",
+                "fallback": "stt-match",
+                "phrases": self.wake_phrases,
+            }
+        try:
+            self._load_wake_model()
+        except Exception:
+            self.wake_active = False
+            raise
+        return {
+            "state": "listening",
+            "engine": "openwakeword-onnx",
+            "model": "hey_jarvis_v0.1",
+            "phrases": self.wake_phrases,
+        }
+
+    def wake_chunk(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not self.wake_active:
+            raise RuntimeError("no wake stream is active")
+        samples = request.get("samples", [])
+        if not isinstance(samples, list) or not samples or len(samples) > 32_000:
+            raise RuntimeError("invalid wake chunk")
+        if int(request.get("sample_rate_hz", 16_000)) != 16_000:
+            raise RuntimeError("wake chunks must be 16 kHz mono audio")
+        if self.wake_fallback:
+            return {"wake": False, "score": 0.0, "fallback": "stt-match"}
+        if self.wake_model is None:
+            raise RuntimeError("the openWakeWord model is not loaded")
+
+        import numpy as np
+
+        audio = np.asarray(self.wake_pending_samples + samples, dtype=np.float32)
+        audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
+        audio = np.clip(audio, -1.0, 1.0)
+        complete_samples = (audio.size // 1_280) * 1_280
+        self.wake_pending_samples = audio[complete_samples:].tolist()
+        pcm = (audio[:complete_samples] * 32_767).astype(np.int16)
+        score = 0.0
+        for offset in range(0, complete_samples, 1_280):
+            predictions = self.wake_model.predict(pcm[offset : offset + 1_280])
+            score = max(
+                score,
+                max((float(value) for value in predictions.values()), default=0.0),
+            )
+        return {"wake": score >= self.wake_threshold, "score": score}
+
+    def wake_stop(self, _request: dict[str, Any]) -> dict[str, Any]:
+        was_active = self.wake_active
+        self.wake_active = False
+        self.wake_fallback = False
+        self.wake_phrases = []
+        self.wake_pending_samples = []
+        if self.wake_model is not None:
+            self.wake_model.reset()
+        return {"state": "idle", "stopped": was_active}
 
     def stt_chunk(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.stream is None:
@@ -438,6 +571,9 @@ class VoiceRuntime:
             "stt_chunk": lambda: self.stt_chunk(request),
             "stt_stop": lambda: self.stt_stop(request),
             "stt_cancel": lambda: self.stt_cancel(request),
+            "wake_start": lambda: self.wake_start(request),
+            "wake_chunk": lambda: self.wake_chunk(request),
+            "wake_stop": lambda: self.wake_stop(request),
             "turn_complete": lambda: self.turn_complete(request),
             "stt_transcribe": lambda: self.stt_transcribe(request),
             "tts_synthesize": lambda: self.tts_synthesize(request),
