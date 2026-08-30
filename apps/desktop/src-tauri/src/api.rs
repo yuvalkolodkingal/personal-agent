@@ -31,6 +31,7 @@ const VOICE_STREAM_SAMPLE_RATE_HZ: usize = 16_000;
 const VOICE_STREAM_MAX_SAMPLES: usize = VOICE_STREAM_SAMPLE_RATE_HZ * 2;
 const TTS_STREAM_MAX_REASSEMBLED_SAMPLES: usize = 24_000 * 180;
 const QWEN_TTS_SAMPLE_RATE_HZ: u32 = 24_000;
+const KOKORO_TTS_SAMPLE_RATE_HZ: u32 = 24_000;
 const TTS_TURN_CLAUSE_MAX_CHARACTERS: usize = 220;
 const TTS_TURN_MAX_TEXT_BYTES: usize = 65_536;
 const TTS_TURN_MAX_DELTA_EVENTS: usize = 4_096;
@@ -611,9 +612,92 @@ fn faster_whisper_install_ready(root: &Path) -> bool {
     })
 }
 
+fn kokoro_asset_size(name: &str) -> Option<u64> {
+    match name {
+        "kokoro-v1.0.int8.onnx" => Some(114_119_327),
+        "voices-v1.0.bin" => Some(28_214_398),
+        _ => None,
+    }
+}
+
+/// Keep the desktop probe bounded while still requiring the exact installer
+/// manifest and the two expected int8 assets. The worker hashes both files
+/// before its first CPU inference.
+fn kokoro_install_ready(root: &Path) -> bool {
+    let marker_path = root.join("kokoro.json");
+    let model_path = root.join("models/kokoro-v1.0-int8");
+    let manifest = std::fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    manifest.is_some_and(|manifest| {
+        manifest.get("package").and_then(Value::as_str) == Some("kokoro-onnx==0.6.1")
+            && manifest.get("wheel_sha256").and_then(Value::as_str) == Some(KOKORO_WHEEL.sha256)
+            && manifest.get("model_release").and_then(Value::as_str) == Some(KOKORO_MODEL_RELEASE)
+            && manifest.get("quantization").and_then(Value::as_str) == Some("int8")
+            && manifest
+                .get("dependencies")
+                .and_then(Value::as_array)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        == &KOKORO_RUNTIME_DEPENDENCIES
+                            .iter()
+                            .map(|dependency| json!(dependency))
+                            .collect::<Vec<_>>()
+                })
+            && manifest.get("model_path").and_then(Value::as_str) == model_path.to_str()
+            && manifest.get("files").is_some_and(|files| {
+                kokoro_model_assets().iter().all(|asset| {
+                    files.get(asset.name).and_then(Value::as_str) == Some(asset.sha256)
+                        && kokoro_asset_size(asset.name).is_some_and(|expected| {
+                            std::fs::metadata(model_path.join(asset.name)).is_ok_and(|metadata| {
+                                metadata.is_file() && metadata.len() == expected
+                            })
+                        })
+                }) && files.as_object().is_some_and(|files| files.len() == 2)
+            })
+    })
+}
+
+fn apply_kokoro_tts_status(
+    status: &mut NativeVoiceStatus,
+    config: &PersonalAgentConfig,
+    voice_root: &Path,
+) {
+    let ready = status.neural_python.is_some() && kokoro_install_ready(&voice_root.join("neural"));
+    status.kokoro_ready = ready;
+    if !ready {
+        status.kokoro_model = None;
+    }
+    let piper_ready = status.piper_executable.is_some() && status.piper_model.is_some();
+    status.tts_ready = match config.voice.tts_backend.as_str() {
+        "qwen3-tts" => status.qwen_ready || ready || piper_ready,
+        "kokoro" => ready || piper_ready,
+        _ => piper_ready,
+    };
+    status.active_tts_backend = match config.voice.tts_backend.as_str() {
+        "qwen3-tts" if status.qwen_ready => "qwen3-tts".to_owned(),
+        "qwen3-tts" | "kokoro" if ready => "kokoro".to_owned(),
+        _ if piper_ready => "piper".to_owned(),
+        _ => config.voice.tts_backend.clone(),
+    };
+    status.degraded = status.active_stt_backend != config.voice.stt_backend
+        || status.active_tts_backend != config.voice.tts_backend
+        || (config.voice.stt_backend == "moonshine" && !status.smart_turn_ready);
+    if ready {
+        status
+            .details
+            .push("Pinned Kokoro 0.6.1 int8 CPU synthesis is ready with af_heart default.".into());
+    } else if matches!(config.voice.tts_backend.as_str(), "qwen3-tts" | "kokoro") {
+        status.details.push(
+            "Kokoro CPU fallback is not installed or its pinned manifest is incomplete.".into(),
+        );
+    }
+}
+
 fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> NativeVoiceStatus {
+    let voice_root = state.app_data.join("voice");
     let mut status = discover_native_voice(
-        &state.app_data.join("voice"),
+        &voice_root,
         &config.voice.stt_backend,
         &config.voice.tts_backend,
         &config.voice.stt_executable,
@@ -622,6 +706,7 @@ fn voice_status_for(state: &DesktopState, config: &PersonalAgentConfig) -> Nativ
         &config.voice.tts_model_path,
         &config.voice.output_device,
     );
+    apply_kokoro_tts_status(&mut status, config, &voice_root);
     if config.voice.uses_faster_whisper() {
         let ready = status.neural_python.is_some()
             && faster_whisper_install_ready(&state.app_data.join("voice/neural"));
@@ -786,6 +871,7 @@ async fn release_neural_stt_lease(state: &DesktopState) {
 
 async fn neural_voice_tts_stream<F>(
     state: &DesktopState,
+    model: LocalModel,
     payload: Value,
     generation: u64,
     timeout: Duration,
@@ -805,12 +891,10 @@ where
         let worker = runtime.as_mut().expect("voice runtime was initialized");
         let mut arbiter = state.voice_model_arbiter.lock().await;
         worker
-            .prepare_model_load(&mut arbiter, LocalModel::Qwen3Tts, Duration::from_secs(30))
+            .prepare_model_load(&mut arbiter, model, Duration::from_secs(30))
             .await
             .map_err(|error| error.to_string())?;
-        arbiter
-            .activate(LocalModel::Qwen3Tts)
-            .map_err(|error| error.to_string())?;
+        arbiter.activate(model).map_err(|error| error.to_string())?;
     }
 
     let result = runtime
@@ -825,15 +909,246 @@ where
             |frame| on_frame(frame),
         )
         .await;
-    state
-        .voice_model_arbiter
-        .lock()
-        .await
-        .release(LocalModel::Qwen3Tts);
+    state.voice_model_arbiter.lock().await.release(model);
     if result.is_err() {
         terminate_failed_neural_worker(state, &mut runtime).await;
     }
     result.map_err(|error| error.to_string())
+}
+
+fn tts_fallback_backend(
+    failed: &str,
+    kokoro_ready: bool,
+    piper_ready: bool,
+) -> Option<&'static str> {
+    match failed {
+        "qwen3-tts" if kokoro_ready => Some("kokoro"),
+        "qwen3-tts" | "kokoro" if piper_ready => Some("piper"),
+        _ => None,
+    }
+}
+
+fn tts_recovering_payload(detail: impl std::fmt::Display, fallback: &str) -> Value {
+    json!({"state": "recovering", "detail": detail.to_string(), "fallback": fallback})
+}
+
+/// A `recovering` event is owed exactly once per failed tier, and only when a
+/// further tier actually exists: with no `next` tier the failure surfaces as
+/// the command error instead of promising a recovery that cannot happen.
+fn tts_ladder_recovering_event(
+    detail: Option<&str>,
+    already_emitted: bool,
+    next: Option<&str>,
+) -> Option<Value> {
+    if already_emitted {
+        return None;
+    }
+    Some(tts_recovering_payload(detail?, next?))
+}
+
+fn neural_tts_engine(backend: &str) -> Option<(LocalModel, u32)> {
+    match backend {
+        "qwen3-tts" => Some((LocalModel::Qwen3Tts, QWEN_TTS_SAMPLE_RATE_HZ)),
+        "kokoro" => Some((LocalModel::Kokoro, KOKORO_TTS_SAMPLE_RATE_HZ)),
+        _ => None,
+    }
+}
+
+/// The tier `voice_self_test` must synthesize with. Reusing the neural engine
+/// table keeps the self test honest: a selected neural backend is exercised
+/// directly instead of silently reporting Piper audio as proof that the
+/// configured engine works.
+fn voice_self_test_tts_tier(active_backend: &str) -> &str {
+    if neural_tts_engine(active_backend).is_some() {
+        active_backend
+    } else {
+        "piper"
+    }
+}
+
+fn neural_tts_payload(config: &PersonalAgentConfig, backend: &str, text: &str) -> Value {
+    let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
+        && !config
+            .voice
+            .tts_model
+            .to_ascii_lowercase()
+            .contains("customvoice")
+    {
+        "base"
+    } else {
+        "custom"
+    };
+    json!({
+        "tts_engine": backend,
+        "text": text,
+        "voice": &config.voice.tts_voice,
+        "speech_rate_percent": config.voice.speech_rate_percent,
+        "model_kind": model_kind,
+        "reference_audio": &config.voice.tts_reference_audio,
+        "reference_text": &config.voice.tts_reference_text,
+    })
+}
+
+async fn synthesize_kokoro_wav(
+    state: &DesktopState,
+    working: &Path,
+    text: &str,
+    voice: &str,
+    speech_rate_percent: u16,
+    prefix: &str,
+) -> Result<PathBuf, String> {
+    let output = working.join(format!("{prefix}-kokoro-{}.wav", uuid::Uuid::new_v4()));
+    let value = neural_voice_model_request(
+        state,
+        LocalModel::Kokoro,
+        false,
+        "tts_synthesize",
+        json!({
+            "tts_engine": "kokoro",
+            "text": text,
+            "output": output,
+            "voice": voice,
+            "speech_rate_percent": speech_rate_percent,
+        }),
+        Duration::from_secs(180),
+    )
+    .await?;
+    if value.get("engine").and_then(Value::as_str) != Some("kokoro") {
+        return Err("Kokoro worker returned unexpected engine provenance".to_owned());
+    }
+    if value.get("sample_rate_hz").and_then(Value::as_u64)
+        != Some(u64::from(KOKORO_TTS_SAMPLE_RATE_HZ))
+    {
+        return Err(format!(
+            "Kokoro returned an unexpected sample rate; expected {KOKORO_TTS_SAMPLE_RATE_HZ} Hz"
+        ));
+    }
+    let wav = value
+        .get("wav")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| "Kokoro returned no synthesized audio".to_owned())?;
+    if wav != output || !wav.is_file() {
+        return Err("Kokoro returned an invalid private output path".to_owned());
+    }
+    Ok(wav)
+}
+
+/// Drive the locked CPU half of the Qwen3 (CUDA) -> Kokoro (CPU) -> Piper
+/// (subprocess) ladder. Both tiers are injected so the tier ordering and the
+/// `recovering` event semantics stay verifiable without CUDA, model weights, or
+/// a live Tauri app handle.
+async fn run_tts_ladder<KokoroTier, PiperTier>(
+    emit: &(dyn Fn(Value) + Send + Sync),
+    attempt_kokoro: bool,
+    piper_ready: bool,
+    qwen_failure: Option<String>,
+    qwen_recovery_emitted: bool,
+    kokoro: impl FnOnce() -> KokoroTier,
+    piper: impl FnOnce(Option<String>) -> PiperTier,
+) -> Result<(PathBuf, &'static str), String>
+where
+    KokoroTier: std::future::Future<Output = Result<PathBuf, String>>,
+    PiperTier: std::future::Future<Output = Result<PathBuf, String>>,
+{
+    let mut prior_error = qwen_failure;
+    if attempt_kokoro {
+        if let Some(event) = tts_ladder_recovering_event(
+            prior_error.as_deref(),
+            qwen_recovery_emitted,
+            Some("kokoro"),
+        ) {
+            emit(event);
+        }
+        match kokoro().await {
+            Ok(wav) => return Ok((wav, "kokoro")),
+            Err(error) => {
+                tracing::warn!(%error, "Kokoro CPU synthesis failed; using private Piper fallback");
+                if let Some(event) =
+                    tts_ladder_recovering_event(Some(&error), false, piper_ready.then_some("piper"))
+                {
+                    emit(event);
+                }
+                prior_error = Some(match prior_error {
+                    Some(qwen) => format!("Qwen3-TTS failed: {qwen}. Kokoro failed: {error}"),
+                    None => format!("Kokoro failed: {error}"),
+                });
+            }
+        }
+    } else if let Some(event) = tts_ladder_recovering_event(
+        prior_error.as_deref(),
+        qwen_recovery_emitted,
+        piper_ready.then_some("piper"),
+    ) {
+        emit(event);
+    }
+    Ok((piper(prior_error).await?, "piper"))
+}
+
+#[allow(clippy::too_many_arguments)] // Every fallback input is an auditable local voice setting.
+async fn synthesize_cpu_tts_ladder(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    config: &PersonalAgentConfig,
+    status: &NativeVoiceStatus,
+    text: &str,
+    prefix: &str,
+    attempt_kokoro: bool,
+    qwen_failure: Option<String>,
+    qwen_recovery_emitted: bool,
+) -> Result<(PathBuf, &'static str), String> {
+    let piper_ready = status.piper_executable.is_some() && status.piper_model.is_some();
+    let runtime_directory = state.app_data.join("voice/runtime");
+    let working = runtime_directory.as_path();
+    run_tts_ladder(
+        &|event| {
+            let _ = app.emit("voice-state", event);
+        },
+        attempt_kokoro && status.kokoro_ready,
+        piper_ready,
+        qwen_failure,
+        qwen_recovery_emitted,
+        || {
+            synthesize_kokoro_wav(
+                state,
+                working,
+                text,
+                &config.voice.tts_voice,
+                config.voice.speech_rate_percent,
+                prefix,
+            )
+        },
+        |prior_error| async move {
+            let executable = status.piper_executable.as_ref().ok_or_else(|| {
+                prior_error.as_ref().map_or_else(
+                    || status.details.join(" "),
+                    |error| format!("{error}. Piper is unavailable"),
+                )
+            })?;
+            let model = status.piper_model.as_ref().ok_or_else(|| {
+                prior_error.as_ref().map_or_else(
+                    || status.details.join(" "),
+                    |error| format!("{error}. Piper is unavailable"),
+                )
+            })?;
+            synthesize_piper(
+                executable,
+                model,
+                Some(&model.with_extension("onnx.json")),
+                working,
+                text,
+                config.voice.speech_rate_percent,
+            )
+            .await
+            .map_err(|fallback| {
+                prior_error.as_ref().map_or_else(
+                    || fallback.to_string(),
+                    |error| format!("{error}. Piper fallback failed: {fallback}"),
+                )
+            })
+        },
+    )
+    .await
 }
 
 struct TurnSpeechQueue {
@@ -958,7 +1273,8 @@ async fn run_turn_speech(
 
     let mut all_clauses = vec![first_clause.clone()];
     let mut first_audio = Some(first_audio);
-    if status.active_tts_backend == "qwen3-tts" {
+    if let Some((model, expected_sample_rate_hz)) = neural_tts_engine(&status.active_tts_backend) {
+        let backend = status.active_tts_backend.as_str();
         match NativePlaybackSink::open(
             &config.voice.output_device,
             config.voice.volume_percent,
@@ -974,19 +1290,8 @@ async fn run_turn_speech(
                 }
                 let _ = app.emit(
                     "voice-state",
-                    json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+                    json!({"state": "synthesizing", "engine": backend, "generation": generation}),
                 );
-                let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
-                    && !config
-                        .voice
-                        .tts_model
-                        .to_ascii_lowercase()
-                        .contains("customvoice")
-                {
-                    "base"
-                } else {
-                    "custom"
-                };
                 let mut current_clause = Some(first_clause);
                 let mut speaking_emitted = false;
                 let mut stream_error = None;
@@ -1000,24 +1305,19 @@ async fn run_turn_speech(
                     let stream_control = control.clone();
                     let result = neural_voice_tts_stream(
                         &state,
-                        json!({
-                            "text": clause,
-                            "voice": &config.voice.tts_voice,
-                            "model_kind": model_kind,
-                            "reference_audio": &config.voice.tts_reference_audio,
-                            "reference_text": &config.voice.tts_reference_text,
-                        }),
+                        model,
+                        neural_tts_payload(&config, backend, &clause),
                         generation,
                         Duration::from_secs(180),
                         |frame| {
-                            stream_control.append_pcm(frame, QWEN_TTS_SAMPLE_RATE_HZ, 1)?;
+                            stream_control.append_pcm(frame, expected_sample_rate_hz, 1)?;
                             if let Some(sender) = first_audio.take() {
                                 let _ = sender.send(Ok(()));
                             }
                             if !speaking_emitted {
                                 let _ = stream_app.emit(
                                     "voice-state",
-                                    json!({"state": "speaking", "engine": "qwen3-tts", "generation": generation}),
+                                    json!({"state": "speaking", "engine": backend, "generation": generation}),
                                 );
                                 speaking_emitted = true;
                             }
@@ -1035,9 +1335,9 @@ async fn run_turn_speech(
                                 .get("sample_rate_hz")
                                 .and_then(Value::as_u64)
                                 .and_then(|rate| u32::try_from(rate).ok());
-                            if sample_rate_hz != Some(QWEN_TTS_SAMPLE_RATE_HZ) {
+                            if sample_rate_hz != Some(expected_sample_rate_hz) {
                                 stream_error = Some(format!(
-                                    "Qwen3-TTS stream returned {sample_rate_hz:?}; expected {QWEN_TTS_SAMPLE_RATE_HZ} Hz"
+                                    "{backend} stream returned {sample_rate_hz:?}; expected {expected_sample_rate_hz} Hz"
                                 ));
                                 break;
                             }
@@ -1065,10 +1365,13 @@ async fn run_turn_speech(
                     if state.voice_generation.load(Ordering::SeqCst) != generation {
                         return;
                     }
-                    let _ = app.emit(
-                        "voice-state",
-                        json!({"state": "recovering", "detail": error, "fallback": "piper"}),
-                    );
+                    let piper_ready =
+                        status.piper_executable.is_some() && status.piper_model.is_some();
+                    if let Some(fallback) =
+                        tts_fallback_backend(backend, status.kokoro_ready, piper_ready)
+                    {
+                        let _ = app.emit("voice-state", tts_recovering_payload(&error, fallback));
+                    }
                     collect_and_speak_turn_fallback(
                         &app,
                         &state,
@@ -1078,6 +1381,8 @@ async fn run_turn_speech(
                         &config,
                         &status,
                         first_audio,
+                        Some(backend),
+                        Some(&error),
                     )
                     .await;
                     return;
@@ -1105,6 +1410,8 @@ async fn run_turn_speech(
         &config,
         &status,
         first_audio,
+        None,
+        None,
     )
     .await;
 }
@@ -1119,6 +1426,8 @@ async fn collect_and_speak_turn_fallback(
     config: &PersonalAgentConfig,
     status: &NativeVoiceStatus,
     mut first_audio: Option<oneshot::Sender<Result<(), String>>>,
+    failed_backend: Option<&str>,
+    failed_detail: Option<&str>,
 ) {
     while let Some(clause) = clauses.recv().await {
         if state.voice_generation.load(Ordering::SeqCst) != generation {
@@ -1141,6 +1450,8 @@ async fn collect_and_speak_turn_fallback(
         status,
         generation,
         &mut first_audio,
+        failed_backend,
+        failed_detail,
     )
     .await
     {
@@ -1160,6 +1471,8 @@ async fn speak_turn_fallback_for_generation(
     status: &NativeVoiceStatus,
     generation: u64,
     first_audio: &mut Option<oneshot::Sender<Result<(), String>>>,
+    failed_backend: Option<&str>,
+    failed_detail: Option<&str>,
 ) -> Result<(), String> {
     if text.is_empty() || text.len() > TTS_TURN_MAX_TEXT_BYTES {
         return Err("streamed turn speech exceeds the 65536-byte limit".to_owned());
@@ -1168,8 +1481,9 @@ async fn speak_turn_fallback_for_generation(
         return Err("streamed turn speech was cancelled".to_owned());
     }
 
-    let mut engine = "piper";
-    let wav = if status.active_tts_backend == "qwen3-tts" {
+    let (wav, engine) = if status.active_tts_backend == "qwen3-tts"
+        && failed_backend != Some("qwen3-tts")
+    {
         let _ = app.emit(
             "voice-state",
             json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
@@ -1194,7 +1508,9 @@ async fn speak_turn_fallback_for_generation(
         state.voice_synthesis_active.store(true, Ordering::SeqCst);
         let neural = neural_voice_tts_stream(
             state,
+            LocalModel::Qwen3Tts,
             json!({
+                "tts_engine": "qwen3-tts",
                 "text": text,
                 "voice": &config.voice.tts_voice,
                 "model_kind": model_kind,
@@ -1237,60 +1553,49 @@ async fn speak_turn_fallback_for_generation(
                     .collect::<Vec<_>>();
                 write_pcm_wav(&output, &normalized, sample_rate_hz)
                     .map_err(|error| error.to_string())?;
-                engine = "qwen3-tts";
-                output
+                (output, "qwen3-tts")
             }
             Ok(_) => return Err("streamed turn speech was cancelled".to_owned()),
             Err(error) => {
                 if state.voice_generation.load(Ordering::SeqCst) != generation {
                     return Err("streamed turn speech was cancelled".to_owned());
                 }
-                tracing::warn!(%error, "Qwen3-TTS compatibility stream failed; using private Piper fallback");
-                let _ = app.emit(
-                    "voice-state",
-                    json!({"state": "recovering", "detail": error, "fallback": "piper"}),
-                );
-                let executable = status
-                    .piper_executable
-                    .as_ref()
-                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
-                let model = status
-                    .piper_model
-                    .as_ref()
-                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
-                synthesize_piper(
-                    executable,
-                    model,
-                    Some(&model.with_extension("onnx.json")),
-                    &state.app_data.join("voice/runtime"),
+                tracing::warn!(%error, "Qwen3-TTS compatibility stream failed; entering the CPU fallback ladder");
+                synthesize_cpu_tts_ladder(
+                    app,
+                    state,
+                    config,
+                    status,
                     text,
-                    config.voice.speech_rate_percent,
+                    "tts-turn",
+                    true,
+                    Some(error),
+                    false,
                 )
-                .await
-                .map_err(|fallback| {
-                    format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
-                })?
+                .await?
             }
         }
     } else {
-        let executable = status
-            .piper_executable
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        let model = status
-            .piper_model
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        synthesize_piper(
-            executable,
-            model,
-            Some(&model.with_extension("onnx.json")),
-            &state.app_data.join("voice/runtime"),
+        let attempt_kokoro =
+            status.active_tts_backend == "kokoro" || failed_backend == Some("qwen3-tts");
+        let qwen_failure = (failed_backend == Some("qwen3-tts")).then(|| {
+            failed_detail
+                .unwrap_or("Qwen3-TTS stream failed")
+                .to_owned()
+        });
+        let qwen_recovery_emitted = qwen_failure.is_some();
+        synthesize_cpu_tts_ladder(
+            app,
+            state,
+            config,
+            status,
             text,
-            config.voice.speech_rate_percent,
+            "tts-turn",
+            attempt_kokoro,
+            qwen_failure,
+            qwen_recovery_emitted,
         )
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
     };
 
     if state.voice_generation.load(Ordering::SeqCst) != generation {
@@ -3298,10 +3603,13 @@ pub(crate) async fn voice_speak(
         return Ok(json!({"spoken": false, "reason": "quiet mode"}));
     }
     let status = voice_status_for(&state, &config);
-    let mut engine = "piper";
+    // Both are bound by the tier that actually produced audio, so no unread
+    // placeholder tier can ever be reported as the speaking engine.
+    let engine;
     let wav;
     let mut native_unavailable = None;
-    if status.active_tts_backend == "qwen3-tts" {
+    if let Some((model, expected_sample_rate_hz)) = neural_tts_engine(&status.active_tts_backend) {
+        let backend = status.active_tts_backend.as_str();
         let native = NativePlaybackSink::open(
             &config.voice.output_device,
             config.voice.volume_percent,
@@ -3327,22 +3635,11 @@ pub(crate) async fn voice_speak(
         let output = state
             .app_data
             .join("voice/runtime")
-            .join(format!("tts-qwen-{}.wav", uuid::Uuid::new_v4()));
+            .join(format!("tts-{backend}-{}.wav", uuid::Uuid::new_v4()));
         let _ = app.emit(
             "voice-state",
-            json!({"state": "synthesizing", "engine": "qwen3-tts", "generation": generation}),
+            json!({"state": "synthesizing", "engine": backend, "generation": generation}),
         );
-        let model_kind = if config.voice.tts_model.to_ascii_lowercase().contains("base")
-            && !config
-                .voice
-                .tts_model
-                .to_ascii_lowercase()
-                .contains("customvoice")
-        {
-            "base"
-        } else {
-            "custom"
-        };
         state.voice_synthesis_active.store(true, Ordering::SeqCst);
         let mut samples = Vec::new();
         let mut sample_count = 0_usize;
@@ -3351,13 +3648,8 @@ pub(crate) async fn voice_speak(
         let stream_control = native_control.clone();
         let neural = neural_voice_tts_stream(
             &state,
-            json!({
-                "text": &text,
-                "voice": &config.voice.tts_voice,
-                "model_kind": model_kind,
-                "reference_audio": &config.voice.tts_reference_audio,
-                "reference_text": &config.voice.tts_reference_text,
-            }),
+            model,
+            neural_tts_payload(&config, backend, &text),
             generation,
             Duration::from_secs(180),
             |frame| {
@@ -3368,11 +3660,11 @@ pub(crate) async fn voice_speak(
                     ));
                 }
                 if let Some(control) = stream_control.as_ref() {
-                    control.append_pcm(frame, QWEN_TTS_SAMPLE_RATE_HZ, 1)?;
+                    control.append_pcm(frame, expected_sample_rate_hz, 1)?;
                     if !speaking_emitted {
                         let _ = stream_app.emit(
                             "voice-state",
-                            json!({"state": "speaking", "engine": "qwen3-tts", "generation": generation}),
+                            json!({"state": "speaking", "engine": backend, "generation": generation}),
                         );
                         speaking_emitted = true;
                     }
@@ -3400,16 +3692,16 @@ pub(crate) async fn voice_speak(
                 else {
                     discard_playback_generation(&state, generation).await;
                     drop(native_sink.take());
-                    return Err("Qwen3-TTS stream returned no sample rate".to_owned());
+                    return Err(format!("{backend} stream returned no sample rate"));
                 };
-                if sample_rate_hz != QWEN_TTS_SAMPLE_RATE_HZ {
+                if sample_rate_hz != expected_sample_rate_hz {
                     discard_playback_generation(&state, generation).await;
                     drop(native_sink.take());
                     return Err(format!(
-                        "Qwen3-TTS stream returned {sample_rate_hz} Hz; expected {QWEN_TTS_SAMPLE_RATE_HZ} Hz"
+                        "{backend} stream returned {sample_rate_hz} Hz; expected {expected_sample_rate_hz} Hz"
                     ));
                 }
-                engine = "qwen3-tts";
+                engine = backend;
                 if let Some(sink) = native_sink.take() {
                     if let Err(error) = sink.finish() {
                         discard_playback_generation(&state, generation).await;
@@ -3439,52 +3731,44 @@ pub(crate) async fn voice_speak(
                 discard_playback_generation(&state, generation).await;
                 drop(native_sink.take());
                 native_unavailable = None;
-                tracing::warn!(%error, "Qwen3-TTS failed; using private Piper fallback");
-                let _ = app.emit(
-                    "voice-state",
-                    json!({"state": "recovering", "detail": error, "fallback": "piper"}),
-                );
-                let executable = status
-                    .piper_executable
-                    .as_ref()
-                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
-                let model = status
-                    .piper_model
-                    .as_ref()
-                    .ok_or_else(|| format!("Qwen3-TTS failed and Piper is unavailable: {error}"))?;
-                wav = synthesize_piper(
-                    executable,
-                    model,
-                    Some(&model.with_extension("onnx.json")),
-                    &state.app_data.join("voice/runtime"),
+                tracing::warn!(%error, %backend, "neural TTS failed; entering the next local fallback tier");
+                let piper_ready = status.piper_executable.is_some() && status.piper_model.is_some();
+                if let Some(fallback) =
+                    tts_fallback_backend(backend, status.kokoro_ready, piper_ready)
+                {
+                    let _ = app.emit("voice-state", tts_recovering_payload(&error, fallback));
+                }
+                let (fallback, fallback_engine) = synthesize_cpu_tts_ladder(
+                    &app,
+                    &state,
+                    &config,
+                    &status,
                     &text,
-                    config.voice.speech_rate_percent,
+                    "tts",
+                    backend == "qwen3-tts",
+                    Some(format!("{backend} failed: {error}")),
+                    true,
                 )
-                .await
-                .map_err(|fallback| {
-                    format!("Qwen3-TTS failed: {error}. Piper fallback failed: {fallback}")
-                })?;
+                .await?;
+                engine = fallback_engine;
+                wav = fallback;
             }
         }
     } else {
-        let executable = status
-            .piper_executable
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        let model = status
-            .piper_model
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        wav = synthesize_piper(
-            executable,
-            model,
-            Some(&model.with_extension("onnx.json")),
-            &state.app_data.join("voice/runtime"),
+        let (fallback, fallback_engine) = synthesize_cpu_tts_ladder(
+            &app,
+            &state,
+            &config,
+            &status,
             &text,
-            config.voice.speech_rate_percent,
+            "tts",
+            status.active_tts_backend == "kokoro",
+            None,
+            false,
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
+        engine = fallback_engine;
+        wav = fallback;
     }
     if state.voice_generation.load(Ordering::SeqCst) != generation {
         let _ = std::fs::remove_file(&wav);
@@ -3622,6 +3906,74 @@ fn voice_self_test_report(
     })
 }
 
+/// Synthesize the fixed self-test phrase with the tier the selected backend
+/// resolves to, so the report proves the configured engine actually ran.
+const SELF_TEST_PHRASE: &str = "Personal Agent voice test";
+
+async fn voice_self_test_synthesize(
+    state: &DesktopState,
+    config: &PersonalAgentConfig,
+    status: &NativeVoiceStatus,
+    working: &Path,
+) -> Result<PathBuf, String> {
+    match voice_self_test_tts_tier(&status.active_tts_backend) {
+        "qwen3-tts" => {
+            let output = working.join(format!("self-test-qwen-{}.wav", uuid::Uuid::new_v4()));
+            let value = neural_voice_model_request(
+                state,
+                LocalModel::Qwen3Tts,
+                false,
+                "tts_synthesize",
+                json!({
+                    "text": SELF_TEST_PHRASE,
+                    "output": output,
+                    "voice": config.voice.tts_voice,
+                    "model_kind": "custom",
+                }),
+                Duration::from_secs(180),
+            )
+            .await?;
+            Ok(PathBuf::from(
+                value
+                    .get("wav")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Qwen3-TTS returned no test audio".to_owned())?,
+            ))
+        }
+        "kokoro" => {
+            synthesize_kokoro_wav(
+                state,
+                working,
+                SELF_TEST_PHRASE,
+                &config.voice.tts_voice,
+                config.voice.speech_rate_percent,
+                "self-test",
+            )
+            .await
+        }
+        _ => {
+            let piper = status
+                .piper_executable
+                .as_ref()
+                .ok_or_else(|| status.details.join(" "))?;
+            let piper_model = status
+                .piper_model
+                .as_ref()
+                .ok_or_else(|| status.details.join(" "))?;
+            synthesize_piper(
+                piper,
+                piper_model,
+                Some(&piper_model.with_extension("onnx.json")),
+                working,
+                SELF_TEST_PHRASE,
+                config.voice.speech_rate_percent,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn voice_self_test(
     state: tauri::State<'_, DesktopState>,
@@ -3631,48 +3983,7 @@ pub(crate) async fn voice_self_test(
     let working = state.app_data.join("voice/runtime");
     std::fs::create_dir_all(&working).map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let wav = if status.active_tts_backend == "qwen3-tts" {
-        let output = working.join(format!("self-test-qwen-{}.wav", uuid::Uuid::new_v4()));
-        let value = neural_voice_model_request(
-            &state,
-            LocalModel::Qwen3Tts,
-            false,
-            "tts_synthesize",
-            json!({
-                "text": "Personal Agent voice test",
-                "output": output,
-                "voice": config.voice.tts_voice,
-                "model_kind": "custom",
-            }),
-            Duration::from_secs(180),
-        )
-        .await?;
-        PathBuf::from(
-            value
-                .get("wav")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "Qwen3-TTS returned no test audio".to_owned())?,
-        )
-    } else {
-        let piper = status
-            .piper_executable
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        let piper_model = status
-            .piper_model
-            .as_ref()
-            .ok_or_else(|| status.details.join(" "))?;
-        synthesize_piper(
-            piper,
-            piper_model,
-            Some(&piper_model.with_extension("onnx.json")),
-            &working,
-            "Personal Agent voice test",
-            config.voice.speech_rate_percent,
-        )
-        .await
-        .map_err(|error| error.to_string())?
-    };
+    let wav = voice_self_test_synthesize(&state, &config, &status, &working).await?;
     let synthesis_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let recognition_started = Instant::now();
     let result = if matches!(
@@ -3875,6 +4186,35 @@ const FASTER_WHISPER_WHEEL: VoiceAsset = VoiceAsset {
     url: "https://files.pythonhosted.org/packages/05/99/49ee85903dee060d9f08297b4a342e5e0bcfca2f027a07b4ee0a38ab13f9/faster_whisper-1.2.1-py3-none-any.whl",
     sha256: "79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7",
 };
+const KOKORO_WHEEL: VoiceAsset = VoiceAsset {
+    name: "kokoro_onnx-0.6.1-py3-none-any.whl",
+    url: "https://files.pythonhosted.org/packages/60/e1/a27e5a70a525a5ee1fd5357596f07b724d02ff317f134e86cb6e3d9db968/kokoro_onnx-0.6.1-py3-none-any.whl",
+    sha256: "50c8de4950d601df41428ee5462a48c8a78bef441bf671f2492e070ef44d8a32",
+};
+const KOKORO_MODEL_RELEASE: &str = "model-files-v1.1";
+const KOKORO_INT8_MODEL: VoiceAsset = VoiceAsset {
+    name: "kokoro-v1.0.int8.onnx",
+    url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.int8.onnx",
+    sha256: "ae315a79b623f244700e4afb9246c46a26066782e049ba174bf3ba433970ee9c",
+};
+const KOKORO_VOICES: VoiceAsset = VoiceAsset {
+    name: "voices-v1.0.bin",
+    url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin",
+    sha256: "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+};
+const KOKORO_RUNTIME_DEPENDENCIES: [&str; 11] = [
+    "attrs==26.1.0",
+    "cffi==2.1.1",
+    "dlinfo==2.0.0",
+    "espeakng-loader==0.2.4",
+    "joblib==1.5.3",
+    "numpy==2.5.2",
+    "onnxruntime==1.28.0",
+    "phonemizer==3.4.0",
+    "pycparser==3.0",
+    "soundfile==0.14.0",
+    "typing-extensions==4.16.0",
+];
 const FASTER_WHISPER_MODEL_ID: &str = "mobiuslabsgmbh/faster-whisper-large-v3-turbo";
 const FASTER_WHISPER_MODEL_REVISION: &str = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf";
 const FASTER_WHISPER_COMPUTE_TYPE: &str = "int8_float16";
@@ -3937,6 +4277,26 @@ fn faster_whisper_model_assets() -> [&'static VoiceAsset; 5] {
         &FASTER_WHISPER_TOKENIZER,
         &FASTER_WHISPER_VOCABULARY,
     ]
+}
+
+fn kokoro_model_assets() -> [&'static VoiceAsset; 2] {
+    [&KOKORO_INT8_MODEL, &KOKORO_VOICES]
+}
+
+fn kokoro_install_manifest(model_path: &Path) -> Value {
+    let files = kokoro_model_assets()
+        .into_iter()
+        .map(|asset| (asset.name, asset.sha256))
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "package": "kokoro-onnx==0.6.1",
+        "wheel_sha256": KOKORO_WHEEL.sha256,
+        "model_release": KOKORO_MODEL_RELEASE,
+        "quantization": "int8",
+        "dependencies": KOKORO_RUNTIME_DEPENDENCIES,
+        "model_path": model_path,
+        "files": files,
+    })
 }
 
 fn faster_whisper_install_manifest(model_path: &Path) -> Value {
@@ -4266,6 +4626,61 @@ async fn install_accurate_stt(root: &Path, app: &tauri::AppHandle) -> Result<(),
     result
 }
 
+async fn install_kokoro_voice(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
+    let python = ensure_neural_python(root, app).await?;
+    let wheel = root.join("downloads").join(KOKORO_WHEEL.name);
+    download_voice_asset(&KOKORO_WHEEL, &wheel, app).await?;
+
+    let mut dependencies = Command::new("uv");
+    dependencies
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .arg("--no-deps")
+        .args(KOKORO_RUNTIME_DEPENDENCIES);
+    run_voice_installer(
+        app,
+        "Installing exact Kokoro CPU runtime dependencies",
+        dependencies,
+        Duration::from_mins(10),
+    )
+    .await?;
+    let mut install = Command::new("uv");
+    install
+        .args(["pip", "install", "--python"])
+        .arg(&python)
+        .arg("--no-deps")
+        .arg(&wheel);
+    let install_result = run_voice_installer(
+        app,
+        "Installing pinned kokoro-onnx 0.6.1 CPU runtime",
+        install,
+        Duration::from_mins(10),
+    )
+    .await;
+    let _ = std::fs::remove_file(&wheel);
+    install_result?;
+
+    let neural = root.join("neural");
+    let destination = neural.join("models/kokoro-v1.0-int8");
+    let staging = neural.join(format!("models/.kokoro-staging-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let result = async {
+        for asset in kokoro_model_assets() {
+            download_voice_asset(asset, &staging.join(asset.name), app).await?;
+        }
+        promote_directory(&staging, &destination)?;
+        atomic_write_private_json(
+            &neural.join("kokoro.json"),
+            &kokoro_install_manifest(&destination),
+        )
+    }
+    .await;
+    if result.is_err() && staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
+
 async fn install_memory_embedder(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
     if std::env::consts::ARCH != "x86_64" {
         return Err(
@@ -4397,7 +4812,7 @@ snapshot_download(repo_id='Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir=sys.
         Duration::from_mins(30),
     )
     .await?;
-    Ok(())
+    install_kokoro_voice(root, app).await
 }
 
 #[tauri::command]
@@ -4418,6 +4833,7 @@ pub(crate) async fn voice_install(
             install_memory_embedder(&root, &app).await?;
         }
         "accurate" | "faster-whisper" => install_accurate_stt(&root, &app).await?,
+        "kokoro" => install_kokoro_voice(&root, &app).await?,
         "memory-embedder" => install_memory_embedder(&root, &app).await?,
         "whisper" => install_whisper_engine(&root, &app).await?,
         "whisper-model" => {
@@ -5143,6 +5559,262 @@ runtime_module["PROTOCOL_STDOUT"].flush()
             report.get("stt_backend").and_then(Value::as_str),
             Some("faster-whisper")
         );
+    }
+
+    /// A voice root holding the pinned Kokoro manifest with correctly sized
+    /// sparse int8 assets, a neural interpreter, and a private Piper tier. No
+    /// model weights are required: every probe the desktop performs is metadata.
+    fn kokoro_voice_root_fixture(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "personal-agent-tts4-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        let neural = root.join("neural");
+        let model = neural.join("models/kokoro-v1.0-int8");
+        std::fs::create_dir_all(&model).expect("create sparse kokoro fixture");
+        let interpreter = if cfg!(windows) {
+            neural.join("venv/Scripts/python.exe")
+        } else {
+            neural.join("venv/bin/python")
+        };
+        std::fs::create_dir_all(interpreter.parent().expect("venv directory"))
+            .expect("create neural venv fixture");
+        std::fs::write(&interpreter, b"neural interpreter fixture")
+            .expect("write neural interpreter fixture");
+        for asset in kokoro_model_assets() {
+            let file = std::fs::File::create(model.join(asset.name)).expect("create sparse asset");
+            file.set_len(kokoro_asset_size(asset.name).expect("known kokoro asset size"))
+                .expect("size sparse asset");
+        }
+        std::fs::write(
+            neural.join("kokoro.json"),
+            serde_json::to_vec(&kokoro_install_manifest(&model)).expect("manifest JSON"),
+        )
+        .expect("write kokoro manifest");
+        root
+    }
+
+    fn kokoro_fixture_status(
+        root: &Path,
+        config: &PersonalAgentConfig,
+        piper: &Path,
+        piper_model: &Path,
+    ) -> NativeVoiceStatus {
+        let mut status = discover_native_voice(
+            root,
+            &config.voice.stt_backend,
+            &config.voice.tts_backend,
+            "",
+            "",
+            &piper.to_string_lossy(),
+            &piper_model.to_string_lossy(),
+            "",
+        );
+        apply_kokoro_tts_status(&mut status, config, root);
+        status
+    }
+
+    #[test]
+    fn voice_self_test_synthesizes_via_kokoro_when_kokoro_is_the_selected_backend() {
+        let root = kokoro_voice_root_fixture("selftest");
+        // Piper must stay installed so a Kokoro selection is proven to win on
+        // merit rather than because no other tier exists.
+        let piper = root.join("piper/bin/piper");
+        let piper_model = root.join("piper/voices/en_US-lessac-medium.onnx");
+        std::fs::create_dir_all(piper.parent().expect("piper bin")).expect("create piper fixture");
+        std::fs::create_dir_all(piper_model.parent().expect("piper voices"))
+            .expect("create piper voice fixture");
+        std::fs::write(&piper, b"piper fixture").expect("write piper fixture");
+        std::fs::write(&piper_model, b"piper voice fixture").expect("write piper voice fixture");
+
+        let mut config = PersonalAgentConfig::default();
+        config.voice.tts_backend = "kokoro".to_owned();
+        let status = kokoro_fixture_status(&root, &config, &piper, &piper_model);
+        assert!(status.kokoro_ready);
+        assert!(status.tts_ready);
+        assert_eq!(status.active_tts_backend, "kokoro");
+        assert_eq!(
+            voice_self_test_tts_tier(&status.active_tts_backend),
+            "kokoro",
+            "voice_self_test must exercise the selected Kokoro tier, not Piper"
+        );
+        assert!(matches!(
+            neural_tts_engine("kokoro"),
+            Some((LocalModel::Kokoro, KOKORO_TTS_SAMPLE_RATE_HZ))
+        ));
+
+        // Qwen3 is still tier one; with no CUDA weights present the locked
+        // ladder resolves the selected `qwen3-tts` backend to Kokoro.
+        config.voice.tts_backend = "qwen3-tts".to_owned();
+        let qwen_status = kokoro_fixture_status(&root, &config, &piper, &piper_model);
+        assert!(!qwen_status.qwen_ready);
+        assert_eq!(qwen_status.active_tts_backend, "kokoro");
+        assert_eq!(
+            voice_self_test_tts_tier(&qwen_status.active_tts_backend),
+            "kokoro"
+        );
+
+        // Removing the pinned manifest must fail closed to Piper instead of
+        // reporting a Kokoro tier that cannot synthesize.
+        std::fs::remove_file(root.join("neural/kokoro.json")).expect("remove kokoro manifest");
+        config.voice.tts_backend = "kokoro".to_owned();
+        let degraded = kokoro_fixture_status(&root, &config, &piper, &piper_model);
+        assert!(!degraded.kokoro_ready);
+        assert_eq!(degraded.active_tts_backend, "piper");
+        assert_eq!(
+            voice_self_test_tts_tier(&degraded.active_tts_backend),
+            "piper"
+        );
+        std::fs::remove_dir_all(root).expect("remove kokoro self-test fixture");
+    }
+
+    #[tokio::test]
+    async fn qwen_failure_falls_to_kokoro_and_emits_the_recovering_event() {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+
+        assert_eq!(
+            tts_fallback_backend("qwen3-tts", true, true),
+            Some("kokoro")
+        );
+        assert_eq!(
+            tts_fallback_backend("qwen3-tts", false, true),
+            Some("piper")
+        );
+        assert_eq!(tts_fallback_backend("kokoro", false, true), Some("piper"));
+        assert_eq!(tts_fallback_backend("kokoro", true, false), None);
+        assert_eq!(tts_fallback_backend("piper", true, true), None);
+
+        let kokoro_wav = PathBuf::from("kokoro-tier.wav");
+        let piper_wav = PathBuf::from("piper-tier.wav");
+
+        // Tier one (Qwen3 on CUDA) failed: Kokoro runs next and the transition
+        // is announced exactly once, before the CPU tier is attempted.
+        let events = Mutex::new(Vec::new());
+        let piper_calls = AtomicUsize::new(0);
+        let (wav, engine) = run_tts_ladder(
+            &|event| events.lock().expect("event log").push(event),
+            true,
+            true,
+            Some("CUDA out of memory".to_owned()),
+            false,
+            || std::future::ready(Ok(kokoro_wav.clone())),
+            |_| {
+                piper_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(piper_wav.clone()))
+            },
+        )
+        .await
+        .expect("kokoro tier synthesized");
+        assert_eq!(engine, "kokoro");
+        assert_eq!(wav, kokoro_wav);
+        assert_eq!(
+            piper_calls.load(Ordering::SeqCst),
+            0,
+            "Piper must not run once Kokoro recovers the turn"
+        );
+        assert_eq!(
+            events.into_inner().expect("event log"),
+            vec![json!({
+                "state": "recovering",
+                "detail": "CUDA out of memory",
+                "fallback": "kokoro",
+            })]
+        );
+    }
+
+    /// Kokoro failing too walks one further tier, announces it, and carries
+    /// both failures forward so nothing is silently swallowed.
+    #[tokio::test]
+    async fn kokoro_failure_falls_to_piper_and_announces_every_remaining_tier() {
+        use std::sync::Mutex;
+
+        let piper_wav = PathBuf::from("piper-tier.wav");
+        let events = Mutex::new(Vec::new());
+        let piper_prior_error = Mutex::new(None);
+        let (wav, engine) = run_tts_ladder(
+            &|event| events.lock().expect("event log").push(event),
+            true,
+            true,
+            Some("CUDA out of memory".to_owned()),
+            false,
+            || std::future::ready(Err("onnxruntime session failed".to_owned())),
+            |prior| {
+                *piper_prior_error.lock().expect("prior error") = prior;
+                std::future::ready(Ok(piper_wav.clone()))
+            },
+        )
+        .await
+        .expect("piper tier synthesized");
+        assert_eq!((wav, engine), (piper_wav.clone(), "piper"));
+        assert_eq!(
+            events.into_inner().expect("event log"),
+            vec![
+                json!({
+                    "state": "recovering",
+                    "detail": "CUDA out of memory",
+                    "fallback": "kokoro",
+                }),
+                json!({
+                    "state": "recovering",
+                    "detail": "onnxruntime session failed",
+                    "fallback": "piper",
+                }),
+            ]
+        );
+        assert_eq!(
+            piper_prior_error.into_inner().expect("prior error"),
+            Some(
+                "Qwen3-TTS failed: CUDA out of memory. Kokoro failed: onnxruntime session failed"
+                    .to_owned()
+            )
+        );
+
+        // An uninstalled Kokoro tier skips straight to Piper with a single
+        // event, and a caller that already announced the transition never
+        // duplicates it.
+        for (already_emitted, expected) in [(false, 1_usize), (true, 0)] {
+            let events = Mutex::new(Vec::new());
+            let (_, engine) = run_tts_ladder(
+                &|event| events.lock().expect("event log").push(event),
+                false,
+                true,
+                Some("Qwen3-TTS worker exited".to_owned()),
+                already_emitted,
+                || std::future::ready(Err("kokoro is not installed".to_owned())),
+                |_| std::future::ready(Ok(piper_wav.clone())),
+            )
+            .await
+            .expect("piper tier synthesized");
+            assert_eq!(engine, "piper");
+            assert_eq!(events.into_inner().expect("event log").len(), expected);
+        }
+
+        // With no tier left there is nothing to recover to, so the failure
+        // surfaces as an error instead of a `recovering` promise.
+        let events = Mutex::new(Vec::new());
+        let error = run_tts_ladder(
+            &|event| events.lock().expect("event log").push(event),
+            false,
+            false,
+            Some("Qwen3-TTS worker exited".to_owned()),
+            false,
+            || std::future::ready(Err("kokoro is not installed".to_owned())),
+            |prior| {
+                std::future::ready(Err(prior.map_or_else(
+                    || "Piper is unavailable".to_owned(),
+                    |error| format!("{error}. Piper is unavailable"),
+                )))
+            },
+        )
+        .await
+        .expect_err("no tier remained");
+        assert_eq!(error, "Qwen3-TTS worker exited. Piper is unavailable");
+        assert!(events.into_inner().expect("event log").is_empty());
     }
 
     #[test]

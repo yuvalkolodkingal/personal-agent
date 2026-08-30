@@ -81,6 +81,26 @@ FASTER_WHISPER_MODEL_SHA256 = {
     "tokenizer.json": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
     "vocabulary.json": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
 }
+KOKORO_PACKAGE_VERSION = "0.6.1"
+KOKORO_WHEEL_SHA256 = "50c8de4950d601df41428ee5462a48c8a78bef441bf671f2492e070ef44d8a32"
+KOKORO_MODEL_RELEASE = "model-files-v1.1"
+KOKORO_MODEL_SHA256 = "ae315a79b623f244700e4afb9246c46a26066782e049ba174bf3ba433970ee9c"
+KOKORO_VOICES_SHA256 = "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
+KOKORO_RUNTIME_DEPENDENCIES = [
+    "attrs==26.1.0",
+    "cffi==2.1.1",
+    "dlinfo==2.0.0",
+    "espeakng-loader==0.2.4",
+    "joblib==1.5.3",
+    "numpy==2.5.2",
+    "onnxruntime==1.28.0",
+    "phonemizer==3.4.0",
+    "pycparser==3.0",
+    "soundfile==0.14.0",
+    "typing-extensions==4.16.0",
+]
+KOKORO_DEFAULT_VOICE = "af_heart"
+KOKORO_SAMPLE_RATE_HZ = 24_000
 FASTER_WHISPER_WINDOW_SAMPLES = 16_000 * 3
 FASTER_WHISPER_FIRST_PARTIAL_SAMPLES = FASTER_WHISPER_WINDOW_SAMPLES
 FASTER_WHISPER_OVERLAP_SAMPLES = 16_000 // 2
@@ -210,6 +230,7 @@ class VoiceRuntime:
         self.partial_audio_samples = 0
         self.qwen = None
         self.qwen_kind = ""
+        self.kokoro = None
         self.smart_turn = None
         self.turn_audio: list[float] = []
         self.silero_vad = None
@@ -710,6 +731,109 @@ class VoiceRuntime:
         self.qwen_kind = kind
         return kind
 
+    def _kokoro_marker(self) -> dict[str, Any]:
+        marker = self.root / "kokoro.json"
+        if not marker.is_file():
+            raise RuntimeError(
+                "Kokoro CPU voice is not installed; install the Kokoro voice profile"
+            )
+        manifest = json.loads(marker.read_text(encoding="utf-8"))
+        expected = {
+            "package": f"kokoro-onnx=={KOKORO_PACKAGE_VERSION}",
+            "wheel_sha256": KOKORO_WHEEL_SHA256,
+            "model_release": KOKORO_MODEL_RELEASE,
+            "quantization": "int8",
+            "dependencies": KOKORO_RUNTIME_DEPENDENCIES,
+        }
+        for key, value in expected.items():
+            if manifest.get(key) != value:
+                raise RuntimeError(f"Kokoro install manifest has an unexpected {key}")
+        model_path = Path(str(manifest.get("model_path", "")))
+        expected_path = self.models / "kokoro-v1.0-int8"
+        if model_path != expected_path or not model_path.is_dir():
+            raise RuntimeError("Kokoro model files are missing or outside the voice root")
+        required = manifest.get("files")
+        expected_files = {
+            "kokoro-v1.0.int8.onnx": KOKORO_MODEL_SHA256,
+            "voices-v1.0.bin": KOKORO_VOICES_SHA256,
+        }
+        if required != expected_files:
+            raise RuntimeError("Kokoro install manifest is incomplete")
+        for name, expected_digest in expected_files.items():
+            asset = model_path / name
+            if not asset.is_file():
+                raise RuntimeError(f"Kokoro model file is missing: {name}")
+            actual_digest = sha256_file(asset)
+            if actual_digest != expected_digest:
+                raise RuntimeError(
+                    f"Kokoro model digest mismatch for {name}: "
+                    f"expected {expected_digest}, found {actual_digest}"
+                )
+        manifest["model_path"] = str(model_path)
+        return manifest
+
+    def _load_kokoro(self) -> None:
+        if self.kokoro is not None:
+            return
+        manifest = self._kokoro_marker()
+        from importlib.metadata import PackageNotFoundError, version
+
+        for specification in [
+            f"kokoro-onnx=={KOKORO_PACKAGE_VERSION}",
+            *KOKORO_RUNTIME_DEPENDENCIES,
+        ]:
+            package, expected_version = specification.split("==", maxsplit=1)
+            try:
+                installed_version = version(package)
+            except PackageNotFoundError as error:
+                raise RuntimeError(
+                    f"Kokoro runtime dependency is missing: {package}"
+                ) from error
+            if installed_version != expected_version:
+                raise RuntimeError(
+                    f"Kokoro runtime dependency mismatch for {package}: "
+                    f"expected {expected_version}, found {installed_version}"
+                )
+        from kokoro_onnx import Kokoro
+
+        model_path = Path(manifest["model_path"])
+        self.kokoro = Kokoro(
+            str(model_path / "kokoro-v1.0.int8.onnx"),
+            str(model_path / "voices-v1.0.bin"),
+        )
+
+    @staticmethod
+    def _kokoro_voice(request: dict[str, Any]) -> str:
+        voice = str(request.get("voice", "")).strip()
+        # Existing Qwen profiles store `Ryan`; crossing into the CPU fallback
+        # must never pass that incompatible speaker name into Kokoro.
+        return KOKORO_DEFAULT_VOICE if not voice or voice == "Ryan" else voice
+
+    @staticmethod
+    def _kokoro_speed(request: dict[str, Any]) -> float:
+        raw = request.get("speech_rate_percent", 100)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            raise RuntimeError("Kokoro speech rate must be numeric")
+        return min(200.0, max(50.0, float(raw))) / 100.0
+
+    def _kokoro_create(
+        self, text: str, request: dict[str, Any]
+    ) -> tuple[Any, int, str]:
+        self._load_kokoro()
+        voice = self._kokoro_voice(request)
+        waveform, sample_rate = self.kokoro.create(
+            text,
+            voice=voice,
+            speed=self._kokoro_speed(request),
+            lang="en-us",
+        )
+        sample_rate = int(sample_rate)
+        if sample_rate != KOKORO_SAMPLE_RATE_HZ:
+            raise RuntimeError(
+                f"Kokoro returned {sample_rate} Hz; expected {KOKORO_SAMPLE_RATE_HZ} Hz"
+            )
+        return waveform, sample_rate, voice
+
     def _embed_paths(self) -> tuple[Path, Path]:
         root = self.models / "multilingual-e5-small-int8"
         return root / "model.onnx", root / "tokenizer.json"
@@ -987,6 +1111,7 @@ class VoiceRuntime:
         faster_whisper_marker = self.root / "faster-whisper.json"
         qwen_custom = self.models / "qwen3-tts-0.6b-customvoice"
         qwen_base = self.models / "qwen3-tts-0.6b-base"
+        kokoro_root = self.models / "kokoro-v1.0-int8"
         smart_turn = self.models / "smart-turn-v3.2-cpu.onnx"
         embed_model, embed_tokenizer = self._embed_paths()
         custom_complete = (
@@ -1005,12 +1130,18 @@ class VoiceRuntime:
             "qwen_ready": custom_complete or base_complete,
             "qwen_custom_voice_ready": custom_complete,
             "qwen_clone_ready": base_complete,
+            "kokoro_ready": (
+                (self.root / "kokoro.json").is_file()
+                and (kokoro_root / "kokoro-v1.0.int8.onnx").is_file()
+                and (kokoro_root / "voices-v1.0.bin").is_file()
+            ),
             "smart_turn_ready": smart_turn.is_file(),
             "embed_ready": embed_model.is_file() and embed_tokenizer.is_file(),
             "moonshine_loaded": self.moonshine is not None,
             "moonshine_thread_mode": self.moonshine_thread_mode or "unloaded",
             "performance_cpu_tier": self.performance_cpu_tier,
             "qwen_loaded": self.qwen is not None,
+            "kokoro_loaded": self.kokoro is not None,
             "faster_whisper_loaded": self.faster_whisper is not None,
             "active_stt_engine": self.stt_engine or "idle",
             "vision_grounding_loaded": self.vision_grounding is not None,
@@ -1344,9 +1475,23 @@ class VoiceRuntime:
         if not output.is_relative_to(self.root.parent):
             raise RuntimeError("speech output is outside the private voice directory")
         output.parent.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        engine = str(request.get("tts_engine", "qwen3-tts")).strip()
+        if engine == "kokoro":
+            waveform, sample_rate, voice = self._kokoro_create(text, request)
+            sf.write(output, waveform, sample_rate)
+            return {
+                "wav": str(output),
+                "sample_rate_hz": sample_rate,
+                "synthesis_ms": int((time.monotonic() - started) * 1000),
+                "engine": "kokoro",
+                "model_kind": "int8",
+                "voice": voice,
+            }
+        if engine != "qwen3-tts":
+            raise RuntimeError(f"unsupported neural TTS engine: {engine}")
         requested = str(request.get("model_kind", "custom"))
         kind = self._load_qwen(requested)
-        started = time.monotonic()
         if kind == "base":
             reference = Path(str(request.get("reference_audio", "")))
             reference_text = str(request.get("reference_text", "")).strip()
@@ -1417,6 +1562,9 @@ class VoiceRuntime:
             raise RuntimeError("tts_stream found no speakable clauses")
 
         socket_path = self._private_tts_socket(request)
+        engine = str(request.get("tts_engine", "qwen3-tts")).strip()
+        if engine not in {"qwen3-tts", "kokoro"}:
+            raise RuntimeError(f"unsupported neural TTS engine: {engine}")
         requested = str(request.get("model_kind", "custom"))
         voice = str(request.get("voice", "Ryan")) or "Ryan"
         started = time.monotonic()
@@ -1429,9 +1577,18 @@ class VoiceRuntime:
             # Connect before loading so model/config failures close the audio
             # channel and let Rust consume the JSON error without waiting for
             # the socket-accept deadline.
-            kind = self._load_qwen(requested)
+            kind = "int8"
+            if engine == "qwen3-tts":
+                kind = self._load_qwen(requested)
+            else:
+                self._load_kokoro()
             for clause in clauses:
-                if kind == "base":
+                if engine == "kokoro":
+                    waveform, clause_sample_rate, voice = self._kokoro_create(
+                        clause, request
+                    )
+                    wavs = [waveform]
+                elif kind == "base":
                     reference = Path(str(request.get("reference_audio", "")))
                     reference_text = str(request.get("reference_text", "")).strip()
                     if not reference.is_file():
@@ -1455,7 +1612,7 @@ class VoiceRuntime:
                 if sample_rate_hz is None:
                     sample_rate_hz = clause_sample_rate
                 elif sample_rate_hz != clause_sample_rate:
-                    raise RuntimeError("Qwen3-TTS changed sample rate between clauses")
+                    raise RuntimeError(f"{engine} changed sample rate between clauses")
                 encoded = self._pcm16le(wavs[0])
                 try:
                     stream.sendall(struct.pack("<I", len(encoded)) + encoded)
@@ -1472,8 +1629,9 @@ class VoiceRuntime:
             "samples": samples,
             "cancelled": cancelled,
             "synthesis_ms": int((time.monotonic() - started) * 1000),
-            "engine": "qwen3-tts-0.6b",
+            "engine": "kokoro" if engine == "kokoro" else "qwen3-tts-0.6b",
             "model_kind": kind,
+            "voice": voice,
         }
 
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:

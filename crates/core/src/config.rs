@@ -390,10 +390,15 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub stt_model_path: String,
     #[serde(default = "default_tts_backend")]
+    /// Local TTS tier. `qwen3-tts` uses CUDA and falls back through the
+    /// `kokoro` CPU int8 worker before the private Piper subprocess. Selecting
+    /// `kokoro` starts at the CPU tier and still retains Piper as final fallback.
     pub tts_backend: String,
     #[serde(default = "default_tts_model")]
     pub tts_model: String,
     #[serde(default = "default_voice")]
+    /// Engine voice identifier. Kokoro uses `af_heart` when this is empty or
+    /// still contains the Qwen default (`Ryan`).
     pub tts_voice: String,
     #[serde(default)]
     pub tts_executable: String,

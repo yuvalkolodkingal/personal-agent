@@ -26,8 +26,10 @@ pub struct NativeVoiceStatus {
     pub moonshine_ready: bool,
     pub smart_turn_ready: bool,
     pub qwen_ready: bool,
+    pub kokoro_ready: bool,
     pub moonshine_model: Option<PathBuf>,
     pub qwen_model: Option<PathBuf>,
+    pub kokoro_model: Option<PathBuf>,
     pub neural_python: Option<PathBuf>,
     pub whisper_executable: Option<PathBuf>,
     pub whisper_model: Option<PathBuf>,
@@ -128,6 +130,11 @@ pub fn discover_native_voice(
             && path.join("model.safetensors").is_file()
             && path.join("speech_tokenizer/model.safetensors").is_file()
     });
+    let kokoro_root = voice_root.join("neural/models/kokoro-v1.0-int8");
+    let kokoro_model = (kokoro_root.join("kokoro-v1.0.int8.onnx").is_file()
+        && kokoro_root.join("voices-v1.0.bin").is_file()
+        && voice_root.join("neural/kokoro.json").is_file())
+    .then_some(kokoro_root);
     let neural_runtime_ready = neural_python.is_some();
     let smart_turn_ready = neural_runtime_ready
         && voice_root
@@ -135,17 +142,21 @@ pub fn discover_native_voice(
             .is_file();
     let moonshine_ready = neural_runtime_ready && moonshine_model.is_some();
     let qwen_ready = neural_runtime_ready && qwen_model.is_some();
+    let kokoro_ready = neural_runtime_ready && kokoro_model.is_some();
     let whisper_ready = whisper_executable.is_some() && whisper_model.is_some();
     let piper_ready = piper_executable.is_some() && piper_model.is_some();
     let wants_moonshine = stt_backend == "moonshine";
     let wants_qwen = tts_backend == "qwen3-tts";
+    let wants_kokoro = tts_backend == "kokoro";
     let stt_ready = if wants_moonshine {
         moonshine_ready || whisper_ready
     } else {
         whisper_ready
     };
     let tts_ready = if wants_qwen {
-        qwen_ready || piper_ready
+        qwen_ready || kokoro_ready || piper_ready
+    } else if wants_kokoro {
+        kokoro_ready || piper_ready
     } else {
         piper_ready
     };
@@ -158,6 +169,8 @@ pub fn discover_native_voice(
     };
     let active_tts_backend = if wants_qwen && qwen_ready {
         "qwen3-tts".to_owned()
+    } else if (wants_qwen || wants_kokoro) && kokoro_ready {
+        "kokoro".to_owned()
     } else if piper_ready {
         "piper".to_owned()
     } else {
@@ -216,7 +229,10 @@ pub fn discover_native_voice(
             .push("Moonshine Medium Streaming is unavailable; Whisper is the STT fallback.".into());
     }
     if wants_qwen && !qwen_ready {
-        details.push("Qwen3-TTS 0.6B is unavailable; Piper is the TTS fallback.".into());
+        details.push("Qwen3-TTS 0.6B is unavailable; Kokoro CPU is the next TTS tier.".into());
+    }
+    if (wants_qwen || wants_kokoro) && !kokoro_ready {
+        details.push("Kokoro CPU is unavailable; Piper is the final TTS fallback.".into());
     }
     if wants_moonshine && !smart_turn_ready {
         details.push(
@@ -228,6 +244,9 @@ pub fn discover_native_voice(
     }
     if qwen_ready {
         details.push("Qwen3-TTS 0.6B is ready on the local GPU.".into());
+    }
+    if kokoro_ready {
+        details.push("Kokoro int8 is ready on the local CPU.".into());
     }
     if smart_turn_ready {
         details.push("Smart Turn v3.2 semantic endpointing is ready on the local CPU.".into());
@@ -245,8 +264,10 @@ pub fn discover_native_voice(
         moonshine_ready,
         smart_turn_ready,
         qwen_ready,
+        kokoro_ready,
         moonshine_model,
         qwen_model,
+        kokoro_model,
         neural_python,
         whisper_executable,
         whisper_model,
