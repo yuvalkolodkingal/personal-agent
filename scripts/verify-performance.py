@@ -34,6 +34,19 @@ def main() -> None:
         assert metric["sample_count"] >= 100, name
         assert metric["p95_microseconds"] < limit, f"{name} p95 exceeded {limit}us"
         assert metric["maximum_microseconds"] < limit, f"{name} maximum exceeded {limit}us"
+    endpoint = report["stt_endpoint_replay"]
+    if endpoint["status"] == "measured":
+        metric = endpoint["endpoint_decision"]
+        assert metric["sample_count"] >= 5, "stt_endpoint_replay"
+        assert metric["p95_microseconds"] < 250_000, "STT endpoint p95 exceeded 250ms"
+        assert metric["maximum_microseconds"] < 250_000, "STT endpoint maximum exceeded 250ms"
+        assert endpoint["smart_turn_consultations_per_silence"] == 1
+        assert all(
+            decision["decision"] == "smart-turn"
+            for decision in endpoint["decisions"]
+        ), "endpoint replay did not exercise Smart Turn"
+    else:
+        assert endpoint["status"] == "external-model-assets-required"
     if args.write:
         output = ROOT / "docs/operations/performance-report.json"
         output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

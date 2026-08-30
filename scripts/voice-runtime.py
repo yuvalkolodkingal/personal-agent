@@ -13,6 +13,7 @@ import contextlib
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -32,6 +33,11 @@ OPENWAKEWORD_MODEL_SHA256 = "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434
 OPENWAKEWORD_MELSPEC_SHA256 = "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f"
 OPENWAKEWORD_EMBEDDING_SHA256 = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f"
 BUILTIN_WAKE_PHRASES = frozenset({"hey jarvis", "jarvis"})
+SILERO_VAD_VERSION = "v5.1.2"
+SILERO_VAD_REVISION = "6478567951ae5c9979ad7b234185b5515f4be7a1"
+SILERO_VAD_SHA256 = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
+SILERO_VAD_WINDOW_SAMPLES = 512
+SILERO_VAD_CONTEXT_SAMPLES = 64
 
 
 def normalized_phrase(value: Any) -> str:
@@ -61,12 +67,18 @@ class VoiceRuntime:
         self.root = root
         self.models = root / "models"
         self.moonshine = None
+        self.moonshine_thread_mode = ""
         self.stream = None
         self.partial_text = ""
         self.qwen = None
         self.qwen_kind = ""
         self.smart_turn = None
         self.turn_audio: list[float] = []
+        self.silero_vad = None
+        self.vad_state = None
+        self.vad_context = None
+        self.vad_pending_samples: list[float] = []
+        self.vad_last_probability = 0.0
         self.embed_session = None
         self.embed_tokenizer = None
         self.wake_model = None
@@ -86,7 +98,25 @@ class VoiceRuntime:
             raise RuntimeError("Moonshine Medium Streaming is not installed")
         return json.loads(marker.read_text(encoding="utf-8"))
 
-    def _load_moonshine(self, vocabulary: list[str] | None = None) -> None:
+    def _load_moonshine(
+        self, vocabulary: list[str] | None = None, *, streaming: bool
+    ) -> None:
+        wanted_thread_mode = "single" if streaming else "default"
+        if self.moonshine is not None and self.moonshine_thread_mode != wanted_thread_mode:
+            if self.stream is not None:
+                raise RuntimeError("cannot change Moonshine mode while a stream is active")
+            self.moonshine.close()
+            self.moonshine = None
+            self.moonshine_thread_mode = ""
+            gc.collect()
+        # Moonshine exposes this native-runtime switch so its many resident
+        # ONNX sessions do not leave spinning thread pools that starve the
+        # latency-bound Silero/Smart Turn endpoint path. Batch transcription
+        # retains the normal scheduler because it is throughput-bound.
+        if streaming:
+            os.environ["MOONSHINE_ORT_SINGLE_THREAD"] = "1"
+        else:
+            os.environ.pop("MOONSHINE_ORT_SINGLE_THREAD", None)
         from moonshine_voice import ModelArch
         from moonshine_voice.transcriber import Transcriber
 
@@ -101,8 +131,22 @@ class VoiceRuntime:
                 model_arch=wanted_arch,
                 update_interval=0.45,
             )
+            self.moonshine_thread_mode = wanted_thread_mode
         if vocabulary and hasattr(self.moonshine, "set_keyterms"):
             self.moonshine.set_keyterms(vocabulary[:128])
+
+    def _load_smart_turn(self) -> bool:
+        smart_turn_path = self.models / "smart-turn-v3.2-cpu.onnx"
+        if not smart_turn_path.is_file():
+            return False
+        if self.smart_turn is None:
+            from smart_turn import SmartTurn
+
+            # Create the small endpoint model before Moonshine claims its own
+            # ONNX execution resources. This avoids starving the latency-bound
+            # endpoint consultation after a streaming decode.
+            self.smart_turn = SmartTurn(smart_turn_path, cpu_count=4)
+        return True
 
     def _qwen_model_path(self, requested: str) -> tuple[Path, str]:
         custom = self.models / "qwen3-tts-0.6b-customvoice"
@@ -150,6 +194,111 @@ class VoiceRuntime:
             root / "melspectrogram.onnx",
             root / "embedding_model.onnx",
         )
+
+    def _silero_vad_path(self) -> Path:
+        return self.models / "silero-vad-v5.1.2.onnx"
+
+    def _reset_silero_vad(self) -> None:
+        self.vad_pending_samples = []
+        self.vad_last_probability = 0.0
+        if self.silero_vad is None:
+            self.vad_state = None
+            self.vad_context = None
+            return
+        import numpy as np
+
+        # Silero VAD v5 uses one combined recurrent state, unlike the older
+        # openWakeWord-bundled model's separate h/c tensors.
+        self.vad_state = np.zeros((2, 1, 128), dtype=np.float32)
+        self.vad_context = np.zeros(
+            (1, SILERO_VAD_CONTEXT_SAMPLES), dtype=np.float32
+        )
+
+    def _load_silero_vad(self) -> None:
+        if self.silero_vad is not None:
+            return
+        model = self._silero_vad_path()
+        if not model.is_file():
+            raise RuntimeError(f"Silero VAD {SILERO_VAD_VERSION} is not installed")
+        found = sha256_file(model)
+        if found != SILERO_VAD_SHA256:
+            raise RuntimeError(
+                "Silero VAD v5 asset digest mismatch: "
+                f"expected {SILERO_VAD_SHA256}, found {found}"
+            )
+
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.inter_op_num_threads = 1
+        options.intra_op_num_threads = 1
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session = ort.InferenceSession(
+            str(model), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        inputs = {item.name: item for item in session.get_inputs()}
+        outputs = {item.name: item for item in session.get_outputs()}
+        if set(inputs) != {"input", "state", "sr"} or set(outputs) != {
+            "output",
+            "stateN",
+        }:
+            raise RuntimeError(
+                "Silero VAD model does not expose the pinned v5 input/state contract"
+            )
+        state_shape = inputs["state"].shape
+        if (
+            len(state_shape) != 3
+            or state_shape[0] != 2
+            or state_shape[2] != 128
+            or inputs["sr"].type != "tensor(int64)"
+        ):
+            raise RuntimeError(
+                "Silero VAD model has an unexpected recurrent-state contract"
+            )
+        self.silero_vad = session
+        self._reset_silero_vad()
+
+    def _speech_probability(
+        self, samples: list[Any], sample_rate_hz: int
+    ) -> tuple[float, int]:
+        if sample_rate_hz != 16_000:
+            raise RuntimeError("Silero VAD chunks must be 16 kHz mono audio")
+        self._load_silero_vad()
+        import numpy as np
+
+        audio = np.asarray(self.vad_pending_samples + samples, dtype=np.float32)
+        audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
+        audio = np.clip(audio, -1.0, 1.0)
+        complete_samples = (
+            audio.size // SILERO_VAD_WINDOW_SAMPLES
+        ) * SILERO_VAD_WINDOW_SAMPLES
+        self.vad_pending_samples = audio[complete_samples:].tolist()
+        probabilities: list[float] = []
+        for offset in range(0, complete_samples, SILERO_VAD_WINDOW_SAMPLES):
+            frame = audio[
+                offset : offset + SILERO_VAD_WINDOW_SAMPLES
+            ].reshape(1, -1)
+            model_input = np.concatenate((self.vad_context, frame), axis=1)
+            output, state = self.silero_vad.run(
+                ["output", "stateN"],
+                {
+                    "input": model_input,
+                    "state": self.vad_state,
+                    "sr": np.asarray(16_000, dtype=np.int64),
+                },
+            )
+            self.vad_state = np.asarray(state, dtype=np.float32)
+            self.vad_context = model_input[:, -SILERO_VAD_CONTEXT_SAMPLES:]
+            probabilities.append(
+                max(0.0, min(1.0, float(np.asarray(output).reshape(-1)[0])))
+            )
+        if probabilities:
+            # The maximum makes a mixed speech/tail-silence transport chunk a
+            # speech chunk. A following all-silence chunk then trips the stop
+            # threshold without cutting off the final phoneme.
+            self.vad_last_probability = max(probabilities)
+        return self.vad_last_probability, len(probabilities)
 
     def _load_wake_model(self) -> None:
         if self.wake_model is not None:
@@ -330,6 +479,7 @@ class VoiceRuntime:
             "smart_turn_ready": smart_turn.is_file(),
             "embed_ready": embed_model.is_file() and embed_tokenizer.is_file(),
             "moonshine_loaded": self.moonshine is not None,
+            "moonshine_thread_mode": self.moonshine_thread_mode or "unloaded",
             "qwen_loaded": self.qwen is not None,
             "faster_whisper_loaded": self.faster_whisper is not None,
             "vision_grounding_loaded": self.vision_grounding is not None,
@@ -337,6 +487,10 @@ class VoiceRuntime:
             "wake_ready": all(path.is_file() for path in self._wake_paths()),
             "wake_loaded": self.wake_model is not None,
             "wake_active": self.wake_active,
+            "silero_vad_ready": self._silero_vad_path().is_file(),
+            "silero_vad_loaded": self.silero_vad is not None,
+            "silero_vad_version": SILERO_VAD_VERSION,
+            "silero_vad_revision": SILERO_VAD_REVISION,
         }
 
     def unload(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -366,7 +520,11 @@ class VoiceRuntime:
         return {"model": model, "unloaded": was_loaded, "loaded": False}
 
     def stt_start(self, request: dict[str, Any]) -> dict[str, Any]:
-        self._load_moonshine([str(item) for item in request.get("vocabulary", [])])
+        self._load_smart_turn()
+        self._load_moonshine(
+            [str(item) for item in request.get("vocabulary", [])], streaming=True
+        )
+        self._load_silero_vad()
         if self.stream is not None:
             try:
                 self.stream.stop()
@@ -374,9 +532,14 @@ class VoiceRuntime:
                 pass
         self.partial_text = ""
         self.turn_audio = []
+        self._reset_silero_vad()
         self.stream = self.moonshine.create_stream(update_interval=0.45)
         self.stream.start()
-        return {"state": "listening", "text": ""}
+        return {
+            "state": "listening",
+            "text": "",
+            "moonshine_thread_mode": self.moonshine_thread_mode,
+        }
 
     def wake_start(self, request: dict[str, Any]) -> dict[str, Any]:
         phrases = request.get("phrases")
@@ -397,6 +560,9 @@ class VoiceRuntime:
         )
         self.wake_active = True
         if self.wake_fallback:
+            # The frontend's digital-silence pre-gate means the VAD session can
+            # stay unloaded until the first non-trivial custom-phrase frame.
+            self._reset_silero_vad()
             return {
                 "state": "listening",
                 "fallback": "stt-match",
@@ -423,7 +589,17 @@ class VoiceRuntime:
         if int(request.get("sample_rate_hz", 16_000)) != 16_000:
             raise RuntimeError("wake chunks must be 16 kHz mono audio")
         if self.wake_fallback:
-            return {"wake": False, "score": 0.0, "fallback": "stt-match"}
+            speech_prob, vad_frames = self._speech_probability(
+                samples, int(request.get("sample_rate_hz", 16_000))
+            )
+            return {
+                "wake": False,
+                "score": 0.0,
+                "fallback": "stt-match",
+                "speech_prob": speech_prob,
+                "vad_frames": vad_frames,
+                "vad_model": f"silero-vad-{SILERO_VAD_VERSION}",
+            }
         if self.wake_model is None:
             raise RuntimeError("the openWakeWord model is not loaded")
 
@@ -450,6 +626,7 @@ class VoiceRuntime:
         self.wake_fallback = False
         self.wake_phrases = []
         self.wake_pending_samples = []
+        self._reset_silero_vad()
         if self.wake_model is not None:
             self.wake_model.reset()
         return {"state": "idle", "stopped": was_active}
@@ -458,9 +635,11 @@ class VoiceRuntime:
         if self.stream is None:
             raise RuntimeError("no Moonshine stream is active")
         samples = request.get("samples", [])
-        if not isinstance(samples, list) or len(samples) > 32_000:
+        if not isinstance(samples, list) or not samples or len(samples) > 32_000:
             raise RuntimeError("invalid speech chunk")
-        self.stream.add_audio(samples, int(request.get("sample_rate_hz", 16_000)))
+        sample_rate_hz = int(request.get("sample_rate_hz", 16_000))
+        speech_prob, vad_frames = self._speech_probability(samples, sample_rate_hz)
+        self.stream.add_audio(samples, sample_rate_hz)
         self.turn_audio.extend(float(sample) for sample in samples)
         if len(self.turn_audio) > 16_000 * 8:
             self.turn_audio = self.turn_audio[-16_000 * 8 :]
@@ -468,7 +647,14 @@ class VoiceRuntime:
         text = transcript_text(result)
         if text:
             self.partial_text = text
-        return {"state": "listening", "text": self.partial_text, "final_result": False}
+        return {
+            "state": "listening",
+            "text": self.partial_text,
+            "final_result": False,
+            "speech_prob": speech_prob,
+            "vad_frames": vad_frames,
+            "vad_model": f"silero-vad-{SILERO_VAD_VERSION}",
+        }
 
     def stt_stop(self, _request: dict[str, Any]) -> dict[str, Any]:
         if self.stream is None:
@@ -479,6 +665,7 @@ class VoiceRuntime:
         text = transcript_text(result) or self.partial_text
         self.partial_text = ""
         self.turn_audio = []
+        self._reset_silero_vad()
         if not text:
             raise RuntimeError("no speech was detected")
         return {
@@ -496,22 +683,25 @@ class VoiceRuntime:
                 self.stream = None
         self.partial_text = ""
         self.turn_audio = []
+        self._reset_silero_vad()
         return {"state": "idle", "cancelled": True}
 
     def turn_complete(self, request: dict[str, Any]) -> dict[str, Any]:
-        if self.smart_turn is None:
-            from smart_turn import SmartTurn
-
-            self.smart_turn = SmartTurn(self.models / "smart-turn-v3.2-cpu.onnx")
-        return self.smart_turn.predict(
+        if not self._load_smart_turn():
+            return {"complete": True, "decision": "silence-fallback"}
+        result = self.smart_turn.predict(
             self.turn_audio,
             threshold=float(request.get("threshold", 0.5)),
         )
+        result["decision"] = "smart-turn"
+        return result
 
     def stt_transcribe(self, request: dict[str, Any]) -> dict[str, Any]:
         from moonshine_voice import load_wav_file
 
-        self._load_moonshine([str(item) for item in request.get("vocabulary", [])])
+        self._load_moonshine(
+            [str(item) for item in request.get("vocabulary", [])], streaming=False
+        )
         wav = Path(str(request.get("wav", "")))
         if not wav.is_file() or not wav.is_relative_to(self.root.parent):
             raise RuntimeError("transcription input is outside the private voice directory")
@@ -520,7 +710,12 @@ class VoiceRuntime:
         text = transcript_text(result)
         if not text:
             raise RuntimeError("no speech was detected")
-        return {"text": text, "final_result": True, "language": "en"}
+        return {
+            "text": text,
+            "final_result": True,
+            "language": "en",
+            "moonshine_thread_mode": self.moonshine_thread_mode,
+        }
 
     def tts_synthesize(self, request: dict[str, Any]) -> dict[str, Any]:
         import soundfile as sf

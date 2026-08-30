@@ -120,7 +120,12 @@ export function encodePcm16Le(samples: ArrayLike<number>): ArrayBuffer {
 }
 
 export function sendVoiceStreamChunk(samples: ArrayLike<number>) {
-  return invoke<{ text?: string }>(
+  return invoke<{
+    text?: string;
+    speech_prob: number;
+    vad_frames?: number;
+    vad_model?: string;
+  }>(
     "voice_stream_chunk",
     encodePcm16Le(samples),
   );
@@ -130,7 +135,54 @@ export type WakeChunkResult = {
   wake: boolean;
   score: number;
   fallback?: "stt-match";
+  speech_prob?: number;
 };
+
+/** Config stores probability thresholds as integer thousandths. */
+export function vadProbabilityThreshold(milli: number) {
+  return Math.max(0, Math.min(1, milli / 1000));
+}
+
+/** Reject only digital silence/tiny transport noise before invoking worker VAD. */
+export function passesVoicePreGate(rms: number) {
+  return Number.isFinite(rms) && rms >= 0.0005;
+}
+
+export type VadEndpointState = {
+  speechStarted: boolean;
+  semanticConsultedForSilence: boolean;
+};
+
+/** Apply Silero hysteresis and request at most one semantic check per silence. */
+export function advanceVadEndpoint(
+  state: VadEndpointState,
+  speechProbability: number,
+  startThresholdMilli: number,
+  stopThresholdMilli: number,
+) {
+  const probability = Math.max(0, Math.min(1, speechProbability));
+  if (probability >= vadProbabilityThreshold(startThresholdMilli))
+    return {
+      state: {
+        speechStarted: true,
+        semanticConsultedForSilence: false,
+      },
+      consultSmartTurn: false,
+    };
+  if (
+    state.speechStarted &&
+    probability <= vadProbabilityThreshold(stopThresholdMilli) &&
+    !state.semanticConsultedForSilence
+  )
+    return {
+      state: {
+        speechStarted: true,
+        semanticConsultedForSilence: true,
+      },
+      consultSmartTurn: true,
+    };
+  return { state, consultSmartTurn: false };
+}
 
 /** Send ambient audio to the dedicated wake-word worker without JSON samples. */
 export function sendWakeStreamChunk(samples: ArrayLike<number>) {
@@ -166,11 +218,9 @@ export function useVoiceCapture(
   const streamFailure = useRef("");
   const streamQueue = useRef<Promise<void>>(Promise.resolve());
   const speechStarted = useRef(false);
-  const noiseFloor = useRef(0.005);
-  const silenceStartedAt = useRef(0);
-  const latestPartial = useRef("");
   const turnCheckInFlight = useRef(false);
-  const turnDeferrals = useRef(0);
+  const semanticConsultedForSilence = useRef(false);
+  const considerEndpointRef = useRef<() => Promise<void>>(async () => undefined);
   const startRef = useRef<() => Promise<void>>(async () => undefined);
   const onTranscriptRef = useRef(onTranscript);
   const wakeStream = useRef<MediaStream | null>(null);
@@ -181,8 +231,6 @@ export function useVoiceCapture(
   const wakeCandidate = useRef<Float32Array[]>([]);
   const wakeCandidateSamples = useRef(0);
   const wakeSpeechStarted = useRef(false);
-  const wakeNoiseFloor = useRef(0.005);
-  const wakeSilenceStartedAt = useRef(0);
   const wakeFallback = useRef(false);
   const wakeQueue = useRef<Promise<void>>(Promise.resolve());
   const wakeSessionActive = useRef(false);
@@ -202,7 +250,6 @@ export function useVoiceCapture(
       meta: VoiceTranscriptMeta = { final: false, source: "capture" },
       notify = true,
     ) => {
-      latestPartial.current = text;
       setPartialTranscript(text);
       if (notify) onPartialTranscript?.(text, meta);
     },
@@ -224,7 +271,6 @@ export function useVoiceCapture(
       wakeCandidate.current = [];
       wakeCandidateSamples.current = 0;
       wakeSpeechStarted.current = false;
-      wakeSilenceStartedAt.current = 0;
       wakeFallback.current = false;
       let workerStopped: Promise<unknown> = Promise.resolve();
       if (wakeSessionActive.current) {
@@ -324,8 +370,6 @@ export function useVoiceCapture(
       wakeCandidate.current = [];
       wakeCandidateSamples.current = 0;
       wakeSpeechStarted.current = false;
-      wakeNoiseFloor.current = 0.005;
-      wakeSilenceStartedAt.current = 0;
       node.onaudioprocess = (event) => {
         if (wakeGeneration.current !== generation) return;
         const data = new Float32Array(event.inputBuffer.getChannelData(0));
@@ -338,99 +382,83 @@ export function useVoiceCapture(
         }
         const rms = Math.sqrt(sum / data.length);
         setLevel(Math.min(1, rms * 8));
-        if (!wakeFallback.current) {
-          const requestGeneration = wakeGeneration.current;
-          const samples = downsample(data, audioContext.sampleRate);
-          wakeQueue.current = wakeQueue.current
-            .then(async () => {
-              if (wakeGeneration.current !== requestGeneration) return;
-              const result = await sendWakeStreamChunk(samples);
-              if (
-                wakeGeneration.current === requestGeneration &&
-                result.wake
-              ) {
-                const phrase = config.voice.wake_phrases.find((candidate) =>
-                  ["hey jarvis", "jarvis"].includes(
-                    normalizedWords(candidate).join(" "),
-                  ),
-                );
-                await activateWake(phrase ?? "hey jarvis");
-              }
-            })
-            .catch((caught) => {
-              if (wakeGeneration.current !== requestGeneration) return;
-              setError(`Wake recognition failed: ${String(caught)}`);
-              void stopWakeCapture();
-              transition("error");
-            });
-          return;
-        }
-        const startThreshold = Math.max(
-          0.012,
-          wakeNoiseFloor.current * 3,
-          (config.voice.vad_start_milli / 1000) * 0.04,
-        );
-        const stopThreshold = Math.max(
-          0.008,
-          wakeNoiseFloor.current * 1.8,
-          (config.voice.vad_stop_milli / 1000) * 0.04,
-        );
-        const preRollSamples =
-          (audioContext.sampleRate * config.voice.pre_roll_ms) / 1000;
-        if (!wakeSpeechStarted.current) {
-          wakeNoiseFloor.current = wakeNoiseFloor.current * 0.97 + rms * 0.03;
-          wakeRolling.current.push(data);
-          let rollingSamples = wakeRolling.current.reduce(
-            (total, chunk) => total + chunk.length,
-            0,
-          );
-          while (
-            rollingSamples > preRollSamples &&
-            wakeRolling.current.length > 1
-          ) {
-            rollingSamples -= wakeRolling.current.shift()?.length ?? 0;
-          }
-          if (rms >= startThreshold) {
-            wakeSpeechStarted.current = true;
-            wakeCandidate.current = [...wakeRolling.current];
-            wakeCandidateSamples.current = rollingSamples;
-            wakeSilenceStartedAt.current = 0;
-          }
-          return;
-        }
-        wakeCandidate.current.push(data);
-        wakeCandidateSamples.current += data.length;
-        const now = performance.now();
-        if (rms <= stopThreshold) {
-          if (!wakeSilenceStartedAt.current) wakeSilenceStartedAt.current = now;
-        } else wakeSilenceStartedAt.current = 0;
-        const silenceMs = Math.max(
-          350,
-          Math.min(900, config.voice.vad_stop_milli),
-        );
-        const timedOut =
-          wakeCandidateSamples.current >= audioContext.sampleRate * 4;
-        const ended =
-          wakeSilenceStartedAt.current > 0 &&
-          now - wakeSilenceStartedAt.current >= silenceMs;
-        if (!ended && !timedOut) return;
-        const candidate = mergeChunks(wakeCandidate.current);
-        wakeCandidate.current = [];
-        wakeCandidateSamples.current = 0;
-        wakeRolling.current = [];
-        wakeSpeechStarted.current = false;
-        wakeSilenceStartedAt.current = 0;
-        if (candidate.length < audioContext.sampleRate / 4) return;
         const requestGeneration = wakeGeneration.current;
+        const samples = downsample(data, audioContext.sampleRate);
         wakeQueue.current = wakeQueue.current
           .then(async () => {
-            const result = await invoke<{ text: string }>("voice_transcribe", {
-              samples: downsample(candidate, audioContext.sampleRate),
-              sampleRateHz: 16_000,
-            });
+            if (wakeGeneration.current !== requestGeneration) return;
+            if (!wakeFallback.current) {
+              const result = await sendWakeStreamChunk(samples);
+              if (!result.wake) return;
+              const phrase = config.voice.wake_phrases.find((candidate) =>
+                ["hey jarvis", "jarvis"].includes(
+                  normalizedWords(candidate).join(" "),
+                ),
+              );
+              await activateWake(phrase ?? "hey jarvis");
+              return;
+            }
+
+            const preRollSamples =
+              (audioContext.sampleRate * config.voice.pre_roll_ms) / 1000;
+            const updateRolling = () => {
+              wakeRolling.current.push(data);
+              let rollingSamples = wakeRolling.current.reduce(
+                (total, chunk) => total + chunk.length,
+                0,
+              );
+              while (
+                rollingSamples > preRollSamples &&
+                wakeRolling.current.length > 1
+              ) {
+                rollingSamples -= wakeRolling.current.shift()?.length ?? 0;
+              }
+              return rollingSamples;
+            };
+            const shouldConsultWorker =
+              wakeSpeechStarted.current || passesVoicePreGate(rms);
+            const result = shouldConsultWorker
+              ? await sendWakeStreamChunk(samples)
+              : ({ speech_prob: 0 } as WakeChunkResult);
+            const speechProbability = result.speech_prob ?? 0;
+            const startThreshold = vadProbabilityThreshold(
+              config.voice.vad_start_milli,
+            );
+            const stopThreshold = vadProbabilityThreshold(
+              config.voice.vad_stop_milli,
+            );
+            if (!wakeSpeechStarted.current) {
+              const rollingSamples = updateRolling();
+              if (speechProbability >= startThreshold) {
+                wakeSpeechStarted.current = true;
+                wakeCandidate.current = [...wakeRolling.current];
+                wakeCandidateSamples.current = rollingSamples;
+              }
+              return;
+            }
+
+            wakeCandidate.current.push(data);
+            wakeCandidateSamples.current += data.length;
+            const timedOut =
+              wakeCandidateSamples.current >= audioContext.sampleRate * 4;
+            if (speechProbability > stopThreshold && !timedOut) return;
+
+            const candidate = mergeChunks(wakeCandidate.current);
+            wakeCandidate.current = [];
+            wakeCandidateSamples.current = 0;
+            wakeRolling.current = [];
+            wakeSpeechStarted.current = false;
+            if (candidate.length < audioContext.sampleRate / 4) return;
+            const transcript = await invoke<{ text: string }>(
+              "voice_transcribe",
+              {
+                samples: downsample(candidate, audioContext.sampleRate),
+                sampleRateHz: 16_000,
+              },
+            );
             if (wakeGeneration.current !== requestGeneration) return;
             const match = matchWakePhrase(
-              result.text,
+              transcript.text,
               config.voice.wake_phrases,
             );
             if (!match) return;
@@ -488,12 +516,33 @@ export function useVoiceCapture(
               source: "capture",
               audioEndMs,
             });
+          if (!Number.isFinite(result.speech_prob))
+            throw new Error("voice worker omitted Silero speech probability");
+          const endpoint = advanceVadEndpoint(
+            {
+              speechStarted: speechStarted.current,
+              semanticConsultedForSilence:
+                semanticConsultedForSilence.current,
+            },
+            result.speech_prob,
+            config.voice.vad_start_milli,
+            config.voice.vad_stop_milli,
+          );
+          speechStarted.current = endpoint.state.speechStarted;
+          semanticConsultedForSilence.current =
+            endpoint.state.semanticConsultedForSilence;
+          if (
+            endpoint.consultSmartTurn &&
+            stateRef.current === "listening"
+          ) {
+            void considerEndpointRef.current();
+          }
         })
         .catch((caught) => {
           streamFailure.current = String(caught);
         });
     },
-    [publishPartial],
+    [config.voice.vad_start_milli, config.voice.vad_stop_milli, publishPartial],
   );
 
   const stop = useCallback(
@@ -578,9 +627,8 @@ export function useVoiceCapture(
         streamFailure.current = "";
         stopInFlight.current = false;
         speechStarted.current = false;
-        silenceStartedAt.current = 0;
         turnCheckInFlight.current = false;
-        turnDeferrals.current = 0;
+        semanticConsultedForSilence.current = false;
       }
     },
     [
@@ -615,16 +663,18 @@ export function useVoiceCapture(
       await streamQueue.current;
       const result =
         neuralStreaming.current && !streamFailure.current
-          ? await invoke<{ complete: boolean; probability?: number }>(
+          ? await invoke<{
+              complete: boolean;
+              probability?: number;
+              decision?: "smart-turn" | "silence-fallback";
+            }>(
               "voice_turn_complete",
             )
           : { complete: true };
-      if (result.complete || turnDeferrals.current >= 2) {
+      if (result.complete) {
         await stop(true);
         return;
       }
-      turnDeferrals.current += 1;
-      silenceStartedAt.current = performance.now();
       transition("listening");
     } catch {
       // A missing or failed semantic endpoint model must never strand capture.
@@ -633,6 +683,8 @@ export function useVoiceCapture(
       turnCheckInFlight.current = false;
     }
   }, [queueStreamChunk, stop, transition]);
+
+  considerEndpointRef.current = considerEndpoint;
 
   const start = useCallback(async () => {
     if (
@@ -651,10 +703,8 @@ export function useVoiceCapture(
     streamFailure.current = "";
     streamQueue.current = Promise.resolve();
     speechStarted.current = false;
-    silenceStartedAt.current = 0;
     turnCheckInFlight.current = false;
-    turnDeferrals.current = 0;
-    noiseFloor.current = 0.005;
+    semanticConsultedForSilence.current = false;
     publishPartial("", { final: false, source: "capture" }, false);
     setError("");
     transition("loading_model");
@@ -717,47 +767,19 @@ export function useVoiceCapture(
         }
         const rms = Math.sqrt(sum / data.length);
         chunks.current.push(data);
-        streamingChunks.current.push(data);
-        streamingSamples.current += data.length;
-        if (streamingSamples.current >= audioContext.sampleRate * 0.45) {
-          queueStreamChunk(
-            mergeChunks(streamingChunks.current),
-            audioContext.sampleRate,
-          );
-          streamingChunks.current = [];
-          streamingSamples.current = 0;
+        if (speechStarted.current || passesVoicePreGate(rms)) {
+          streamingChunks.current.push(data);
+          streamingSamples.current += data.length;
+          if (streamingSamples.current >= audioContext.sampleRate * 0.08) {
+            queueStreamChunk(
+              mergeChunks(streamingChunks.current),
+              audioContext.sampleRate,
+            );
+            streamingChunks.current = [];
+            streamingSamples.current = 0;
+          }
         }
         setLevel(Math.min(1, rms * 8));
-        const now = performance.now();
-        if (!speechStarted.current)
-          noiseFloor.current = noiseFloor.current * 0.97 + rms * 0.03;
-        const startThreshold = Math.max(
-          0.012,
-          noiseFloor.current * 3,
-          (config.voice.vad_start_milli / 1000) * 0.04,
-        );
-        const stopThreshold = Math.max(
-          0.008,
-          noiseFloor.current * 1.8,
-          (config.voice.vad_stop_milli / 1000) * 0.04,
-        );
-        if (rms >= startThreshold) {
-          speechStarted.current = true;
-          silenceStartedAt.current = 0;
-        } else if (speechStarted.current && rms <= stopThreshold) {
-          if (!silenceStartedAt.current) silenceStartedAt.current = now;
-          const looksComplete = /[.!?]["')\]]?$/.test(
-            latestPartial.current.trim(),
-          );
-          const endpointMs = looksComplete
-            ? config.voice.endpoint_short_ms
-            : config.voice.endpoint_long_ms;
-          if (
-            now - silenceStartedAt.current >= endpointMs &&
-            stateRef.current === "listening"
-          )
-            void considerEndpoint();
-        } else if (speechStarted.current) silenceStartedAt.current = 0;
       };
       input.connect(node);
       node.connect(silentOutput);
@@ -796,7 +818,6 @@ export function useVoiceCapture(
     }
   }, [
     config.voice,
-    considerEndpoint,
     onProjection,
     publishPartial,
     queueStreamChunk,
@@ -820,7 +841,7 @@ export function useVoiceCapture(
     context.current = null;
     neuralStreaming.current = false;
     turnCheckInFlight.current = false;
-    turnDeferrals.current = 0;
+    semanticConsultedForSilence.current = false;
     void invoke<Projection>("microphone_state", {
       active: false,
       mode: config.voice.mode,

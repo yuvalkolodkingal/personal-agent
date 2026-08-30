@@ -175,6 +175,13 @@ struct WakeReplayObservation {
     event_latencies: Vec<Duration>,
 }
 
+struct EndpointReplayObservation {
+    decision_latency: Duration,
+    maximum_speech_probability: f64,
+    decision: String,
+    complete: bool,
+}
+
 async fn replay_wake_once(
     worker: &mut NeuralVoiceRuntime,
     samples: &[f32],
@@ -214,22 +221,202 @@ async fn replay_stt_once(
     wav_path: &Path,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    worker
+    let result = worker
         .request(
             "stt_transcribe",
             json!({"wav": wav_path, "vocabulary": []}),
             timeout,
         )
         .await?;
+    if result.get("moonshine_thread_mode").and_then(Value::as_str) != Some("default") {
+        return Err("batch Moonshine did not use its normal throughput mode".into());
+    }
     Ok(())
 }
 
-async fn actual_worker_wake_cpu_replay() -> Result<Value, Box<dyn std::error::Error>> {
+async fn replay_endpoint_once(
+    worker: &mut NeuralVoiceRuntime,
+    samples: &[f32],
+    timeout: Duration,
+) -> Result<EndpointReplayObservation, Box<dyn std::error::Error>> {
+    const START_THRESHOLD: f64 = 0.6;
+    const STOP_THRESHOLD: f64 = 0.35;
+    const SILERO_WINDOW_SAMPLES: usize = 512;
+
+    let started = worker
+        .request("stt_start", json!({"vocabulary": []}), timeout)
+        .await?;
+    if started.get("moonshine_thread_mode").and_then(Value::as_str) != Some("single") {
+        return Err("streaming Moonshine did not recreate in endpoint-safe mode".into());
+    }
+    let mut maximum_speech_probability = 0.0_f64;
+    let mut speech_seen = false;
+    let replay = samples
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0.0_f32, 16_000))
+        .collect::<Vec<_>>();
+    for chunk in replay.chunks(SILERO_WINDOW_SAMPLES) {
+        let mut frame = [0.0_f32; SILERO_WINDOW_SAMPLES];
+        frame[..chunk.len()].copy_from_slice(chunk);
+        // This starts at the first sample of the candidate silence frame, so
+        // the measurement includes real Silero inference plus exactly one
+        // real Smart Turn request made by the endpoint-fusion path.
+        let frame_started = Instant::now();
+        let result = worker
+            .request(
+                "stt_chunk",
+                json!({"samples": frame.as_slice(), "sample_rate_hz": 16_000}),
+                timeout,
+            )
+            .await?;
+        if result.get("vad_model").and_then(Value::as_str) != Some("silero-vad-v5.1.2")
+            || result.get("vad_frames").and_then(Value::as_u64) != Some(1)
+        {
+            return Err("worker did not exercise the pinned Silero v5 512-sample contract".into());
+        }
+        let speech_probability = result
+            .get("speech_prob")
+            .and_then(Value::as_f64)
+            .ok_or("worker omitted Silero speech probability")?;
+        maximum_speech_probability = maximum_speech_probability.max(speech_probability);
+        if speech_probability >= START_THRESHOLD {
+            speech_seen = true;
+            continue;
+        }
+        if !speech_seen || speech_probability > STOP_THRESHOLD {
+            continue;
+        }
+
+        let endpoint = worker
+            .request("turn_complete", json!({"threshold": 0.5}), timeout)
+            .await?;
+        let decision_latency = frame_started.elapsed();
+        let decision = endpoint
+            .get("decision")
+            .and_then(Value::as_str)
+            .ok_or("endpoint worker omitted its decision provenance")?
+            .to_owned();
+        let complete = endpoint
+            .get("complete")
+            .and_then(Value::as_bool)
+            .ok_or("endpoint worker omitted the completion decision")?;
+        worker.request("stt_cancel", json!({}), timeout).await?;
+        return Ok(EndpointReplayObservation {
+            decision_latency,
+            maximum_speech_probability,
+            decision,
+            complete,
+        });
+    }
+    let _ = worker.request("stt_cancel", json!({}), timeout).await;
+    Err("Silero v5 replay did not observe speech followed by acoustic silence".into())
+}
+
+async fn measure_wake_cpu_replay(
+    worker: &mut NeuralVoiceRuntime,
+    process_id: u32,
+    samples: &[f32],
+    wav_path: &Path,
+    timeout: Duration,
+    repeats: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    replay_wake_once(worker, samples, timeout).await?;
+    replay_stt_once(worker, wav_path, timeout).await?;
+    let wake_ticks_before = worker_cpu_ticks(process_id)?;
+    let mut wake_response_latencies = Vec::new();
+    let mut detected = false;
+    let mut maximum_score = 0.0_f64;
+    for _ in 0..repeats {
+        let observation = replay_wake_once(worker, samples, timeout).await?;
+        maximum_score = maximum_score.max(observation.maximum_score);
+        wake_response_latencies.extend(observation.event_latencies);
+        detected |= observation.detected;
+    }
+    let wake_cpu_ticks = worker_cpu_ticks(process_id)?.saturating_sub(wake_ticks_before);
+    let stt_ticks_before = worker_cpu_ticks(process_id)?;
+    for _ in 0..repeats {
+        replay_stt_once(worker, wav_path, timeout).await?;
+    }
+    let stt_cpu_ticks = worker_cpu_ticks(process_id)?.saturating_sub(stt_ticks_before);
+    if !detected {
+        return Err(format!(
+            "pinned openWakeWord model did not detect replay (maximum score {maximum_score})"
+        )
+        .into());
+    }
+    let reduction_ratio = stt_cpu_ticks.to_string().parse::<f64>()?
+        / wake_cpu_ticks.max(1).to_string().parse::<f64>()?;
+    if reduction_ratio < 5.0 {
+        return Err(format!(
+            "real worker CPU replay improved only {reduction_ratio:.2}x; expected at least 5x"
+        )
+        .into());
+    }
+    let latency = summarize_latencies(&wake_response_latencies)?;
+    if latency.maximum_microseconds >= 250_000 {
+        return Err("wake-to-listen worker replay exceeded 250 ms".into());
+    }
+    Ok(json!({
+        "status": "measured",
+        "measurement": "Linux worker user+system CPU ticks over identical replay PCM",
+        "sample_count": repeats,
+        "openwakeword_cpu_ticks": wake_cpu_ticks,
+        "legacy_stt_cpu_ticks": stt_cpu_ticks,
+        "reduction_ratio": reduction_ratio,
+        "minimum_reduction_ratio": 5.0,
+        "wake_event_response": latency,
+        "maximum_score": maximum_score,
+    }))
+}
+
+async fn measure_endpoint_replay(
+    worker: &mut NeuralVoiceRuntime,
+    samples: &[f32],
+    timeout: Duration,
+    repeats: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let warm_endpoint = replay_endpoint_once(worker, samples, timeout).await?;
+    if warm_endpoint.decision != "smart-turn" {
+        return Err("endpoint replay did not consult the installed Smart Turn model".into());
+    }
+    let mut endpoint_latencies = Vec::new();
+    let mut decisions = Vec::new();
+    let mut maximum_speech_probability = warm_endpoint.maximum_speech_probability;
+    for _ in 0..repeats {
+        let observation = replay_endpoint_once(worker, samples, timeout).await?;
+        maximum_speech_probability =
+            maximum_speech_probability.max(observation.maximum_speech_probability);
+        endpoint_latencies.push(observation.decision_latency);
+        decisions.push(json!({
+            "decision": observation.decision,
+            "complete": observation.complete,
+        }));
+    }
+    let endpoint_latency = summarize_latencies(&endpoint_latencies)?;
+    if endpoint_latency.maximum_microseconds >= 250_000 {
+        return Err("Silero + Smart Turn endpoint replay exceeded 250 ms".into());
+    }
+    Ok(json!({
+        "status": "measured",
+        "measurement": "real pinned Silero v5 512-sample frame followed by one real Smart Turn v3.2 request",
+        "vad_model": "silero-vad-v5.1.2",
+        "vad_start_probability": 0.6,
+        "vad_stop_probability": 0.35,
+        "smart_turn_consultations_per_silence": 1,
+        "maximum_speech_probability": maximum_speech_probability,
+        "endpoint_decision": endpoint_latency,
+        "decisions": decisions,
+    }))
+}
+
+async fn actual_worker_voice_replays() -> Result<(Value, Value), Box<dyn std::error::Error>> {
     let Some(root) = std::env::var_os("PERSONAL_AGENT_VOICE_REPLAY_ROOT").map(PathBuf::from) else {
-        return Ok(json!({
+        let external = json!({
             "status": "external-model-assets-required",
             "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet"
-        }));
+        });
+        return Ok((external.clone(), external));
     };
     let python = PathBuf::from(
         std::env::var_os("PERSONAL_AGENT_VOICE_REPLAY_PYTHON")
@@ -262,59 +449,19 @@ async fn actual_worker_wake_cpu_replay() -> Result<Value, Box<dyn std::error::Er
     let timeout = Duration::from_secs(120);
     let repeats = 5_u64;
 
-    // Warm both real model paths before comparing their steady-state worker CPU.
-    replay_wake_once(&mut worker, &samples, timeout).await?;
-    replay_stt_once(&mut worker, &wav_path, timeout).await?;
-
-    let wake_ticks_before = worker_cpu_ticks(process_id)?;
-    let mut wake_response_latencies = Vec::new();
-    let mut detected = false;
-    let mut maximum_score = 0.0_f64;
-    for _ in 0..repeats {
-        let observation = replay_wake_once(&mut worker, &samples, timeout).await?;
-        maximum_score = maximum_score.max(observation.maximum_score);
-        wake_response_latencies.extend(observation.event_latencies);
-        detected |= observation.detected;
-    }
-    let wake_cpu_ticks = worker_cpu_ticks(process_id)?.saturating_sub(wake_ticks_before);
-
-    let stt_ticks_before = worker_cpu_ticks(process_id)?;
-    for _ in 0..repeats {
-        replay_stt_once(&mut worker, &wav_path, timeout).await?;
-    }
-    let stt_cpu_ticks = worker_cpu_ticks(process_id)?.saturating_sub(stt_ticks_before);
+    let ambient_armed_cpu_replay = measure_wake_cpu_replay(
+        &mut worker,
+        process_id,
+        &samples,
+        &wav_path,
+        timeout,
+        repeats,
+    )
+    .await?;
+    let stt_endpoint_replay =
+        measure_endpoint_replay(&mut worker, &samples, timeout, repeats).await?;
     worker.terminate();
-
-    if !detected {
-        return Err(format!(
-            "pinned openWakeWord model did not detect replay (maximum score {maximum_score})"
-        )
-        .into());
-    }
-    let stt_cpu_ticks_float = stt_cpu_ticks.to_string().parse::<f64>()?;
-    let wake_cpu_ticks_float = wake_cpu_ticks.max(1).to_string().parse::<f64>()?;
-    let reduction_ratio = stt_cpu_ticks_float / wake_cpu_ticks_float;
-    if reduction_ratio < 5.0 {
-        return Err(format!(
-            "real worker CPU replay improved only {reduction_ratio:.2}x; expected at least 5x"
-        )
-        .into());
-    }
-    let latency = summarize_latencies(&wake_response_latencies)?;
-    if latency.maximum_microseconds >= 250_000 {
-        return Err("wake-to-listen worker replay exceeded 250 ms".into());
-    }
-    Ok(json!({
-        "status": "measured",
-        "measurement": "Linux worker user+system CPU ticks over identical replay PCM",
-        "sample_count": repeats,
-        "openwakeword_cpu_ticks": wake_cpu_ticks,
-        "legacy_stt_cpu_ticks": stt_cpu_ticks,
-        "reduction_ratio": reduction_ratio,
-        "minimum_reduction_ratio": 5.0,
-        "wake_event_response": latency,
-        "maximum_score": maximum_score,
-    }))
+    Ok((ambient_armed_cpu_replay, stt_endpoint_replay))
 }
 
 #[tokio::main]
@@ -369,7 +516,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replay_desktop_snapshot_warm()?;
         desktop_snapshot_warm.push(started.elapsed());
     }
-    let ambient_armed_cpu_replay = actual_worker_wake_cpu_replay().await?;
+    let (ambient_armed_cpu_replay, stt_endpoint_replay) = actual_worker_voice_replays().await?;
     let report = json!({
         "schema_version": 1, "measurement": "deterministic-replay", "network": "disabled",
         "hotkey_to_listening": summarize_latencies(&hotkey)?,
@@ -380,11 +527,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "bootstrap_ipc": summarize_latencies(&bootstrap_ipc)?,
         "desktop_snapshot_warm": summarize_latencies(&desktop_snapshot_warm)?,
         "ambient_armed_cpu_replay": ambient_armed_cpu_replay,
+        "stt_endpoint_replay": stt_endpoint_replay,
         "replay_scope": {
             "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
             "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
             "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
-            "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required"
+            "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required",
+            "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set"
         },
         "replay_disclaimer": "Replay numbers are not physical microphone, speaker, network, screen-capture, or UI-startup measurements.",
         "external_hardware_required": ["end_to_end_barge_in", "cloud_first_audio", "idle_cpu", "idle_resident_memory", "warm_ui_startup", "physical_desktop_snapshot"]

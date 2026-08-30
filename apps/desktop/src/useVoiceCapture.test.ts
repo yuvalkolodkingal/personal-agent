@@ -5,9 +5,12 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import {
+  advanceVadEndpoint,
   matchWakePhrase,
+  passesVoicePreGate,
   sendVoiceStreamChunk,
   sendWakeStreamChunk,
+  vadProbabilityThreshold,
 } from "./useVoiceCapture";
 
 describe("binary voice streaming", () => {
@@ -77,5 +80,49 @@ describe("wake phrase matching", () => {
       phrase: "hey jarvis",
       remainder: "email Yuval about GitHub.",
     });
+  });
+});
+
+describe("Silero endpoint thresholds", () => {
+  it("treats VAD config millivals as probabilities, never durations", () => {
+    expect(vadProbabilityThreshold(600)).toBe(0.6);
+    expect(vadProbabilityThreshold(350)).toBe(0.35);
+    expect(vadProbabilityThreshold(-10)).toBe(0);
+    expect(vadProbabilityThreshold(1_500)).toBe(1);
+  });
+
+  it("uses the frontend RMS check only as a digital-silence pre-gate", () => {
+    expect(passesVoicePreGate(0)).toBe(false);
+    expect(passesVoicePreGate(0.00049)).toBe(false);
+    expect(passesVoicePreGate(0.0005)).toBe(true);
+    expect(passesVoicePreGate(Number.NaN)).toBe(false);
+  });
+
+  it("consults Smart Turn once per Silero silence episode", () => {
+    const initial = {
+      speechStarted: false,
+      semanticConsultedForSilence: false,
+    };
+    const speech = advanceVadEndpoint(initial, 0.82, 600, 350);
+    expect(speech.consultSmartTurn).toBe(false);
+    const firstSilence = advanceVadEndpoint(speech.state, 0.2, 600, 350);
+    expect(firstSilence.consultSmartTurn).toBe(true);
+    const sameSilence = advanceVadEndpoint(
+      firstSilence.state,
+      0.1,
+      600,
+      350,
+    );
+    expect(sameSilence.consultSmartTurn).toBe(false);
+    const resumedSpeech = advanceVadEndpoint(
+      sameSilence.state,
+      0.75,
+      600,
+      350,
+    );
+    expect(
+      advanceVadEndpoint(resumedSpeech.state, 0.15, 600, 350)
+        .consultSmartTurn,
+    ).toBe(true);
   });
 });

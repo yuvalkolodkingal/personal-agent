@@ -1,10 +1,39 @@
 {
+  "ambient_armed_cpu_replay": {
+    "legacy_stt_cpu_ticks": 10711,
+    "maximum_score": 0.9983576536178588,
+    "measurement": "Linux worker user+system CPU ticks over identical replay PCM",
+    "minimum_reduction_ratio": 5.0,
+    "openwakeword_cpu_ticks": 1165,
+    "reduction_ratio": 9.193991416309013,
+    "sample_count": 5,
+    "status": "measured",
+    "wake_event_response": {
+      "maximum_microseconds": 9647,
+      "p50_microseconds": 7948,
+      "p95_microseconds": 9647,
+      "sample_count": 20
+    }
+  },
+  "bootstrap_ipc": {
+    "maximum_microseconds": 958,
+    "p50_microseconds": 655,
+    "p95_microseconds": 810,
+    "sample_count": 100
+  },
+  "desktop_snapshot_warm": {
+    "maximum_microseconds": 30,
+    "p50_microseconds": 17,
+    "p95_microseconds": 21,
+    "sample_count": 100
+  },
   "external_hardware_required": [
     "end_to_end_barge_in",
     "cloud_first_audio",
     "idle_cpu",
     "idle_resident_memory",
-    "warm_ui_startup"
+    "warm_ui_startup",
+    "physical_desktop_snapshot"
   ],
   "hotkey_to_listening": {
     "maximum_microseconds": 0,
@@ -13,7 +42,7 @@
     "sample_count": 100
   },
   "internal_speaker_stop": {
-    "maximum_microseconds": 1,
+    "maximum_microseconds": 0,
     "p50_microseconds": 0,
     "p95_microseconds": 0,
     "sample_count": 100
@@ -21,16 +50,67 @@
   "measurement": "deterministic-replay",
   "network": "disabled",
   "offline_deterministic_command": {
-    "maximum_microseconds": 57,
-    "p50_microseconds": 21,
-    "p95_microseconds": 27,
+    "maximum_microseconds": 22,
+    "p50_microseconds": 10,
+    "p95_microseconds": 13,
     "sample_count": 100
   },
+  "replay_disclaimer": "Replay numbers are not physical microphone, speaker, network, screen-capture, or UI-startup measurements.",
+  "replay_scope": {
+    "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required",
+    "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
+    "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
+    "startup_native_setup": "serialized native-state replay; excludes window-system and physical device probes",
+    "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set"
+  },
   "schema_version": 1,
+  "startup_native_setup": {
+    "maximum_microseconds": 76,
+    "p50_microseconds": 22,
+    "p95_microseconds": 28,
+    "sample_count": 100
+  },
+  "stt_endpoint_replay": {
+    "decisions": [
+      {
+        "complete": true,
+        "decision": "smart-turn"
+      },
+      {
+        "complete": true,
+        "decision": "smart-turn"
+      },
+      {
+        "complete": true,
+        "decision": "smart-turn"
+      },
+      {
+        "complete": true,
+        "decision": "smart-turn"
+      },
+      {
+        "complete": true,
+        "decision": "smart-turn"
+      }
+    ],
+    "endpoint_decision": {
+      "maximum_microseconds": 120279,
+      "p50_microseconds": 110233,
+      "p95_microseconds": 120279,
+      "sample_count": 5
+    },
+    "maximum_speech_probability": 0.9996996521949768,
+    "measurement": "real pinned Silero v5 512-sample frame followed by one real Smart Turn v3.2 request",
+    "smart_turn_consultations_per_silence": 1,
+    "status": "measured",
+    "vad_model": "silero-vad-v5.1.2",
+    "vad_start_probability": 0.6,
+    "vad_stop_probability": 0.35
+  },
   "wake_detection_to_listening": {
-    "maximum_microseconds": 50,
-    "p50_microseconds": 20,
-    "p95_microseconds": 26,
+    "maximum_microseconds": 21,
+    "p50_microseconds": 9,
+    "p95_microseconds": 12,
     "sample_count": 100
   }
 }

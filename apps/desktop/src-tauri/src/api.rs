@@ -2014,19 +2014,33 @@ pub(crate) async fn voice_turn_complete(
 ) -> Result<Value, String> {
     let config = config_snapshot(&state)?;
     let status = voice_status_for(&state, &config);
-    if status.active_stt_backend != "moonshine" || !status.smart_turn_ready {
-        return Err(
-            "Smart Turn endpointing is not installed; using the silence endpoint fallback"
-                .to_owned(),
-        );
+    if let Some(fallback) =
+        endpoint_fallback_decision(status.active_stt_backend.as_str(), status.smart_turn_ready)
+    {
+        return Ok(fallback);
     }
-    neural_voice_request(
+    match neural_voice_request(
         &state,
         "turn_complete",
         json!({"threshold": 0.5}),
         Duration::from_secs(10),
     )
     .await
+    {
+        Ok(decision) => Ok(decision),
+        Err(error) if error.contains("Smart Turn v3.2 model is not installed") => {
+            Ok(silence_fallback_decision())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn silence_fallback_decision() -> Value {
+    json!({"complete": true, "decision": "silence-fallback"})
+}
+
+fn endpoint_fallback_decision(active_stt_backend: &str, smart_turn_ready: bool) -> Option<Value> {
+    (active_stt_backend != "moonshine" || !smart_turn_ready).then(silence_fallback_decision)
 }
 
 #[tauri::command]
@@ -2446,6 +2460,16 @@ const OPENWAKEWORD_EMBEDDING: VoiceAsset = VoiceAsset {
     url: "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx",
     sha256: "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f",
 };
+const SILERO_VAD_V5: VoiceAsset = VoiceAsset {
+    name: "silero-vad-v5.1.2.onnx",
+    url: "https://raw.githubusercontent.com/snakers4/silero-vad/6478567951ae5c9979ad7b234185b5515f4be7a1/src/silero_vad/data/silero_vad.onnx",
+    sha256: "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f",
+};
+const SMART_TURN_V3_2: VoiceAsset = VoiceAsset {
+    name: "smart-turn-v3.2-cpu.onnx",
+    url: "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx",
+    sha256: "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f",
+};
 
 async fn download_voice_asset(
     asset: &VoiceAsset,
@@ -2730,6 +2754,12 @@ async fn install_neural_voice(root: &Path, app: &tauri::AppHandle) -> Result<(),
     ] {
         download_voice_asset(asset, &wake_root.join(asset.name), app).await?;
     }
+    download_voice_asset(
+        &SILERO_VAD_V5,
+        &neural.join("models").join(SILERO_VAD_V5.name),
+        app,
+    )
+    .await?;
     let moonshine_root = neural.join("models/moonshine");
     let marker = neural.join("moonshine.json");
     let moonshine_code = r"import json, pathlib, sys
@@ -2748,18 +2778,10 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps({'model_path': path, 'model_arch
         Duration::from_mins(20),
     )
     .await?;
-    let smart_turn_code = r"from huggingface_hub import hf_hub_download
-import sys
-hf_hub_download(repo_id='pipecat-ai/smart-turn-v3', filename='smart-turn-v3.2-cpu.onnx', local_dir=sys.argv[1])";
-    let mut smart_turn = Command::new(&python);
-    smart_turn
-        .args(["-c", smart_turn_code])
-        .arg(neural.join("models"));
-    run_voice_installer(
+    download_voice_asset(
+        &SMART_TURN_V3_2,
+        &neural.join("models").join(SMART_TURN_V3_2.name),
         app,
-        "Downloading Smart Turn v3.2 endpointing",
-        smart_turn,
-        Duration::from_secs(300),
     )
     .await?;
     let qwen_path = neural.join("models/qwen3-tts-0.6b-customvoice");
@@ -3001,6 +3023,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn silero_vad_v5_asset_and_smart_turn_are_revision_and_digest_pinned() {
+        assert!(SILERO_VAD_V5.url.contains(
+            "/6478567951ae5c9979ad7b234185b5515f4be7a1/src/silero_vad/data/silero_vad.onnx"
+        ));
+        assert_eq!(
+            SILERO_VAD_V5.sha256,
+            "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
+        );
+        assert!(
+            SMART_TURN_V3_2
+                .url
+                .contains("/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx")
+        );
+        assert_eq!(SMART_TURN_V3_2.sha256.len(), 64);
+    }
+
+    #[test]
+    fn missing_smart_turn_returns_a_successful_silence_fallback_decision() {
+        assert_eq!(
+            endpoint_fallback_decision("moonshine", false),
+            Some(json!({"complete": true, "decision": "silence-fallback"}))
+        );
+        assert_eq!(
+            endpoint_fallback_decision("whisper.cpp", true),
+            Some(json!({"complete": true, "decision": "silence-fallback"}))
+        );
+        assert_eq!(endpoint_fallback_decision("moonshine", true), None);
+    }
+
     #[tokio::test]
     async fn wake_worker_protocol_covers_start_chunk_and_stop() {
         let nonce = SystemTime::now()
@@ -3074,8 +3126,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(chunk.pointer("/result/wake"), Some(&json!(false)));
-        assert_eq!(chunk.pointer("/result/fallback"), Some(&json!("stt-match")));
+        assert_eq!(chunk.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            chunk
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("Silero VAD v5.1.2 is not installed"))
+        );
         let stop = worker_test_request(
             &mut stdin,
             &mut stdout,
