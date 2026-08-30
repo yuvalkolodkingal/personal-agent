@@ -191,7 +191,7 @@ jobs:
           expanded="$(mktemp -d)"
           pkgutil --expand target/debug/bundle/pkg/Personal-Agent_0.1.0_arm64.pkg "$expanded/package"
           test -f "$expanded/package/Payload"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: unsigned-${{ matrix.target }}-installers
           path: |
