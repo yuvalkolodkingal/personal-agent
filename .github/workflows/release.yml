@@ -106,7 +106,7 @@ jobs:
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Keep the Linux bundles for install verification
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-bundles-${{ matrix.target }}
           path: |
