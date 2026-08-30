@@ -47,6 +47,10 @@
 | TTS-1 | DONE | The fake worker streams three ordered clauses over a private length-prefixed PCM socket; one monotonic deadline covers connect/read/ack, and generation cancellation stops within one frame. Audio protocol, deadline, bounds, format, and strict-clippy gates pass. | `34ec158` |
 | TTS-2 | DONE | Native rodio/cpal playback owns one streaming sink, stops immediately without polling, applies capture ducking, and falls back to `pw-play` only when device discovery/open fails. Audio tests pass 32/32 with one pre-existing asset test ignored; replay stop and first-audio gates pass. | `8163733` |
 | TTS-3 | DONE | A bounded nonblocking Rust clause pump consumes FakeRuntime deltas, keeps exactly one completed-clause prebuffer, rejects stale playback generations, and starts sink audio before `runtime-turn-complete`; replay first-audio p95 is 216 µs against the 700 ms limit. | `765a034` |
+| STT-5 | DONE | `python scripts/verify-performance.py` passes and gates `stt_partial_lag_ms` p95 < 700 ms; WER is computed over the 10-WAV CC0 corpus in `scripts/fixtures/stt-corpus/`. On this host the three STT metrics record `external-model-assets-required`, so the gate is satisfied but not yet numerically exercised. | `ca7c2d3` |
+| STT-3 | DONE | Pinned wheel/model hashes are exact (`faster_whisper_wheel_dependencies_and_complete_model_are_exactly_pinned`), the status probe is metadata-bounded and fail-closed, a tampered pinned model is rejected before CUDA load, `voice_self_test_reports_the_selected_accurate_engine` passes, and the accurate stream never leaks its arbiter lease across restart. Workspace suite green. | `6db6bfd` |
+| TTS-4 | DONE | `cargo test -p personal-agent-desktop kokoro` -> 3 passed, 0 failed: `voice_self_test_synthesizes_via_kokoro_when_kokoro_is_the_selected_backend`, `qwen_failure_falls_to_kokoro_and_emits_the_recovering_event`, `kokoro_failure_falls_to_piper_and_announces_every_remaining_tier`. The ladder tests assert the exact `recovering` event sequence, that Piper never runs once Kokoro recovers, that a missing pinned manifest fails closed to Piper, and that prior-tier errors chain forward. | `8180118` |
+| TTS-5 | DONE | Frontend 17 files / 96 tests and desktop Rust 101/101 pass. `App.test.tsx > voice barge-in` renders the real app, asserts the wake track is not stopped during playback, that `applyConstraints({echoCancellation:true})` ran, and that 400 ms at `speech_prob 0.95` triggers `voice_stop` + Listening. Replay `internal_speaker_stop` p95 = 1 us (max 15 us) against the 100 ms barge-in bar. The `between-clauses` emission that made the half-duplex guard dead code was implemented in `api.rs` with a Rust state-machine test, and the neural wake path now reports `speech_prob`, verified against the real pinned openWakeWord + Silero models. | `c3584c3` |
 
 ## Wave 1 gate
 
@@ -173,3 +177,36 @@ security, SBOM, notices, and release-metadata checks all pass.
 
 The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
 `x86_64-pc-windows-msvc` standard library and no `rustup` with which to install it.
+
+## Wave 9 gate
+
+Wave 9 is STT-3, STT-5, TTS-4, TTS-5, TTS-6. The gate below was run at the TTS-5 boundary and
+covers STT-3, STT-5, TTS-4, and TTS-5; **TTS-6 is still in flight and this gate will be re-run
+before the wave is closed.** This wave was interrupted by a host crash that killed two in-flight
+subagents; their work was recovered from disk, independently re-verified rather than trusted, and
+finished.
+
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`
+both exit 0, and `cargo test --workspace --locked` is fully green with the two pre-existing ignores
+(audio hardware/model-assets, runtime live-sidecar); desktop is 101/101 and audio 34/34. `bun run
+check`, `bun run test` (17 files / 96 tests), and the production build all pass. The deterministic
+initial-JavaScript gate reports 81.32 KiB gzip against the 300 KiB limit. Registry, pack,
+performance, 6,144-case fuzz, security, SBOM, and release-metadata checks all pass.
+
+Three defects were found by verification rather than by the implementing agents, and fixed:
+
+- TTS-4 was left with two `unused_assignments` warnings that would have failed the `-D warnings`
+  wave gate, plus a `cargo fmt` violation.
+- TTS-5's half-duplex guard consumed `voice-state: between-clauses`, but nothing in `api.rs` ever
+  emitted it, so the AEC-unavailable listening window was dead code. The sink now emits it.
+- `wake_chunk` returned `speech_prob` only on the `stt-match` fallback branch, so TTS-5's
+  "400 ms above 0.9" barge-in trigger could not fire on the default openWakeWord path. The neural
+  branch now reports it, requested by Rust only while playback is active so STT-1's ambient
+  wake-CPU reduction is preserved, and fail-soft when Silero is unavailable.
+
+The Windows cross-check was rerun and exits 101 with `E0463`: this host has no
+`x86_64-pc-windows-msvc` standard library and `rustup` is not installed.
+
+STT-5 follow-up available: the pinned Moonshine/faster-whisper replay assets are present on this
+host under `target/stt3-live/`, so `stt_partial_lag_ms` and both WER figures can be converted from
+`external-model-assets-required` into real measurements.

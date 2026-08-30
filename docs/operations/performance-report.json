@@ -4,15 +4,15 @@
     "status": "external-model-assets-required"
   },
   "bootstrap_ipc": {
-    "maximum_microseconds": 1205,
-    "p50_microseconds": 810,
-    "p95_microseconds": 1020,
+    "maximum_microseconds": 1823,
+    "p50_microseconds": 1119,
+    "p95_microseconds": 1505,
     "sample_count": 100
   },
   "desktop_snapshot_warm": {
-    "maximum_microseconds": 51,
-    "p50_microseconds": 24,
-    "p95_microseconds": 33,
+    "maximum_microseconds": 90,
+    "p50_microseconds": 33,
+    "p95_microseconds": 51,
     "sample_count": 100
   },
   "external_hardware_required": [
@@ -24,23 +24,23 @@
     "physical_desktop_snapshot"
   ],
   "hotkey_to_listening": {
-    "maximum_microseconds": 0,
+    "maximum_microseconds": 1,
     "p50_microseconds": 0,
     "p95_microseconds": 0,
     "sample_count": 100
   },
   "internal_speaker_stop": {
-    "maximum_microseconds": 6,
+    "maximum_microseconds": 2,
     "p50_microseconds": 0,
-    "p95_microseconds": 0,
+    "p95_microseconds": 1,
     "sample_count": 100
   },
   "measurement": "deterministic-replay",
   "network": "disabled",
   "offline_deterministic_command": {
-    "maximum_microseconds": 31,
-    "p50_microseconds": 20,
-    "p95_microseconds": 25,
+    "maximum_microseconds": 60,
+    "p50_microseconds": 26,
+    "p95_microseconds": 46,
     "sample_count": 100
   },
   "replay_disclaimer": "Replay numbers are not physical microphone, speaker, network, screen-capture, or UI-startup measurements.",
@@ -52,13 +52,14 @@
     "stt_accuracy": "ten CC0 Common Voice 11 utterances transcribed by each real configured engine when replay env vars are set; no hard WER threshold",
     "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set",
     "stt_partial_lag_ms": "paced 20 ms CC0 corpus replay comparing observed partial emit wall-time with the worker-reported decoder audio boundary when replay env vars are set",
+    "tts_ack_first_audio_ms": "warmup-cached acknowledgement phrase read from the 64 MiB LRU disk cache and handed to a bounded in-memory PCM sink; excludes synthesis and physical device startup",
     "tts_first_audio_ms": "three-clause fake-engine turn through a one-clause prebuffer and bounded in-memory PCM sink; excludes physical device startup"
   },
   "schema_version": 1,
   "startup_native_setup": {
-    "maximum_microseconds": 112,
-    "p50_microseconds": 46,
-    "p95_microseconds": 59,
+    "maximum_microseconds": 131,
+    "p50_microseconds": 57,
+    "p95_microseconds": 102,
     "sample_count": 100
   },
   "stt_endpoint_replay": {
@@ -77,16 +78,22 @@
     "command": "PERSONAL_AGENT_VOICE_REPLAY_ROOT=<neural-root> PERSONAL_AGENT_VOICE_REPLAY_PYTHON=<venv-python> PERSONAL_AGENT_VOICE_REPLAY_PCM=<signed-pcm16le> PERSONAL_AGENT_VOICE_REPLAY_WAV=<pcm16-wav> cargo run -p personal-agent-audio --bin audio-benchmark --quiet",
     "status": "external-model-assets-required"
   },
+  "tts_ack_first_audio_ms": {
+    "maximum_microseconds": 4210,
+    "p50_microseconds": 3060,
+    "p95_microseconds": 4039,
+    "sample_count": 100
+  },
   "tts_first_audio_ms": {
-    "maximum_microseconds": 530,
-    "p50_microseconds": 192,
-    "p95_microseconds": 268,
+    "maximum_microseconds": 501,
+    "p50_microseconds": 198,
+    "p95_microseconds": 352,
     "sample_count": 100
   },
   "wake_detection_to_listening": {
-    "maximum_microseconds": 32,
-    "p50_microseconds": 15,
-    "p95_microseconds": 22,
+    "maximum_microseconds": 43,
+    "p50_microseconds": 20,
+    "p95_microseconds": 34,
     "sample_count": 100
   }
 }

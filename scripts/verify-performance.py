@@ -19,6 +19,9 @@ LIMITS_US = {
     "bootstrap_ipc": 250_000,
     "desktop_snapshot_warm": 150_000,
     "tts_first_audio_ms": 700_000,
+    # Warmup pre-synthesizes the acknowledgement phrases, so a cached ack must
+    # reach the playback queue well inside the SPEC-V2 TTS-6 250 ms budget.
+    "tts_ack_first_audio_ms": 250_000,
 }
 
 

@@ -1,6 +1,7 @@
 //! Replaceable, privacy-aware audio pipeline and deterministic endpointing primitives.
 
 mod arbiter;
+mod cache;
 mod dictation;
 mod native;
 mod neural;
@@ -9,6 +10,7 @@ mod sink;
 pub use arbiter::{
     AdmissionDenied, AdmissionPlan, DEFAULT_VRAM_CEILING_MIB, LocalModel, ModelArbiter,
 };
+pub use cache::{CachedPhrase, PHRASE_CACHE_CAPACITY_BYTES, PhraseCache, PhraseKey};
 pub use dictation::{
     ApplicationPlan, CommandRouter, DeterministicCommand, DictationEngine, DictationError,
     DictationLatencyMetrics, DictationMode, DictationTarget, DictationToken, DictationUpdate,

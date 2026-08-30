@@ -1,9 +1,10 @@
 use super::{ActiveSession, DesktopState, VoicePlayback, configured_runtime, perf};
 use personal_agent_agent::Goal;
 use personal_agent_audio::{
-    AudioError, LocalModel, NativePlaybackControl, NativePlaybackSink, NativeVoiceStatus,
-    NeuralVoiceRuntime, PlaybackEnd, discover_native_voice, play_wav, synthesize_piper,
-    transcribe_pcm, transcribe_wav, write_pcm_wav,
+    AudioError, CachedPhrase, LocalModel, NativePlaybackControl, NativePlaybackSink,
+    NativeVoiceStatus, NeuralVoiceRuntime, PhraseCache, PhraseKey, PlaybackEnd,
+    discover_native_voice, play_wav, synthesize_piper, transcribe_pcm, transcribe_wav,
+    write_pcm_wav,
 };
 use personal_agent_core::{
     FeatureHashEmbedder, Memory, MemoryNamespace, MemoryTier, MemoryTrust, PersonalAgentConfig,
@@ -36,6 +37,16 @@ const TTS_TURN_CLAUSE_MAX_CHARACTERS: usize = 220;
 const TTS_TURN_MAX_TEXT_BYTES: usize = 65_536;
 const TTS_TURN_MAX_DELTA_EVENTS: usize = 4_096;
 const TTS_TURN_FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Locked warmup acknowledgement; persona lines are derived from the configured
+/// assistant identity next to it.
+const TTS_ACK_PHRASE: &str = "On it.";
+const TTS_WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Only short phrases are worth a cache entry: long, unique narration would
+/// evict the acknowledgements it is supposed to keep warm.
+const TTS_PHRASE_CACHE_MAX_TEXT_BYTES: usize = 512;
+/// Sixty seconds of 24 kHz mono audio, so no single phrase can dominate the
+/// 64 MiB budget.
+const TTS_PHRASE_CACHE_MAX_SAMPLES: usize = 1_440_000;
 
 #[derive(Default)]
 struct ClauseSegmenter {
@@ -989,6 +1000,207 @@ fn neural_tts_payload(config: &PersonalAgentConfig, backend: &str, text: &str) -
     })
 }
 
+/// Open the private phrase cache in the application data directory.
+///
+/// A cache failure is never fatal: speech simply always synthesizes.
+fn tts_phrase_cache(state: &DesktopState) -> Option<PhraseCache> {
+    match PhraseCache::open(state.app_data.join("voice/phrase-cache")) {
+        Ok(cache) => Some(cache),
+        Err(error) => {
+            tracing::warn!(%error, "phrase cache is unavailable; speech will always synthesize");
+            None
+        }
+    }
+}
+
+/// The `voice` component of the locked cache key.
+///
+/// A voice is not only the engine voice identifier: the TTS model and the
+/// reference clone inputs change the produced audio too, so all of them have
+/// to invalidate a cached phrase.
+fn tts_phrase_voice(config: &PersonalAgentConfig) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        config.voice.tts_voice,
+        config.voice.tts_model,
+        config.voice.tts_reference_audio,
+        config.voice.tts_reference_text
+    )
+}
+
+/// The `rate` component of the locked cache key: the engine sample rate paired
+/// with the configured speech rate, both of which change the rendered audio.
+fn tts_phrase_rate(sample_rate_hz: u32, speech_rate_percent: u16) -> String {
+    format!("{sample_rate_hz}@{speech_rate_percent}")
+}
+
+/// `SHA-256(engine|voice|rate|text)` for one phrase under the current voice
+/// configuration.
+fn tts_phrase_key(
+    config: &PersonalAgentConfig,
+    backend: &str,
+    sample_rate_hz: u32,
+    text: &str,
+) -> PhraseKey {
+    PhraseKey::new(
+        backend,
+        &tts_phrase_voice(config),
+        &tts_phrase_rate(sample_rate_hz, config.voice.speech_rate_percent),
+        text,
+    )
+}
+
+/// Acknowledgement lines pre-synthesized at warmup: the locked "On it." plus
+/// the persona lines derived from the configured assistant identity.
+fn warmup_ack_phrases(config: &PersonalAgentConfig) -> Vec<String> {
+    let mut phrases = vec![TTS_ACK_PHRASE.to_owned()];
+    let name = config.persona.name.trim();
+    if !name.is_empty() {
+        for line in [format!("{name} here."), format!("{name} is on it.")] {
+            if !phrases.contains(&line) {
+                phrases.push(line);
+            }
+        }
+    }
+    phrases
+}
+
+/// Pre-synthesize the acknowledgement phrases into the disk cache so the first
+/// spoken response of a session starts from a cache hit instead of a cold
+/// worker.
+///
+/// Runs in the background after startup and never plays audio. A real turn
+/// bumps the generation, which both cancels the in-flight warmup synthesis and
+/// stops this loop, so warmup never holds the model against live speech.
+pub(crate) async fn warmup_tts_phrase_cache(state: &DesktopState) {
+    let Ok(config) = config_snapshot(state) else {
+        return;
+    };
+    let status = voice_status_for(state, &config);
+    let backend = status.active_tts_backend.clone();
+    // Only the neural tiers stream through the worker; the Piper subprocess
+    // tier has no frame path to record.
+    let Some((model, sample_rate_hz)) = neural_tts_engine(&backend) else {
+        return;
+    };
+    let Some(cache) = tts_phrase_cache(state) else {
+        return;
+    };
+    let generation = state.voice_generation.load(Ordering::SeqCst);
+    for phrase in warmup_ack_phrases(&config) {
+        if state.voice_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let key = tts_phrase_key(&config, &backend, sample_rate_hz, &phrase);
+        if cache.contains(&key).unwrap_or(false) {
+            continue;
+        }
+        let mut recorder = PhraseRecorder::new(key, &phrase);
+        let result = neural_voice_tts_stream(
+            state,
+            model,
+            neural_tts_payload(&config, &backend, &phrase),
+            generation,
+            TTS_WARMUP_TIMEOUT,
+            |frame| {
+                recorder.observe(frame);
+                Ok(())
+            },
+        )
+        .await;
+        match result {
+            Ok(value) if value.get("cancelled").and_then(Value::as_bool) != Some(true) => {
+                let reported = value
+                    .get("sample_rate_hz")
+                    .and_then(Value::as_u64)
+                    .and_then(|rate| u32::try_from(rate).ok());
+                if reported == Some(sample_rate_hz) {
+                    recorder.store(Some(&cache), sample_rate_hz);
+                }
+            }
+            // Cancelled: a real turn took the model, so stop warming.
+            Ok(_) => return,
+            Err(error) => {
+                tracing::debug!(%error, "acknowledgement phrase was not pre-synthesized");
+                return;
+            }
+        }
+    }
+}
+
+/// Accumulates one synthesized phrase for the disk cache.
+///
+/// The phrase text never leaves this struct: only its digest names the entry,
+/// and nothing here is logged.
+struct PhraseRecorder {
+    key: PhraseKey,
+    samples: Vec<i16>,
+    cacheable: bool,
+}
+
+impl PhraseRecorder {
+    fn new(key: PhraseKey, text: &str) -> Self {
+        Self {
+            key,
+            samples: Vec::new(),
+            cacheable: text.len() <= TTS_PHRASE_CACHE_MAX_TEXT_BYTES,
+        }
+    }
+
+    fn observe(&mut self, frame: &[i16]) {
+        if !self.cacheable {
+            return;
+        }
+        if self.samples.len().saturating_add(frame.len()) > TTS_PHRASE_CACHE_MAX_SAMPLES {
+            self.cacheable = false;
+            self.samples = Vec::new();
+            return;
+        }
+        self.samples.extend_from_slice(frame);
+    }
+
+    fn store(self, cache: Option<&PhraseCache>, sample_rate_hz: u32) {
+        if !self.cacheable || self.samples.is_empty() {
+            return;
+        }
+        let Some(cache) = cache else {
+            return;
+        };
+        if let Err(error) = cache.put(&self.key, &self.samples, sample_rate_hz, 1) {
+            tracing::debug!(%error, "synthesized phrase was not cached");
+        }
+    }
+}
+
+/// Queue one cache hit on the streaming turn sink.
+///
+/// The worker is never consulted, so the first frame is available immediately;
+/// the returned value mirrors the streamed worker reply so the caller keeps one
+/// sample-rate validation path.
+fn play_cached_clause(
+    app: &tauri::AppHandle,
+    control: &NativePlaybackControl,
+    phrase: &CachedPhrase,
+    engine: &str,
+    generation: u64,
+    first_audio: &mut Option<oneshot::Sender<Result<(), String>>>,
+    clause_states: &mut ClauseSpeechStates,
+) -> Result<Value, String> {
+    control
+        .append_pcm(&phrase.samples, phrase.sample_rate_hz, phrase.channels)
+        .map_err(|error| error.to_string())?;
+    if let Some(sender) = first_audio.take() {
+        let _ = sender.send(Ok(()));
+    }
+    if clause_states.enter_speaking() {
+        let _ = app.emit(
+            "voice-state",
+            json!({"state": "speaking", "engine": engine, "generation": generation, "cached": true}),
+        );
+    }
+    Ok(json!({"sample_rate_hz": phrase.sample_rate_hz}))
+}
+
 async fn synthesize_kokoro_wav(
     state: &DesktopState,
     working: &Path,
@@ -1321,35 +1533,52 @@ async fn run_turn_speech(
                 let mut current_clause = Some(first_clause);
                 let mut clause_states = ClauseSpeechStates::default();
                 let mut stream_error = None;
+                let cache = tts_phrase_cache(&state);
                 while let Some(clause) = current_clause {
                     if state.voice_generation.load(Ordering::SeqCst) != generation {
                         discard_playback_generation(&state, generation).await;
                         return;
                     }
+                    let key = tts_phrase_key(&config, backend, expected_sample_rate_hz, &clause);
+                    let cached = cache.as_ref().and_then(|cache| cache.get(&key));
+                    let mut recorder = PhraseRecorder::new(key, &clause);
                     state.voice_synthesis_active.store(true, Ordering::SeqCst);
                     let stream_app = app.clone();
                     let stream_control = control.clone();
-                    let result = neural_voice_tts_stream(
-                        &state,
-                        model,
-                        neural_tts_payload(&config, backend, &clause),
-                        generation,
-                        Duration::from_secs(180),
-                        |frame| {
-                            stream_control.append_pcm(frame, expected_sample_rate_hz, 1)?;
-                            if let Some(sender) = first_audio.take() {
-                                let _ = sender.send(Ok(()));
-                            }
-                            if clause_states.enter_speaking() {
-                                let _ = stream_app.emit(
-                                    "voice-state",
-                                    json!({"state": "speaking", "engine": backend, "generation": generation}),
-                                );
-                            }
-                            Ok(())
-                        },
-                    )
-                    .await;
+                    let result = if let Some(phrase) = cached.as_ref() {
+                        play_cached_clause(
+                            &app,
+                            &control,
+                            phrase,
+                            backend,
+                            generation,
+                            &mut first_audio,
+                            &mut clause_states,
+                        )
+                    } else {
+                        neural_voice_tts_stream(
+                            &state,
+                            model,
+                            neural_tts_payload(&config, backend, &clause),
+                            generation,
+                            Duration::from_secs(180),
+                            |frame| {
+                                stream_control.append_pcm(frame, expected_sample_rate_hz, 1)?;
+                                recorder.observe(frame);
+                                if let Some(sender) = first_audio.take() {
+                                    let _ = sender.send(Ok(()));
+                                }
+                                if clause_states.enter_speaking() {
+                                    let _ = stream_app.emit(
+                                        "voice-state",
+                                        json!({"state": "speaking", "engine": backend, "generation": generation}),
+                                    );
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await
+                    };
                     state.voice_synthesis_active.store(false, Ordering::SeqCst);
                     match result {
                         Ok(value)
@@ -1366,6 +1595,7 @@ async fn run_turn_speech(
                                 ));
                                 break;
                             }
+                            recorder.store(cache.as_ref(), expected_sample_rate_hz);
                         }
                         Ok(_) => {
                             discard_playback_generation(&state, generation).await;

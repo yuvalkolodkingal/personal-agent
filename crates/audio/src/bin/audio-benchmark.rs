@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use personal_agent_audio::{
     AudioError, AudioFrame, EnrolledWakeDetector, MicrophoneState, NetworkPolicy,
-    NeuralVoiceRuntime, SpeechRecognizer, SpeechSynthesizer, Transcript, VoicePipeline,
-    WakeTemplate, summarize_latencies,
+    NeuralVoiceRuntime, PhraseCache, PhraseKey, SpeechRecognizer, SpeechSynthesizer, Transcript,
+    VoicePipeline, WakeTemplate, summarize_latencies,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -14,13 +14,18 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STT_CORPUS_CASES: usize = 10;
 const STT_CORPUS_MANIFEST_SHA256: &str =
     "19beb8c0f60c68df6661cd5d5f6975687d825ee9f419419751bee935442b3152";
 const STT_REPLAY_CHUNK_SAMPLES: usize = 320;
 const STT_SAMPLE_RATE_HZ: u32 = 16_000;
+const ACK_PHRASE: &str = "On it.";
+const ACK_PHRASE_ENGINE: &str = "qwen3-tts";
+const ACK_PHRASE_VOICE: &str = "Ryan";
+const ACK_PHRASE_SAMPLE_RATE_HZ: u32 = 24_000;
+const ACK_PHRASE_FRAME_SAMPLES: usize = 480;
 
 fn audio_duration(samples: u64) -> Duration {
     let sample_rate_hz = u64::from(STT_SAMPLE_RATE_HZ);
@@ -202,6 +207,66 @@ fn replay_tts_first_audio(frame: &[i16]) -> Result<Duration, Box<dyn std::error:
         }
         Ok(())
     })?;
+    Ok(first_audio)
+}
+
+/// Pre-synthesize the warmup acknowledgement into a private phrase cache, the
+/// same way the desktop host warms "On it." and the persona lines before the
+/// first spoken turn.
+fn warm_ack_phrase_cache() -> Result<(PhraseCache, PhraseKey, PathBuf), Box<dyn std::error::Error>>
+{
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "personal-agent-ack-replay-{}-{nanos}",
+        std::process::id()
+    ));
+    let cache = PhraseCache::open(&root)?;
+    let key = PhraseKey::new(
+        ACK_PHRASE_ENGINE,
+        ACK_PHRASE_VOICE,
+        &format!("{ACK_PHRASE_SAMPLE_RATE_HZ}@100"),
+        ACK_PHRASE,
+    );
+    let sample_count = usize::try_from(ACK_PHRASE_SAMPLE_RATE_HZ)?;
+    let samples = (0..sample_count)
+        .map(|index| i16::try_from(index % 4_096).unwrap_or(i16::MAX))
+        .collect::<Vec<_>>();
+    cache.put(&key, &samples, ACK_PHRASE_SAMPLE_RATE_HZ, 1)?;
+    Ok((cache, key, root))
+}
+
+/// Time from requesting the acknowledgement to its first PCM frame reaching the
+/// playback queue. A warmed phrase never touches the synthesis worker, so this
+/// is a cache read plus one frame handoff; it excludes physical device startup.
+fn replay_ack_first_audio(
+    cache: &PhraseCache,
+    key: &PhraseKey,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut first_audio = Duration::ZERO;
+    std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+        let (pcm_producer, pcm_sink) = mpsc::sync_channel::<Vec<i16>>(1);
+        scope.spawn(move || {
+            let Some(phrase) = cache.get(key) else {
+                return;
+            };
+            for frame in phrase.samples.chunks(ACK_PHRASE_FRAME_SAMPLES) {
+                if pcm_producer.send(frame.to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        let first_frame = pcm_sink.recv()?;
+        first_audio = started.elapsed();
+        black_box(first_frame.first().copied());
+        for frame in pcm_sink {
+            black_box(frame.first().copied());
+        }
+        Ok(())
+    })?;
+    if first_audio.is_zero() {
+        return Err("the warmed acknowledgement produced no cached audio".into());
+    }
     Ok(first_audio)
 }
 
@@ -1065,6 +1130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bootstrap_ipc = Vec::with_capacity(SAMPLES);
     let mut desktop_snapshot_warm = Vec::with_capacity(SAMPLES);
     let mut tts_first_audio = Vec::with_capacity(SAMPLES);
+    let mut tts_ack_first_audio = Vec::with_capacity(SAMPLES);
+    let (ack_cache, ack_key, ack_root) = warm_ack_phrase_cache()?;
     let tts_frame = vec![512_i16; 480];
     for _ in 0..SAMPLES {
         let started = Instant::now();
@@ -1100,7 +1167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         desktop_snapshot_warm.push(started.elapsed());
 
         tts_first_audio.push(replay_tts_first_audio(&tts_frame)?);
+        tts_ack_first_audio.push(replay_ack_first_audio(&ack_cache, &ack_key)?);
     }
+    drop(ack_cache);
+    std::fs::remove_dir_all(&ack_root)?;
     let (
         ambient_armed_cpu_replay,
         stt_endpoint_replay,
@@ -1118,6 +1188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "bootstrap_ipc": summarize_latencies(&bootstrap_ipc)?,
         "desktop_snapshot_warm": summarize_latencies(&desktop_snapshot_warm)?,
         "tts_first_audio_ms": summarize_latencies(&tts_first_audio)?,
+        "tts_ack_first_audio_ms": summarize_latencies(&tts_ack_first_audio)?,
         "ambient_armed_cpu_replay": ambient_armed_cpu_replay,
         "stt_endpoint_replay": stt_endpoint_replay,
         "stt_wer_moonshine": stt_wer_moonshine,
@@ -1128,6 +1199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "bootstrap_ipc": "JSON encode/decode replay; excludes WebView transport and paint",
             "desktop_snapshot_warm": "serialized accessibility-tree replay; excludes physical screen capture and input",
             "tts_first_audio_ms": "three-clause fake-engine turn through a one-clause prebuffer and bounded in-memory PCM sink; excludes physical device startup",
+            "tts_ack_first_audio_ms": "warmup-cached acknowledgement phrase read from the 64 MiB LRU disk cache and handed to a bounded in-memory PCM sink; excludes synthesis and physical device startup",
             "ambient_armed_cpu": "real pinned worker/model paths when replay env vars are set; otherwise reported as external-model-assets-required",
             "stt_endpoint": "real pinned Silero v5 recurrent-state inference plus one Smart Turn v3.2 consultation when replay env vars are set",
             "stt_accuracy": "ten CC0 Common Voice 11 utterances transcribed by each real configured engine when replay env vars are set; no hard WER threshold",

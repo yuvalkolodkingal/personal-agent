@@ -856,6 +856,13 @@ fn main() {
                         let state = handle.state::<DesktopState>();
                         tracing::info!(healthy = health.healthy, version = %health.version, "runtime health updated");
                         persist_runtime_health(&state, &health);
+                        // Pre-synthesize the acknowledgement phrases off the
+                        // startup path so the first spoken reply is a cache hit.
+                        let warmup_handle = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let warmup_state = warmup_handle.state::<DesktopState>();
+                            api::warmup_tts_phrase_cache(&warmup_state).await;
+                        });
                         if health.healthy {
                             automation_host::ensure_resident_executor(handle.clone());
                             goals_host::ensure_resident_executor(handle.clone());
