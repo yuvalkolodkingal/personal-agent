@@ -29,6 +29,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `atomic-waker 1.1.2` — Apache-2.0 OR MIT — `pkg:cargo/atomic-waker@1.1.2`
 - `auto-launch 0.5.0` — MIT — `pkg:cargo/auto-launch@0.5.0`
 - `autocfg 1.5.1` — Apache-2.0 OR MIT — `pkg:cargo/autocfg@1.5.1`
+- `aws-lc-rs 1.18.0` — ISC AND (Apache-2.0 OR ISC) — `pkg:cargo/aws-lc-rs@1.18.0`
+- `aws-lc-sys 0.44.0` — ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) — `pkg:cargo/aws-lc-sys@0.44.0`
 - `base64 0.21.7` — MIT OR Apache-2.0 — `pkg:cargo/base64@0.21.7`
 - `base64 0.22.1` — MIT OR Apache-2.0 — `pkg:cargo/base64@0.22.1`
 - `base64ct 1.8.3` — Apache-2.0 OR MIT — `pkg:cargo/base64ct@1.8.3`
@@ -65,6 +67,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `chacha20 0.10.2` — MIT OR Apache-2.0 — `pkg:cargo/chacha20@0.10.2`
 - `chrono 0.4.45` — MIT OR Apache-2.0 — `pkg:cargo/chrono@0.4.45`
 - `cipher 0.4.4` — MIT OR Apache-2.0 — `pkg:cargo/cipher@0.4.4`
+- `cmake 0.1.58` — MIT OR Apache-2.0 — `pkg:cargo/cmake@0.1.58`
 - `combine 4.6.8` — MIT — `pkg:cargo/combine@4.6.8`
 - `concurrent-queue 2.5.0` — Apache-2.0 OR MIT — `pkg:cargo/concurrent-queue@2.5.0`
 - `const-oid 0.10.2` — Apache-2.0 OR MIT — `pkg:cargo/const-oid@0.10.2`
@@ -155,6 +158,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `foreign-types-shared 0.3.1` — MIT/Apache-2.0 — `pkg:cargo/foreign-types-shared@0.3.1`
 - `foreign-types 0.5.0` — MIT/Apache-2.0 — `pkg:cargo/foreign-types@0.5.0`
 - `form_urlencoded 1.2.2` — MIT OR Apache-2.0 — `pkg:cargo/form_urlencoded@1.2.2`
+- `fs_extra 1.3.0` — MIT — `pkg:cargo/fs_extra@1.3.0`
 - `futures-channel 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-channel@0.3.34`
 - `futures-core 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-core@0.3.34`
 - `futures-executor 0.3.34` — MIT OR Apache-2.0 — `pkg:cargo/futures-executor@0.3.34`
@@ -205,6 +209,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `http 1.5.0` — MIT OR Apache-2.0 — `pkg:cargo/http@1.5.0`
 - `httparse 1.10.1` — MIT OR Apache-2.0 — `pkg:cargo/httparse@1.10.1`
 - `hybrid-array 0.4.14` — MIT OR Apache-2.0 — `pkg:cargo/hybrid-array@0.4.14`
+- `hyper-rustls 0.27.9` — Apache-2.0 OR ISC OR MIT — `pkg:cargo/hyper-rustls@0.27.9`
 - `hyper-util 0.1.20` — MIT — `pkg:cargo/hyper-util@0.1.20`
 - `hyper 1.11.0` — MIT — `pkg:cargo/hyper@1.11.0`
 - `iana-time-zone-haiku 0.1.2` — MIT OR Apache-2.0 — `pkg:cargo/iana-time-zone-haiku@0.1.2`
@@ -235,10 +240,13 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `jiff-tzdb-platform 0.1.3` — Unlicense OR MIT — `pkg:cargo/jiff-tzdb-platform@0.1.3`
 - `jiff-tzdb 0.1.8` — Unlicense OR MIT — `pkg:cargo/jiff-tzdb@0.1.8`
 - `jiff 0.2.35` — Unlicense OR MIT — `pkg:cargo/jiff@0.2.35`
+- `jni-macros 0.22.4` — MIT OR Apache-2.0 — `pkg:cargo/jni-macros@0.22.4`
 - `jni-sys-macros 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/jni-sys-macros@0.4.1`
 - `jni-sys 0.3.1` — MIT OR Apache-2.0 — `pkg:cargo/jni-sys@0.3.1`
 - `jni-sys 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/jni-sys@0.4.1`
 - `jni 0.21.1` — MIT/Apache-2.0 — `pkg:cargo/jni@0.21.1`
+- `jni 0.22.4` — MIT OR Apache-2.0 — `pkg:cargo/jni@0.22.4`
+- `jobserver 0.1.35` — MIT OR Apache-2.0 — `pkg:cargo/jobserver@0.1.35`
 - `js-sys 0.3.104` — MIT OR Apache-2.0 — `pkg:cargo/js-sys@0.3.104`
 - `json-patch 3.0.1` — MIT/Apache-2.0 — `pkg:cargo/json-patch@3.0.1`
 - `jsonptr 0.6.3` — MIT OR Apache-2.0 — `pkg:cargo/jsonptr@0.6.3`
@@ -257,6 +265,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `litemap 0.8.3` — Unicode-3.0 — `pkg:cargo/litemap@0.8.3`
 - `lock_api 0.4.14` — MIT OR Apache-2.0 — `pkg:cargo/lock_api@0.4.14`
 - `log 0.4.34` — MIT OR Apache-2.0 — `pkg:cargo/log@0.4.34`
+- `lru-slab 0.1.2` — MIT OR Apache-2.0 OR Zlib — `pkg:cargo/lru-slab@0.1.2`
 - `mac-notification-sys 0.6.15` — MIT/Apache-2.0 — `pkg:cargo/mac-notification-sys@0.6.15`
 - `mach2 0.4.3` — BSD-2-Clause OR MIT OR Apache-2.0 — `pkg:cargo/mach2@0.4.3`
 - `markup5ever 0.38.0` — MIT OR Apache-2.0 — `pkg:cargo/markup5ever@0.38.0`
@@ -308,6 +317,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `objc2 0.6.4` — MIT — `pkg:cargo/objc2@0.6.4`
 - `once_cell 1.21.4` — MIT OR Apache-2.0 — `pkg:cargo/once_cell@1.21.4`
 - `openapiv3 2.2.0` — MIT/Apache-2.0 — `pkg:cargo/openapiv3@2.2.0`
+- `openssl-probe 0.2.1` — MIT OR Apache-2.0 — `pkg:cargo/openssl-probe@0.2.1`
 - `openssl-src 300.6.1+3.6.3` — MIT/Apache-2.0 — `pkg:cargo/openssl-src@300.6.1+3.6.3`
 - `openssl-sys 0.9.117` — MIT — `pkg:cargo/openssl-sys@0.9.117`
 - `option-ext 0.2.0` — MPL-2.0 — `pkg:cargo/option-ext@0.2.0`
@@ -366,6 +376,9 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `protoc-bin-vendored 3.2.0` — MIT — `pkg:cargo/protoc-bin-vendored@3.2.0`
 - `pxfm 0.1.30` — BSD-3-Clause OR Apache-2.0 — `pkg:cargo/pxfm@0.1.30`
 - `quick-xml 0.41.0` — MIT — `pkg:cargo/quick-xml@0.41.0`
+- `quinn-proto 0.11.17` — MIT OR Apache-2.0 — `pkg:cargo/quinn-proto@0.11.17`
+- `quinn-udp 0.5.15` — MIT OR Apache-2.0 — `pkg:cargo/quinn-udp@0.5.15`
+- `quinn 0.11.11` — MIT OR Apache-2.0 — `pkg:cargo/quinn@0.11.11`
 - `quote 1.0.47` — MIT OR Apache-2.0 — `pkg:cargo/quote@1.0.47`
 - `r-efi 5.3.0` — MIT OR Apache-2.0 OR LGPL-2.1-or-later — `pkg:cargo/r-efi@5.3.0`
 - `r-efi 6.0.0` — MIT OR Apache-2.0 OR LGPL-2.1-or-later — `pkg:cargo/r-efi@6.0.0`
@@ -375,6 +388,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `rand_core 0.10.1` — MIT OR Apache-2.0 — `pkg:cargo/rand_core@0.10.1`
 - `rand_core 0.6.4` — MIT OR Apache-2.0 — `pkg:cargo/rand_core@0.6.4`
 - `rand_core 0.9.5` — MIT OR Apache-2.0 — `pkg:cargo/rand_core@0.9.5`
+- `rand_pcg 0.10.2` — MIT OR Apache-2.0 — `pkg:cargo/rand_pcg@0.10.2`
 - `raw-window-handle 0.6.2` — MIT OR Apache-2.0 OR Zlib — `pkg:cargo/raw-window-handle@0.6.2`
 - `redox_syscall 0.5.18` — MIT — `pkg:cargo/redox_syscall@0.5.18`
 - `redox_users 0.4.6` — MIT — `pkg:cargo/redox_users@0.4.6`
@@ -386,6 +400,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `regex 1.13.1` — MIT OR Apache-2.0 — `pkg:cargo/regex@1.13.1`
 - `regress 0.11.1` — MIT OR Apache-2.0 — `pkg:cargo/regress@0.11.1`
 - `reqwest 0.13.4` — MIT OR Apache-2.0 — `pkg:cargo/reqwest@0.13.4`
+- `ring 0.17.14` — Apache-2.0 AND ISC — `pkg:cargo/ring@0.17.14`
 - `rmcp-macros 0.10.0` — MIT — `pkg:cargo/rmcp-macros@0.10.0`
 - `rmcp 0.10.0` — MIT — `pkg:cargo/rmcp@0.10.0`
 - `rodio 0.21.1` — MIT OR Apache-2.0 — `pkg:cargo/rodio@0.21.1`
@@ -393,9 +408,16 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `rustc-hash 2.1.3` — Apache-2.0 OR MIT — `pkg:cargo/rustc-hash@2.1.3`
 - `rustc_version 0.4.1` — MIT OR Apache-2.0 — `pkg:cargo/rustc_version@0.4.1`
 - `rustix 1.1.4` — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT — `pkg:cargo/rustix@1.1.4`
+- `rustls-native-certs 0.8.4` — Apache-2.0 OR ISC OR MIT — `pkg:cargo/rustls-native-certs@0.8.4`
+- `rustls-pki-types 1.15.1` — MIT OR Apache-2.0 — `pkg:cargo/rustls-pki-types@1.15.1`
+- `rustls-platform-verifier-android 0.1.1` — MIT OR Apache-2.0 — `pkg:cargo/rustls-platform-verifier-android@0.1.1`
+- `rustls-platform-verifier 0.7.0` — MIT OR Apache-2.0 — `pkg:cargo/rustls-platform-verifier@0.7.0`
+- `rustls-webpki 0.103.15` — ISC — `pkg:cargo/rustls-webpki@0.103.15`
+- `rustls 0.23.43` — Apache-2.0 OR ISC OR MIT — `pkg:cargo/rustls@0.23.43`
 - `rustversion 1.0.23` — MIT OR Apache-2.0 — `pkg:cargo/rustversion@1.0.23`
 - `ryu 1.0.23` — Apache-2.0 OR BSL-1.0 — `pkg:cargo/ryu@1.0.23`
 - `same-file 1.0.6` — Unlicense/MIT — `pkg:cargo/same-file@1.0.6`
+- `schannel 0.1.29` — MIT — `pkg:cargo/schannel@0.1.29`
 - `schemars 0.8.22` — MIT — `pkg:cargo/schemars@0.8.22`
 - `schemars 0.9.0` — MIT — `pkg:cargo/schemars@0.9.0`
 - `schemars 1.2.2` — MIT — `pkg:cargo/schemars@1.2.2`
@@ -434,6 +456,8 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `signal-hook-registry 1.4.8` — MIT OR Apache-2.0 — `pkg:cargo/signal-hook-registry@1.4.8`
 - `signature 2.2.0` — Apache-2.0 OR MIT — `pkg:cargo/signature@2.2.0`
 - `simd-adler32 0.3.10` — MIT — `pkg:cargo/simd-adler32@0.3.10`
+- `simd_cesu8 1.2.0` — Apache-2.0 OR MIT — `pkg:cargo/simd_cesu8@1.2.0`
+- `simdutf8 0.1.5` — MIT OR Apache-2.0 — `pkg:cargo/simdutf8@0.1.5`
 - `siphasher 1.0.3` — MIT/Apache-2.0 — `pkg:cargo/siphasher@1.0.3`
 - `slab 0.4.12` — MIT — `pkg:cargo/slab@0.4.12`
 - `smallvec 1.15.2` — MIT OR Apache-2.0 — `pkg:cargo/smallvec@1.15.2`
@@ -492,6 +516,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `tinyvec 1.12.0` — Zlib OR Apache-2.0 OR MIT — `pkg:cargo/tinyvec@1.12.0`
 - `tinyvec_macros 0.1.1` — MIT OR Apache-2.0 OR Zlib — `pkg:cargo/tinyvec_macros@0.1.1`
 - `tokio-macros 2.7.2` — MIT — `pkg:cargo/tokio-macros@2.7.2`
+- `tokio-rustls 0.26.4` — MIT OR Apache-2.0 — `pkg:cargo/tokio-rustls@0.26.4`
 - `tokio-stream 0.1.19` — MIT — `pkg:cargo/tokio-stream@0.1.19`
 - `tokio-tungstenite 0.30.0` — MIT — `pkg:cargo/tokio-tungstenite@0.30.0`
 - `tokio-util 0.7.19` — MIT — `pkg:cargo/tokio-util@0.7.19`
@@ -535,6 +560,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `unicode-ident 1.0.24` — (MIT OR Apache-2.0) AND Unicode-3.0 — `pkg:cargo/unicode-ident@1.0.24`
 - `unicode-segmentation 1.13.3` — MIT OR Apache-2.0 — `pkg:cargo/unicode-segmentation@1.13.3`
 - `unsafe-libyaml 0.2.11` — MIT — `pkg:cargo/unsafe-libyaml@0.2.11`
+- `untrusted 0.9.0` — ISC — `pkg:cargo/untrusted@0.9.0`
 - `url 2.5.8` — MIT OR Apache-2.0 — `pkg:cargo/url@2.5.8`
 - `urlpattern 0.3.0` — MIT — `pkg:cargo/urlpattern@0.3.0`
 - `utf8_iter 1.0.4` — Apache-2.0 OR MIT — `pkg:cargo/utf8_iter@1.0.4`
@@ -556,9 +582,11 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `wasm-bindgen 0.2.127` — MIT OR Apache-2.0 — `pkg:cargo/wasm-bindgen@0.2.127`
 - `wasm-streams 0.5.0` — MIT OR Apache-2.0 — `pkg:cargo/wasm-streams@0.5.0`
 - `web-sys 0.3.104` — MIT OR Apache-2.0 — `pkg:cargo/web-sys@0.3.104`
+- `web-time 1.1.0` — MIT OR Apache-2.0 — `pkg:cargo/web-time@1.1.0`
 - `web_atoms 0.2.6` — MIT OR Apache-2.0 — `pkg:cargo/web_atoms@0.2.6`
 - `webkit2gtk-sys 2.0.2` — MIT — `pkg:cargo/webkit2gtk-sys@2.0.2`
 - `webkit2gtk 2.0.2` — MIT — `pkg:cargo/webkit2gtk@2.0.2`
+- `webpki-root-certs 1.0.9` — CDLA-Permissive-2.0 — `pkg:cargo/webpki-root-certs@1.0.9`
 - `webview2-com-macros 0.8.1` — MIT — `pkg:cargo/webview2-com-macros@0.8.1`
 - `webview2-com-sys 0.38.2` — MIT — `pkg:cargo/webview2-com-sys@0.38.2`
 - `webview2-com 0.38.2` — MIT — `pkg:cargo/webview2-com@0.38.2`
@@ -584,6 +612,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `windows-strings 0.4.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-strings@0.4.2`
 - `windows-strings 0.5.1` — MIT OR Apache-2.0 — `pkg:cargo/windows-strings@0.5.1`
 - `windows-sys 0.45.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-sys@0.45.0`
+- `windows-sys 0.52.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-sys@0.52.0`
 - `windows-sys 0.59.0` — MIT OR Apache-2.0 — `pkg:cargo/windows-sys@0.59.0`
 - `windows-sys 0.60.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-sys@0.60.2`
 - `windows-sys 0.61.2` — MIT OR Apache-2.0 — `pkg:cargo/windows-sys@0.61.2`

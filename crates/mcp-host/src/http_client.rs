@@ -276,4 +276,30 @@ mod tests {
         assert!(!accepts_stream_or_json(Some("text/html")));
         assert!(!accepts_stream_or_json(None));
     }
+
+    /// Remote MCP servers are reached over `https`, which only works when a TLS
+    /// backend is compiled in. Without one `reqwest` rejects the scheme outright
+    /// rather than attempting a connection, so a refused local port proves the
+    /// backend is present without needing the network.
+    #[tokio::test]
+    async fn https_requests_reach_the_transport_instead_of_failing_on_a_missing_tls_backend() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
+
+        let error = reqwest::Client::new()
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("a closed port cannot answer");
+
+        assert!(
+            error.is_connect(),
+            "expected a connect failure, got {error:?}"
+        );
+        assert!(
+            !error.is_builder(),
+            "https was rejected before connecting, which means no TLS backend is linked: {error:?}"
+        );
+    }
 }
