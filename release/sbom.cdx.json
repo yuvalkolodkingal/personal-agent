@@ -1016,6 +1016,18 @@
           "expression": "MIT"
         }
       ],
+      "name": "dashmap",
+      "purl": "pkg:cargo/dashmap@6.1.0",
+      "type": "library",
+      "version": "6.1.0"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
       "name": "data-encoding",
       "purl": "pkg:cargo/data-encoding@2.11.1",
       "type": "library",
@@ -2076,6 +2088,18 @@
       "purl": "pkg:cargo/hashbrown@0.12.3",
       "type": "library",
       "version": "0.12.3"
+    },
+    {
+      "group": "crates.io",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "name": "hashbrown",
+      "purl": "pkg:cargo/hashbrown@0.14.5",
+      "type": "library",
+      "version": "0.14.5"
     },
     {
       "group": "crates.io",
@@ -7526,7 +7550,7 @@
       "version": "0.1.0"
     }
   },
-  "serialNumber": "urn:uuid:284c412d-dd99-529d-bd3b-007945d7051a",
+  "serialNumber": "urn:uuid:fdc5c513-6dfd-5634-a1ec-86b4bcc7fe85",
   "specVersion": "1.6",
   "version": 1
 }

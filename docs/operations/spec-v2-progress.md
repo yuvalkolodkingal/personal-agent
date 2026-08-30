@@ -35,6 +35,9 @@
 | FIX-7 | DONE | The pinned multilingual E5 int8 worker passes its real 118 MB model protocol and English/Hebrew top-3 fixtures; finite-width numeric validation, memory tests, and desktop clippy pass. | `0592003` |
 | FIX-8 | DONE | `recall_index_handles_ten_thousand_memories_under_fifty_ms` materializes one FTS candidate and reports 569.228 µs; clone/deserialization, eligibility-before-limit, and approval regressions pass. | `1048c2e` |
 | FIX-9 | DONE | Trigger-audited persistence adds exactly one `memories` row with zero updates/deletes or legacy blob rewrites; transactional v5→v6 migration preserves vectors, metadata, links, and pre-existing `legacy-imported` personal data. | `efa0826` |
+| PERF-10 | DONE | FakeRuntime ran one delayed chat turn and 20 resource calls in 307 ms with `max_in_flight=21` (serialized minimum 700 ms); retained-handle replacement, held-lock shutdown, runtime/desktop suites, and strict clippy pass. | `00b312b` |
+| PERF-11 | DONE | PTY echo uses `pty-output:{id}` events with one revision-deduplicated replay and no poll timer; playback awaits a cancellable child; resident mutation/deadline/cancellation and shutdown-join tests pass; desktop Rust 80/80 and frontend 76/76 pass at the task boundary. | `78c4197` |
+| PERF-12 | DONE | Pinned Tauri 2.11.5 compiled raw `ipc::Request` bodies; exact PCM16LE decode/limit tests and ArrayBuffer/no-per-sample-JSON Vitest pass, with desktop Rust 81/81 and frontend 77/77 green. | `acaf82c` |
 
 ## Wave 1 gate
 
@@ -93,6 +96,23 @@ test passed (desktop 74/74; core 37/37; memory 14/14; storage 14/14; runtime 15 
 pre-existing ignored live-sidecar test). Bun checks and tests passed (desktop 75/75), and the
 production build completed at 764.08 kB / 208.00 kB gzip. Registry, pack, performance, fuzz,
 security, SBOM, and release-metadata verification all passed. The inherited exceptions were rerun:
+
+- Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
+- Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by
+  PERF-13 and does not exist yet.
+
+## Wave 5 gate
+
+Wave 5 passes the full §14 gate except the same two inherited baseline failures. Formatting and
+workspace clippy pass with warnings denied, and every locked workspace Rust test passes (desktop
+81/81; runtime 17 passed with one pre-existing ignored live-sidecar test). Bun checks and tests
+pass (desktop 77/77), and the production build completes at 764.50 kB / 208.24 kB gzip. Registry,
+pack, performance, and fuzz verification pass.
+
+The first security-gate pass correctly detected that the generated SBOM predated PERF-10's new
+exact `dashmap` dependency. `python scripts/generate-release-metadata.py` deterministically added
+`dashmap 6.1.0` and its `hashbrown 0.14.5` dependency to the SBOM/notices; the security gate and
+release-metadata `--check` then pass. The inherited exceptions were rerun:
 
 - Windows cross-check exits 101 with `E0463` because the MSVC target standard library is absent.
 - Bundle-size verification exits 1 because `scripts/verify-bundle-size.ts` is introduced by

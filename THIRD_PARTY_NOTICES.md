@@ -86,6 +86,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `darling 0.23.0` — MIT — `pkg:cargo/darling@0.23.0`
 - `darling_core 0.23.0` — MIT — `pkg:cargo/darling_core@0.23.0`
 - `darling_macro 0.23.0` — MIT — `pkg:cargo/darling_macro@0.23.0`
+- `dashmap 6.1.0` — MIT — `pkg:cargo/dashmap@6.1.0`
 - `data-encoding 2.11.1` — MIT — `pkg:cargo/data-encoding@2.11.1`
 - `dbus 0.9.12` — Apache-2.0/MIT — `pkg:cargo/dbus@0.9.12`
 - `defmt-macros 1.1.1` — MIT OR Apache-2.0 — `pkg:cargo/defmt-macros@1.1.1`
@@ -175,6 +176,7 @@ Generated from locked Rust and direct JavaScript dependencies. Transitive npm li
 - `gtk3-macros 0.18.2` — MIT — `pkg:cargo/gtk3-macros@0.18.2`
 - `gtk 0.18.2` — MIT — `pkg:cargo/gtk@0.18.2`
 - `hashbrown 0.12.3` — MIT OR Apache-2.0 — `pkg:cargo/hashbrown@0.12.3`
+- `hashbrown 0.14.5` — MIT OR Apache-2.0 — `pkg:cargo/hashbrown@0.14.5`
 - `hashbrown 0.15.5` — MIT OR Apache-2.0 — `pkg:cargo/hashbrown@0.15.5`
 - `hashbrown 0.16.1` — MIT OR Apache-2.0 — `pkg:cargo/hashbrown@0.16.1`
 - `hashbrown 0.17.1` — MIT OR Apache-2.0 — `pkg:cargo/hashbrown@0.17.1`
