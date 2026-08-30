@@ -6,8 +6,10 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use url::Url;
 
+pub mod cdp;
 mod webdriver;
 
+pub use cdp::{CdpBrowser, CdpConfig, ChromiumBinary, ProfileKind, TabInfo};
 pub use webdriver::{WebDriverBrowser, WebDriverConfig, WebDriverProcess};
 
 /// Opaque node handle valid only for one page generation.
@@ -18,8 +20,38 @@ pub struct NodeHandle {
     pub opaque_id: String,
 }
 
+/// Layout rectangle in CSS pixels relative to the document origin.
+///
+/// Reported for orientation only. Action dispatch never trusts these numbers; it
+/// re-resolves a live box model at the moment of the action, because layout can
+/// move between the snapshot and the click.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One accessible element of a page snapshot, keyed by the same generation-bound
+/// [`NodeHandle`] the engine accepts back for actions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotNode {
+    pub handle: NodeHandle,
+    pub role: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub editable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<NodeBounds>,
+    /// Selectable option labels in document order for `combobox`/`listbox` nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
 /// Structured page representation preferred over pixels.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageSnapshot {
     pub page_id: String,
     pub generation: u64,
@@ -27,6 +59,57 @@ pub struct PageSnapshot {
     pub title: String,
     pub text: String,
     pub handles: Vec<NodeHandle>,
+    /// Accessibility/layout detail for each handle. Empty for engines that cannot
+    /// produce an accessibility tree.
+    #[serde(default)]
+    pub nodes: Vec<SnapshotNode>,
+}
+
+impl PageSnapshot {
+    /// Look up the accessible node behind a handle produced by this snapshot.
+    #[must_use]
+    pub fn node(&self, handle: &NodeHandle) -> Option<&SnapshotNode> {
+        self.nodes.iter().find(|node| &node.handle == handle)
+    }
+
+    /// Re-resolve an element across generations by its stable opaque identifier.
+    ///
+    /// Postcondition checks need this because every action invalidates the
+    /// handles the caller was holding.
+    #[must_use]
+    pub fn node_by_opaque_id(&self, opaque_id: &str) -> Option<&SnapshotNode> {
+        self.nodes
+            .iter()
+            .find(|node| node.handle.opaque_id == opaque_id)
+    }
+}
+
+/// Whether a network request was permitted by [`BrowserPolicy`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressDecision {
+    Allowed,
+    Blocked,
+}
+
+/// Content-free record of one intercepted browser request.
+///
+/// Deliberately carries no bodies, headers, query strings, or path text: the
+/// path is reduced to a digest so receipts can be correlated without becoming a
+/// second copy of the page's data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EgressReceipt {
+    pub sequence: u64,
+    pub method: String,
+    pub scheme: String,
+    pub host: String,
+    /// SHA-256 of the request path, hex encoded.
+    pub path_digest: String,
+    pub resource_type: String,
+    pub decision: EgressDecision,
+    /// Policy reason when `decision` is `Blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Trust carried by browser task inputs. Page-derived instructions are always untrusted.
@@ -213,6 +296,12 @@ pub enum BrowserError {
     DownloadNotScanned,
     #[error("page handle is stale and must be reacquired")]
     StaleHandle,
+    #[error("upload path was not approved by the user: {0}")]
+    UploadPathNotApproved(String),
+    #[error("action postcondition failed: {0}")]
+    PostconditionFailed(String),
+    #[error("the user has taken over the browser; agent actions are paused")]
+    TakeoverActive,
     #[error("browser capability unavailable: {0}")]
     Unavailable(String),
     #[error("browser operation failed: {0}")]
@@ -265,6 +354,7 @@ mod tests {
             title: String::new(),
             text: String::new(),
             handles: vec![],
+            nodes: vec![],
         };
         assert_eq!(
             validate_handle(&page, &handle),

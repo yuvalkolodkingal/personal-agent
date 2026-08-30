@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Personal Agent browser fixture</title>
+  </head>
+  <body>
+    <h1>Fixture form</h1>
+    <p>Fill in the profile and submit it.</p>
+    <!--
+      Loaded from a different host than the page so the engine's Fetch policy has
+      a real third-party subresource to refuse. The test server substitutes the
+      absolute URL because the port is chosen at runtime.
+    -->
+    <script src="{{THIRD_PARTY_SCRIPT}}"></script>
+    <form id="profile" method="post" action="/submit" enctype="multipart/form-data">
+      <p>
+        <label for="full-name">Full name</label>
+        <input id="full-name" name="full_name" type="text" />
+      </p>
+      <p>
+        <label for="plan">Plan</label>
+        <select id="plan" name="plan">
+          <option value="free">Free</option>
+          <option value="pro">Pro</option>
+          <option value="team">Team</option>
+        </select>
+      </p>
+      <p>
+        <label for="attachment">Attachment</label>
+        <input id="attachment" name="attachment" type="file" />
+      </p>
+      <p><button id="submit" type="submit">Submit profile</button></p>
+    </form>
+    <p><a id="download" href="/download.txt" download="fixture-download.txt">Download the report</a></p>
+    <p><a id="next" href="/second.html">Go to the second page</a></p>
+  </body>
+</html>

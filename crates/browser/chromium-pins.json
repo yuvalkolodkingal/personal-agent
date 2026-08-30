@@ -1,0 +1,35 @@
+{
+  "comment": [
+    "Managed Chromium fallback used only when no system Chrome/Chromium/Edge is installed.",
+    "Revisions are chosen to match the Chrome DevTools Protocol revision that chromiumoxide_cdp",
+    "0.9.1 was generated from (1566079); the snapshot bucket does not publish every revision for",
+    "every platform, so each platform pins the nearest published build.",
+    "Digests were produced with: curl -sL <url> | sha256sum",
+    "aarch64-apple-darwin has no published snapshot for this revision range; on that host the",
+    "engine reports an explicit remediation instead of silently downgrading."
+  ],
+  "base_url": "https://storage.googleapis.com/chromium-browser-snapshots",
+  "platforms": {
+    "x86_64-unknown-linux-gnu": {
+      "snapshot_platform": "Linux_x64",
+      "revision": 1566079,
+      "archive": "chrome-linux.zip",
+      "binary": "chrome-linux/chrome",
+      "sha256": "eafeca49c07daab07d3b8749872811f889e10d44186ebd75771b2fde4e09bca6"
+    },
+    "x86_64-apple-darwin": {
+      "snapshot_platform": "Mac",
+      "revision": 1566080,
+      "archive": "chrome-mac.zip",
+      "binary": "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+      "sha256": "24020a076a178f6780339f7330a34b87e13984a470de6a2bfaefb657d4d316d6"
+    },
+    "x86_64-pc-windows-msvc": {
+      "snapshot_platform": "Win_x64",
+      "revision": 1566080,
+      "archive": "chrome-win.zip",
+      "binary": "chrome-win/chrome.exe",
+      "sha256": "eaecfe0d493003fa9ce59562aa043478be72f4dfb165b13ee50bb0bbf0d343f5"
+    }
+  }
+}

@@ -388,6 +388,7 @@ impl BrowserEngine for WebDriverBrowser {
             title,
             text,
             handles,
+            nodes: Vec::new(),
         };
         self.current = Some(snapshot.clone());
         Ok(snapshot)
