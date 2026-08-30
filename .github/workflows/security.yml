@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
+      # verify-fuzz.py builds the workspace, which links the desktop stack.
+      - name: Linux desktop dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { toolchain: 1.98.0 }
       - uses: taiki-e/install-action@v2
