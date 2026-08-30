@@ -1,0 +1,48 @@
+# Maintainer: Personal Agent contributors
+#
+# Packages the tree that `bunx tauri build --bundles deb` has already produced
+# in this checkout. Tauri 2.11 ships no pacman bundler, so rather than describe
+# the install layout a second time (and let the two drift), this reuses the
+# Debian payload Tauri generates and that CI already verifies. The binary is
+# still built on Arch, so it links against Arch's own webkit2gtk.
+#
+# Build with: makepkg -f   (run from this directory, after the tauri build)
+
+pkgname=personal-agent
+pkgdesc="Safe, bounded, fully agentic desktop assistant"
+pkgver=$(
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "${startdir}/../../apps/desktop/src-tauri/tauri.conf.json" | head -1
+)
+pkgrel=1
+arch=('x86_64' 'aarch64')
+url="https://github.com/yuvalkolodkingal/personal-agent"
+license=('Apache-2.0')
+depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'librsvg' 'openssl')
+options=('!strip' '!debug')
+source=()
+
+package() {
+  local repo="${startdir}/../.."
+  local deb
+  deb="$(find "${repo}/target/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)"
+
+  if [[ -z "${deb}" ]]; then
+    echo "no Debian bundle found; run 'bunx tauri build --bundles deb' first" >&2
+    return 1
+  fi
+
+  # bsdtar handles the ar archive and the nested data tarball directly.
+  local staged="${srcdir}/payload"
+  mkdir -p "${staged}"
+  bsdtar -xOf "${deb}" 'data.tar.*' | bsdtar -xf - -C "${staged}"
+
+  cp -a "${staged}/usr" "${pkgdir}/usr"
+
+  # The bundled OpenCode sidecar is a vendored third-party binary; keep its
+  # notices discoverable next to the package like the other distributions do.
+  install -Dm644 "${repo}/THIRD_PARTY_NOTICES.md" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.md"
+  install -Dm644 "${repo}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

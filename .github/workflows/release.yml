@@ -1,0 +1,150 @@
+name: Release
+
+# Publishes installers for every supported desktop target.
+#
+# Push a tag to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The release is created as a draft so the artifacts can be checked before it is
+# made public. Nothing here is code-signed: see docs/operations/release.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  # The same gate CI runs, so a tag can never publish a red tree.
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ inputs.tag || github.ref_name }}" }
+      - name: Linux desktop dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt,clippy
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.0 }
+      - run: bun install --frozen-lockfile
+      - run: bun run sidecar:fetch
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: bun run check && bun run test
+      - run: python scripts/verify-registries.py && python scripts/verify-packs.py
+      - run: python scripts/verify-performance.py && python scripts/verify-fuzz.py
+      - run: python scripts/security-gate.py
+      - run: python scripts/generate-release-metadata.py --check
+
+  # Tauri's own bundlers: .deb + .rpm (Fedora/RHEL) + .AppImage on Linux,
+  # .msi + .exe (NSIS) on Windows, .dmg + .app on macOS.
+  bundle:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: macos-26
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ inputs.tag || github.ref_name }}" }
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+          target: ${{ matrix.target }}
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.4.0 }
+      - run: bun install --frozen-lockfile
+      # Each platform needs its own OpenCode sidecar, hash-verified by the fetcher.
+      - run: bun run sidecar:fetch --target=${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ env.TAG }}
+          releaseName: Personal Agent ${{ env.TAG }}
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  # Tauri 2.11 has no pacman bundler, so Arch packages are built natively with
+  # makepkg inside an Arch container. Building here rather than repackaging the
+  # Debian payload keeps the binary linked against Arch's own webkit2gtk.
+  arch-package:
+    needs: verify
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - name: Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git rust cargo nodejs npm webkit2gtk-4.1 libappindicator-gtk3 \
+            librsvg patchelf openssl base-devel sudo
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v6
+        with: { ref: "${{ inputs.tag || github.ref_name }}" }
+      # makepkg refuses to run as root, so build as an unprivileged user.
+      - name: Prepare a build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder "$GITHUB_WORKSPACE"
+      - name: Build the Arch package
+        run: |
+          set -euo pipefail
+          sudo -u builder --preserve-env=PATH bash -euo pipefail -c '
+            bun install --frozen-lockfile
+            bun run sidecar:fetch --target=x86_64-unknown-linux-gnu
+            cd apps/desktop && bunx tauri build --bundles deb
+          '
+          cd packaging/arch
+          sudo -u builder --preserve-env=PATH makepkg -f --noconfirm
+          mkdir -p "$GITHUB_WORKSPACE/arch-out"
+          cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/arch-out/"
+      - name: Attach the Arch package to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pacman -S --noconfirm --needed github-cli
+          gh release upload "$TAG" "$GITHUB_WORKSPACE"/arch-out/*.pkg.tar.zst \
+            --repo "$GITHUB_REPOSITORY" --clobber
