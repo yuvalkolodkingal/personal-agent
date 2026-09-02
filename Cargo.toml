@@ -34,27 +34,27 @@ authors = ["Personal Agent contributors"]
 
 [workspace.dependencies]
 async-trait = "=0.1.92"
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 chromiumoxide_cdp = "=0.9.1"
 chromiumoxide_types = "=0.9.1"
 chrono = { version = "=0.4.45", features = ["serde"] }
 command-fds = { version = "=0.3.3", features = ["tokio"] }
-cpal = "=0.16.0"
-dashmap = "=6.1.0"
-ed25519-dalek = "=2.2.0"
+cpal = "=0.17.1"
+dashmap = "=6.2.1"
+ed25519-dalek = "=3.0.0"
 futures-util = "=0.3.34"
 http = "=1.5.0"
-keyring = "=4.1.6"
-image = { version = "=0.25.9", default-features = false, features = ["png"] }
+keyring = "=4.2.0"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 libc = "=0.2.189"
 petgraph = "=0.8.3"
 prost = "=0.14.4"
 progenitor = "=0.14.0"
 progenitor-client = "=0.14.0"
-regress = "=0.11.1"
+regress = "=0.12.0"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rmcp = { version = "=3.1.4", default-features = false, features = ["client", "client-side-sse", "transport-child-process", "transport-streamable-http-client"] }
-rodio = { version = "=0.21.1", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "=0.22.2", default-features = false, features = ["playback", "wav"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "backup", "chrono", "serde_json", "uuid"] }
 secrecy = { version = "=0.10.3", features = ["serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -76,7 +76,7 @@ tracing = "=0.1.44"
 tracing-appender = "=0.2.5"
 tracing-subscriber = { version = "=0.3.23", features = ["json"] }
 url = { version = "=2.5.8", features = ["serde"] }
-uuid = { version = "=1.25.0", features = ["serde", "v4", "v7"] }
+uuid = { version = "=1.26.0", features = ["serde", "v4", "v7"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
