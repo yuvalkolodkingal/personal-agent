@@ -10,5 +10,5 @@
     "test": "bun test"
   },
   "peerDependencies": { "react": "=19.2.8" },
-  "devDependencies": { "@types/bun": "=1.4.0", "@types/react": "=19.2.18", "typescript": "=7.0.2" }
+  "devDependencies": { "@types/bun": "=1.4.2", "@types/react": "=19.3.0", "typescript": "=7.0.2" }
 }
