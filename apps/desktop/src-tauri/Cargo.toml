@@ -53,7 +53,7 @@ webkit2gtk = "=2.0.2"
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
-tauri-build = { version = "=2.6.3", features = [] }
+tauri-build = { version = "=2.7.1", features = [] }
 
 [lints]
 workspace = true
