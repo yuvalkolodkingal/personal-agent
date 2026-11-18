@@ -50,10 +50,10 @@ uuid.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util.workspace = true
 webkit2gtk = "=2.0.2"
-zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+zbus = { version = "=6.3.0", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
-tauri-build = { version = "=2.6.3", features = [] }
+tauri-build = { version = "=2.7.4", features = [] }
 
 [lints]
 workspace = true
